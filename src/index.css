@@ -1,0 +1,110 @@
+/* Light design foundation (modern SaaS / HR-dashboard style). The whole app is
+   authored with Tailwind slate utility classes; in Tailwind v4 those resolve
+   through CSS variables, so re-mapping the slate ramp here re-skins the entire
+   app to a light theme in one place — no per-component edits. The mapping
+   INVERTS the lightness axis (high slate number = dark surface on the old dark
+   theme → light surface here; low number = light text → dark text here), which
+   preserves every prominence/elevation relationship the components rely on. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  /* Inter — clean, neutral grotesque matching the reference dashboard. */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+
+  /* ---- Slate ramp remapped for a LIGHT theme ----
+     Backgrounds (bg-slate-*): 900 = white cards that float; 950 = light-gray
+     page/inputs (recessed); 800/700 = light-gray hover/elevated. Borders
+     (border-slate-800, the app's default) land on a soft light hairline. */
+  --color-slate-950: #f4f6f9;  /* page background / recessed input fill */
+  --color-slate-900: #ffffff;  /* card / panel surface (floats white) */
+  --color-slate-850: #f6f8fb;  /* subtle raised surface */
+  --color-slate-800: #e9edf3;  /* hover / elevated fill AND default border */
+  --color-slate-750: #eef1f6;
+  --color-slate-700: #dde3ec;  /* stronger border / secondary-button fill */
+  --color-slate-650: #cfd7e3;
+
+  /* Text ramp: 100 = primary (darkest), stepping lighter to 600 (faintest).
+     Same ordering the components assume, just resolved to dark-on-light. */
+  --color-slate-600: #9aa3b2;  /* faintest labels */
+  --color-slate-500: #7b8493;  /* most-muted text */
+  --color-slate-400: #5c6879;  /* muted text */
+  --color-slate-300: #41506a;  /* secondary text */
+  --color-slate-200: #29374d;  /* near-primary text */
+  --color-slate-100: #1c2837;  /* primary text (headings/body) */
+  --color-slate-50:  #0f1626;  /* rarely used — deepest text */
+
+  /* Accent -400 shades are tuned for a DARK ground (they read as bright pops
+     there). On white they lose contrast, so nudge each to roughly its -500
+     value: same hue, more saturated/darker → readable accent text, icons, and
+     active-nav labels on light. -600/-500 (button fills) are left untouched. */
+  --color-indigo-400: #5b61e6;
+  --color-emerald-400: #059f76;
+  --color-rose-400: #e5405e;
+  --color-amber-400: #d68207;
+  --color-violet-400: #7c53e8;
+  --color-sky-400: #0c96da;
+
+  /* Tighter, intentional radii (kept from the previous foundation). */
+  --radius-lg: 0.5rem;      /* 8px  */
+  --radius-xl: 0.625rem;    /* 10px */
+  --radius-2xl: 0.875rem;   /* 14px */
+  --radius-3xl: 1.125rem;   /* 18px */
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
+  }
+
+  /* Soft light-gray ground so white cards read as deliberately elevated. */
+  body {
+    background-color: #f4f6f9;
+    color: #1c2837;
+  }
+
+  /* Premium micro-detail: headings track slightly tighter, digits align. */
+  h1, h2, h3, h4, h5 {
+    letter-spacing: -0.015em;
+  }
+  .tabular, table {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Consistent, subtle keyboard-focus ring (accent). */
+  :focus-visible {
+    outline: 2px solid color-mix(in oklch, var(--color-indigo-500) 60%, transparent);
+    outline-offset: 1px;
+    border-radius: 2px;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklch, var(--color-indigo-500) 22%, transparent);
+    color: #1c2837;
+  }
+
+  /* Thin, quiet light scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #cbd3e0 transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background-color: #cbd3e0;
+    border-radius: 9999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: #b3bccb;
+  }
+}

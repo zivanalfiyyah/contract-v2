@@ -1,0 +1,365 @@
+  1931	              {/* Form Create Contract */}
+  1932	              {isCreating && (
+  1933	                <div className="bg-slate-950/60 p-6 rounded-2xl border border-indigo-500/20 space-y-6">
+  1934	                  <div className="border-b border-slate-800 pb-3">
+  1935	                    <h3 className="font-bold text-base flex items-center gap-2">
+  1936	                      <Sparkles className="text-amber-400 w-5 h-5" />
+  1937	                      Digital Contract Creation & AI Drafting Wizard
+  1938	                    </h3>
+  1939	                    <p className="text-xs text-slate-400">
+  1940	                      Lengkapi formulir di bawah ini atau gunakan pembuat draf
+  1941	                      cerdas AI.
+  1942	                    </p>
+  1943	                  </div>
+  1944	
+  1945	                  {/* AI Template Suggestions Box */}
+  1946	                  <div className="bg-slate-900 border border-indigo-500/10 p-4 rounded-xl space-y-3">
+  1947	                    <label className="block text-xs font-semibold text-slate-300">
+  1948	                      Asisten AI: Jelaskan kebutuhan kontrak Anda untuk draf
+  1949	                      otomatis
+  1950	                    </label>
+  1951	                    <div className="flex gap-2">
+  1952	                      <input
+  1953	                        type="text"
+  1954	                        placeholder="Contoh: Buatkan kontrak sewa mesin fotokopi dengan vendor CV Maju, denda telat 1%..."
+  1955	                        value={aiPrompt}
+  1956	                        onChange={(e) => setAiPrompt(e.target.value)}
+  1957	                        className="flex-1 px-3 py-2 bg-slate-950 border border-slate-850 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+  1958	                      />
+  1959	                      <button
+  1960	                        type="button"
+  1961	                        onClick={handleAskAISuggestion}
+  1962	                        disabled={aiLoading}
+  1963	                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 text-white text-xs font-semibold rounded-lg flex items-center gap-1.5 transition"
+  1964	                      >
+  1965	                        {aiLoading ? (
+  1966	                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+  1967	                        ) : (
+  1968	                          <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+  1969	                        )}
+  1970	                        Saran AI
+  1971	                      </button>
+  1972	                    </div>
+  1973	
+  1974	                    {aiSuggestion && (
+  1975	                      <div className="bg-slate-950 p-4 rounded-lg border border-indigo-500/30 text-xs space-y-2 animate-fadeIn">
+  1976	                        <p className="font-bold text-indigo-400">
+  1977	                          Rekomendasi Struktur AI:
+  1978	                        </p>
+  1979	                        <p className="text-slate-300">
+  1980	                          <strong>Judul:</strong>{" "}
+  1981	                          {aiSuggestion.recommendedTitle}
+  1982	                        </p>
+  1983	                        <p className="text-slate-300">
+  1984	                          <strong>Kategori:</strong> {aiSuggestion.category}
+  1985	                        </p>
+  1986	                        <p className="text-slate-300">
+  1987	                          <strong>Analisis:</strong> {aiSuggestion.reason}
+  1988	                        </p>
+  1989	                        <p className="font-semibold text-slate-400">
+  1990	                          Pasal-Pasal Wajib dari AI:
+  1991	                        </p>
+  1992	                        <ul className="list-disc pl-5 text-slate-400 space-y-1">
+  1993	                          {aiSuggestion.mandatoryClauses.map((c, i) => (
+  1994	                            <li key={i}>
+  1995	                              <strong>{c.title}:</strong> {c.reason}
+  1996	                            </li>
+  1997	                          ))}
+  1998	                        </ul>
+  1999	                      </div>
+  2000	                    )}
+  2001	                  </div>
+  2002	
+  2003	                  <form
+  2004	                    onSubmit={handleCreateContract}
+  2005	                    className="grid grid-cols-1 md:grid-cols-2 gap-4"
+  2006	                  >
+  2007	                    {/* Select Integrated Employee or Vendor list */}
+  2008	                    <div className="p-3 bg-slate-900 rounded-xl space-y-2">
+  2009	                      <span className="block text-[11px] font-bold text-slate-400 uppercase">
+  2010	                        Integrasi Modul GA / HR
+  2011	                      </span>
+  2012	                      <div className="grid grid-cols-2 gap-2">
+  2013	                        <div>
+  2014	                          <label className="block text-[10px] text-slate-500">
+  2015	                            Sync Karyawan (HR)
+  2016	                          </label>
+  2017	                          <select
+  2018	                            onChange={(e) => handleSyncFromHR(e.target.value)}
+  2019	                            defaultValue=""
+  2020	                            className="w-full mt-1 bg-slate-950 border border-slate-800 rounded p-1.5 text-xs text-slate-300 focus:outline-none"
+  2021	                          >
+  2022	                            <option value="" disabled>
+  2023	                              -- Pilih Karyawan --
+  2024	                            </option>
+  2025	                            {employees.map((emp) => (
+  2026	                              <option key={emp.id} value={emp.id}>
+  2027	                                {emp.name} ({emp.position})
+  2028	                              </option>
+  2029	                            ))}
+  2030	                          </select>
+  2031	                        </div>
+  2032	
+  2033	                        <div>
+  2034	                          <label className="block text-[10px] text-slate-500">
+  2035	                            Sync Vendor (GA)
+  2036	                          </label>
+  2037	                          <select
+  2038	                            onChange={(e) =>
+  2039	                              handleSyncFromVendor(e.target.value)
+  2040	                            }
+  2041	                            defaultValue=""
+  2042	                            className="w-full mt-1 bg-slate-950 border border-slate-800 rounded p-1.5 text-xs text-slate-300 focus:outline-none"
+  2043	                          >
+  2044	                            <option value="" disabled>
+  2045	                              -- Pilih Vendor --
+  2046	                            </option>
+  2047	                            {vendors.map((v) => (
+  2048	                              <option key={v.id} value={v.id}>
+  2049	                                {v.name}
+  2050	                              </option>
+  2051	                            ))}
+  2052	                          </select>
+  2053	                        </div>
+  2054	                      </div>
+  2055	                    </div>
+  2056	
+  2057	                    <div className="space-y-1">
+  2058	                      <label className="block text-xs font-semibold text-slate-300">
+  2059	                        Judul Kontrak
+  2060	                      </label>
+  2061	                      <input
+  2062	                        type="text"
+  2063	                        required
+  2064	                        value={newContractForm.title}
+  2065	                        onChange={(e) =>
+  2066	                          setNewContractForm({
+  2067	                            ...newContractForm,
+  2068	                            title: e.target.value,
+  2069	                          })
+  2070	                        }
+  2071	                        placeholder="e.g. Perjanjian Kerja Waktu Tertentu HR-Staff"
+  2072	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+  2073	                      />
+  2074	                    </div>
+  2075	
+  2076	                    <div className="space-y-1">
+  2077	                      <label className="block text-xs font-semibold text-slate-300">
+  2078	                        Nama Pihak Kedua
+  2079	                      </label>
+  2080	                      <input
+  2081	                        type="text"
+  2082	                        required
+  2083	                        value={newContractForm.party2Name}
+  2084	                        onChange={(e) =>
+  2085	                          setNewContractForm({
+  2086	                            ...newContractForm,
+  2087	                            party2Name: e.target.value,
+  2088	                          })
+  2089	                        }
+  2090	                        placeholder="Nama Lengkap Karyawan / Vendor"
+  2091	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+  2092	                      />
+  2093	                    </div>
+  2094	
+  2095	                    <div className="space-y-1">
+  2096	                      <label className="block text-xs font-semibold text-slate-300">
+  2097	                        Kategori Kontrak
+  2098	                      </label>
+  2099	                      <select
+  2100	                        value={newContractForm.category}
+  2101	                        onChange={(e) =>
+  2102	                          setNewContractForm({
+  2103	                            ...newContractForm,
+  2104	                            category: e.target.value as any,
+  2105	                          })
+  2106	                        }
+  2107	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none"
+  2108	                      >
+  2109	                        <option value="Employment">Employment (PKWT)</option>
+  2110	                        <option value="Vendor">Vendor</option>
+  2111	                        <option value="NDA">NDA</option>
+  2112	                        <option value="MOU">MOU</option>
+  2113	                        <option value="Rental">Rental / Sewa</option>
+  2114	                      </select>
+  2115	                    </div>
+  2116	
+  2117	                    <div className="space-y-1">
+  2118	                      <label className="block text-xs font-semibold text-slate-300">
+  2119	                        Pilih Master Template
+  2120	                      </label>
+  2121	                      <select
+  2122	                        value={newContractForm.templateId}
+  2123	                        onChange={(e) => {
+  2124	                          const tplId = e.target.value;
+  2125	                          const tpl = templates.find((t) => t.id === tplId);
+  2126	                          const initialVars: Record<string, string> = {};
+  2127	                          if (tpl) {
+  2128	                            tpl.requiredVariables.forEach((v) => {
+  2129	                              initialVars[v] = "";
+  2130	                            });
+  2131	                          }
+  2132	                          setNewContractForm({
+  2133	                            ...newContractForm,
+  2134	                            templateId: tplId,
+  2135	                            variables: initialVars,
+  2136	                          });
+  2137	                        }}
+  2138	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none"
+  2139	                      >
+  2140	                        <option value="">-- Tanpa Template (Kosong) --</option>
+  2141	                        {templates.map((tpl) => (
+  2142	                          <option key={tpl.id} value={tpl.id}>
+  2143	                            {tpl.name}
+  2144	                          </option>
+  2145	                        ))}
+  2146	                      </select>
+  2147	                    </div>
+  2148	
+  2149	                    <div className="space-y-1">
+  2150	                      <label className="block text-xs font-semibold text-slate-300">
+  2151	                        Tanggal Mulai Berlaku
+  2152	                      </label>
+  2153	                      <input
+  2154	                        type="date"
+  2155	                        required
+  2156	                        value={newContractForm.startDate}
+  2157	                        onChange={(e) =>
+  2158	                          setNewContractForm({
+  2159	                            ...newContractForm,
+  2160	                            startDate: e.target.value,
+  2161	                          })
+  2162	                        }
+  2163	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none"
+  2164	                      />
+  2165	                    </div>
+  2166	
+  2167	                    <div className="space-y-1">
+  2168	                      <label className="block text-xs font-semibold text-slate-300">
+  2169	                        Tanggal Selesai Berlaku
+  2170	                      </label>
+  2171	                      <input
+  2172	                        type="date"
+  2173	                        required
+  2174	                        value={newContractForm.endDate}
+  2175	                        onChange={(e) =>
+  2176	                          setNewContractForm({
+  2177	                            ...newContractForm,
+  2178	                            endDate: e.target.value,
+  2179	                          })
+  2180	                        }
+  2181	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none"
+  2182	                      />
+  2183	                    </div>
+  2184	
+  2185	                    <div className="space-y-1">
+  2186	                      <label className="block text-xs font-semibold text-slate-300">
+  2187	                        Nilai Kontrak (Nominal IDR)
+  2188	                      </label>
+  2189	                      <input
+  2190	                        type="number"
+  2191	                        value={newContractForm.contractValue}
+  2192	                        onChange={(e) =>
+  2193	                          setNewContractForm({
+  2194	                            ...newContractForm,
+  2195	                            contractValue: Number(e.target.value),
+  2196	                          })
+  2197	                        }
+  2198	                        placeholder="Contoh: 15000000"
+  2199	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+  2200	                      />
+  2201	                    </div>
+  2202	
+  2203	                    <div className="space-y-1">
+  2204	                      <label className="block text-xs font-semibold text-slate-300">
+  2205	                        Reminder Hari Sebelum Expire
+  2206	                      </label>
+  2207	                      <select
+  2208	                        value={newContractForm.reminderDaysBefore}
+  2209	                        onChange={(e) =>
+  2210	                          setNewContractForm({
+  2211	                            ...newContractForm,
+  2212	                            reminderDaysBefore: Number(e.target.value),
+  2213	                          })
+  2214	                        }
+  2215	                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none"
+  2216	                      >
+  2217	                        <option value="7">7 Hari Sebelumnya</option>
+  2218	                        <option value="14">14 Hari Sebelumnya</option>
+  2219	                        <option value="30">30 Hari Sebelumnya</option>
+  2220	                        <option value="60">60 Hari Sebelumnya</option>
+  2221	                        <option value="90">90 Hari Sebelumnya</option>
+  2222	                      </select>
+  2223	                    </div>
+  2224	
+  2225	                    <div className="flex items-center gap-4 py-2">
+  2226	                      <label className="flex items-center gap-2 text-xs font-semibold text-slate-300 cursor-pointer">
+  2227	                        <input
+  2228	                          type="checkbox"
+  2229	                          checked={newContractForm.isAutoRenew}
+  2230	                          onChange={(e) =>
+  2231	                            setNewContractForm({
+  2232	                              ...newContractForm,
+  2233	                              isAutoRenew: e.target.checked,
+  2234	                            })
+  2235	                          }
+  2236	                          className="rounded border-slate-800 bg-slate-900 text-indigo-600 focus:ring-indigo-500"
+  2237	                        />
+  2238	                        Aktifkan Perpanjangan Otomatis (Smart Auto-Renew)
+  2239	                      </label>
+  2240	                    </div>
+  2241	
+  2242	                    {/* Dynamic Variables input based on selected template */}
+  2243	                    {Object.keys(newContractForm.variables).length > 0 && (
+  2244	                      <div className="md:col-span-2 p-4 bg-slate-900/60 rounded-xl border border-slate-800 space-y-3">
+  2245	                        <p className="text-xs font-bold text-slate-300">
+  2246	                          Isian Variabel Templating Kontrak:
+  2247	                        </p>
+  2248	                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+  2249	                          {Object.keys(newContractForm.variables).map(
+  2250	                            (varKey) => (
+  2251	                              <div key={varKey} className="space-y-1">
+  2252	                                <label className="block text-[10px] font-semibold text-slate-400">
+  2253	                                  {varKey}
+  2254	                                </label>
+  2255	                                <input
+  2256	                                  type="text"
+  2257	                                  value={
+  2258	                                    newContractForm.variables[varKey] || ""
+  2259	                                  }
+  2260	                                  onChange={(e) => {
+  2261	                                    const newVal = e.target.value;
+  2262	                                    setNewContractForm((prev) => ({
+  2263	                                      ...prev,
+  2264	                                      variables: {
+  2265	                                        ...prev.variables,
+  2266	                                        [varKey]: newVal,
+  2267	                                      },
+  2268	                                    }));
+  2269	                                  }}
+  2270	                                  className="w-full px-2.5 py-1.5 bg-slate-950 border border-slate-850 rounded text-xs focus:outline-none focus:border-indigo-500"
+  2271	                                />
+  2272	                              </div>
+  2273	                            ),
+  2274	                          )}
+  2275	                        </div>
+  2276	                      </div>
+  2277	                    )}
+  2278	
+  2279	                    <div className="md:col-span-2 pt-3 flex justify-end gap-2">
+  2280	                      <button
+  2281	                        type="button"
+  2282	                        onClick={() => setIsCreating(false)}
+  2283	                        className="px-4 py-2 bg-slate-800 text-xs font-semibold rounded-xl text-slate-300 hover:bg-slate-750"
+  2284	                      >
+  2285	                        Batal
+  2286	                      </button>
+  2287	                      <button
+  2288	                        type="submit"
+  2289	                        className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition shadow-lg"
+  2290	                      >
+  2291	                        Kirim Request Kontrak
+  2292	                      </button>
+  2293	                    </div>
+  2294	                  </form>
+  2295	                </div>

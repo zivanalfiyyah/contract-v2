@@ -2636,6 +2636,11 @@ app.put("/api/contracts/:id", requireAuth, requireRole("admin", "staff", "legal"
     // dwibahasa.
     documentLanguage: req.body.documentLanguage !== undefined ? req.body.documentLanguage : oldContract.documentLanguage,
     sourceLanguage: req.body.sourceLanguage !== undefined ? req.body.sourceLanguage : oldContract.sourceLanguage,
+    // bilingualLayout: susunan dwibahasa (berdampingan / atas-bawah) — preferensi
+    // tampilan saja seperti documentLanguage, jadi juga selalu diizinkan.
+    bilingualLayout: req.body.bilingualLayout !== undefined
+      ? (req.body.bilingualLayout === "stacked" ? "stacked" : "side")
+      : oldContract.bilingualLayout,
     // showLetterhead: preferensi tampilan (nyala/mati kop surat di preview &
     // export), sama seperti documentLanguage di atas — bukan isi naskah yang
     // disepakati, jadi juga SELALU diizinkan terlepas dari status kontrak.

@@ -232,6 +232,12 @@ export interface Contract {
   // "bilingual" (dua kolom Indonesia|Inggris, jatuh ke gaya berselang untuk
   // pasal yang terlalu panjang). Kosong/undefined = "id".
   documentLanguage?: "id" | "en" | "bilingual";
+  // Susunan tampilan saat documentLanguage = "bilingual":
+  //   "side"    : Indonesia | Inggris berdampingan kiri-kanan (default, perilaku
+  //               lama — pasal yang terlalu panjang tetap jatuh ke berselang)
+  //   "stacked" : Indonesia di atas, Inggris di bawah untuk SEMUA bagian
+  // Kosong/undefined = "side".
+  bilingualLayout?: "side" | "stacked";
   // Tampilkan kop surat (logo+nama+alamat perusahaan) di preview/export PDF.
   // Kosong/undefined = true (perilaku lama, tampil). Kontrak KERJASAMA dua
   // pihak yang sejajar (bukan surat sepihak dari satu pihak) sering sengaja

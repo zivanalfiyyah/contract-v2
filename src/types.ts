@@ -174,12 +174,44 @@ export interface ContractCopy {
   updatedAt?: string;
 }
 
+// Satu halaman "LAMPIRAN X" bergaya foto+tabel (mis. Lampiran A pada contoh
+// Addendum sewa: foto gedung + tabel Daftar Fasilitas berkolom No/Nama/Qty).
+// Beda dari amendmentAttachments (tabel rincian polos tanpa foto, dicetak
+// sebelum penutup) — ini dicetak sbg halaman TERPISAH setelah blok tanda
+// tangan/meterai, boleh berisi foto saja, tabel saja, atau keduanya.
+export interface ContractAttachmentSection {
+  id: string;
+  title: string; // mis. "LAMPIRAN A" — dicetak besar & center di puncak halaman
+  subtitle?: string; // mis. "Konstruksi dan Inventaris Gedung oleh PEMBERI SEWA"
+  // Isi bebas (rich HTML) — bisa berisi campuran teks/gambar/tabel apa saja,
+  // disisipkan lewat DocToolbar (tombol gambar/tabel) yang sama dipakai utk
+  // naskah & pasal. Menggantikan pendekatan field kaku (1 foto + 1 tabel)
+  // di bawah ini, yang dipertahankan cuma utk kompatibilitas mundur data lama.
+  bodyHtml?: string;
+  /** @deprecated pakai bodyHtml. Field lama (foto+tabel kaku) — kalau ada &
+   * bodyHtml kosong, tetap dirender apa adanya supaya lampiran lama tidak hilang. */
+  photoLabel?: string;
+  photoDataUrl?: string;
+  photoCaption?: string;
+  tableLabel?: string;
+  tableColumns?: string[];
+  tableRows?: string[][];
+}
+
 export interface Contract {
   id: string;
   tenantId: string;
   templateId: string;
   contractNumber: string;
   title: string;
+  // Status gabungan Pekerjaan Legal <-> Monitoring Kontrak (Draft, Review
+  // Internal/Eksternal, Revisi/Negosiasi, Finalisasi, Proses TTD, Aktif, dst)
+  // — dihitung server-side dari `status` + externalReviewToken/externalApprovals
+  // (lihat computeUnifiedLegalStatus di server.ts), TIDAK menggantikan
+  // `status` asli. Dipakai murni utk tampilan badge tabel Monitoring Kontrak,
+  // dan angka yang sama juga dipakai linkedContract di API Pekerjaan Legal —
+  // supaya keduanya dijamin identik.
+  unifiedStatus?: string;
   category: string;
   party1Name: string; // Legacy
   party2Name: string; // Legacy
@@ -224,6 +256,13 @@ export interface Contract {
   // akan ikut menimpa editan manual di pasal lain). Diisi bersamaan dengan
   // preambleEn tiap kali /translate sukses (lihat server.ts).
   preambleEnOriginal?: string;
+  // Kalimat transisi baku antara narasi pembuka & daftar pasal (mis. "Masing-
+  // masing pihak sepakat untuk mengikatkan diri..."). Dulu hardcoded penuh,
+  // sama di SEMUA kontrak, tidak bisa diedit sama sekali. Sekarang override
+  // per kontrak (HTML, lewat RichTextEditor) — kosong = pakai kalimat baku
+  // bawaan (lihat closingIdDefault/closingEnDefault di src/App.tsx).
+  closingStatement?: string;
+  closingStatementEn?: string;
   titleEn?: string; // terjemahan judul dokumen (header) — dipakai mode en/bilingual
   docTypeEn?: string; // terjemahan jenis surat, mis. "Cooperation Agreement Letter" — dipakai mode en/bilingual
   // Terjemahan paragraf KHUSUS ADDENDUM (recital "Bahwa PARA PIHAK telah
@@ -235,6 +274,12 @@ export interface Contract {
   // sama seperti preambleEn.
   addendumRecitalEn?: string;
   closingParagraphEn?: string;
+  // Metode pembuatan: "smart" = disusun dari template sistem (pasal otomatis,
+  // preview dirender dari clauses+narasi); "upload" = isi kontrak berasal dari
+  // berkas yang diunggah user (preview menampilkan berkas ITU LANGSUNG,
+  // bukan hasil susun ulang lewat template sistem). Kosong/undefined =
+  // "smart" (kontrak lama sebelum field ini ada, perilaku lama tetap jalan).
+  creationMode?: "smart" | "upload";
   masterPdfUrl?: string; // Optional URL for uploaded master contract PDF
   numberSeq?: number; // Nomor urut yang dikonsumsi dari counter persisten (per jenis+tahun) — dipakai sbg baseline anti-duplikat
   docType?: string; // Jenis dokumen saat pendaftaran arsip (Perjanjian, MOU, Addendum, dll)
@@ -254,6 +299,13 @@ export interface Contract {
   // Lampiran rincian opsional pada Addendum (mis. tabel perhitungan biaya).
   // Kosong/tidak ada = section lampiran tidak dicetak sama sekali di preview.
   amendmentAttachments?: { label: string; satuan?: string; jumlah?: string; keterangan?: string }[];
+  // Halaman Lampiran bergaya foto+tabel, dicetak SETELAH blok tanda tangan/
+  // meterai (lihat attachmentSectionsBlock di src/App.tsx) — beda posisi dan
+  // beda bentuk dari amendmentAttachments di atas. Tersedia utk SEMUA jenis
+  // kontrak (bukan cuma Addendum): Perjanjian awal pun sering perlu lampiran
+  // rincian aset/fasilitas bergaya ini. Kosong/tidak ada = tidak ada halaman
+  // lampiran tambahan sama sekali, tidak mengubah dokumen lama manapun.
+  attachmentSections?: ContractAttachmentSection[];
   subFolderId?: string; // id SubFolder (sub/sub-sub folder) tempat kontrak ini diarsipkan, di bawah `category`
   copies?: ContractCopy[]; // rangkap fisik kontrak (1 atau 2) + posisi meterai per rangkap
   // Sharing fee opsional — kosong/tidak ada = kontrak ini tidak punya skema
@@ -685,3 +737,101 @@ export interface FlowStep {
   pic?: string;
 }
 
+
+// ===== PEKERJAAN LEGAL (Dashboard Legal & Pekerjaan Legal) =====
+// Satu entitas dengan status siklus-hidup penuh, BUKAN tiga tabel terpisah
+// (Pekerjaan Masuk / Pekerjaan Legal Utama / Ditolak seperti di brief) —
+// tiga "tabel" itu di UI cukup difilter dari status yang sama, supaya tidak
+// perlu migrasi data antar tabel setiap kali status berubah (approve/reject/
+// lanjut tahap), dan riwayat (timeline) tetap menempel di satu record yang
+// sama sepanjang hidupnya.
+export type LegalJobStatus =
+  | "menunggu_persetujuan" // baru masuk dari form eksternal, belum direview
+  | "draft"
+  | "review_internal"
+  | "review_eksternal"
+  | "revisi_negosiasi"
+  | "finalisasi"
+  | "penomoran"
+  | "ttd"
+  | "distribusi"
+  | "arsip"
+  | "selesai"
+  | "ditolak";
+
+export const LEGAL_JOB_WORKFLOW_STATUSES: LegalJobStatus[] = [
+  "draft", "review_internal", "review_eksternal", "revisi_negosiasi",
+  "finalisasi", "penomoran", "ttd", "distribusi", "arsip", "selesai",
+];
+
+export type LegalJobPriority = "Tinggi" | "Sedang" | "Rendah";
+
+export interface LegalJobDocument {
+  id: string;
+  name: string;
+  url: string;
+  key?: string;
+  mimeType?: string;
+  size?: number;
+  uploadedAt: string;
+  uploadedBy: string; // nama staff, atau "Eksternal (form)" utk lampiran submission
+}
+
+export interface LegalJobNote {
+  id: string;
+  text: string;
+  authorName: string;
+  createdAt: string;
+}
+
+export interface LegalJobTimelineEntry {
+  id: string;
+  label: string;   // "Request Masuk", "Disetujui — Prioritas Tinggi", "Status → Review Internal", dst
+  detail?: string;
+  actor?: string;   // nama staff pelaku, atau "Eksternal" untuk submit form
+  at: string;
+}
+
+export interface LegalJob {
+  id: string;
+  tenantId: string;
+  title: string;             // Judul Pekerjaan
+  partnerName: string;       // Partner / Pihak
+  docType: string;           // Jenis Dokumen
+  picName: string;           // PIC Pemberi Pekerjaan
+  deadline: string;           // YYYY-MM-DD
+  description?: string;       // Keterangan
+  documents: LegalJobDocument[];
+  status: LegalJobStatus;
+  priority?: LegalJobPriority; // diisi Staff Legal saat approve — TIDAK diisi eksternal
+  source: "eksternal" | "internal";
+  submitterName?: string;      // nama pengisi form eksternal (opsional)
+  submitterEmail?: string;     // email pengisi, untuk notifikasi penolakan (opsional)
+  rejectionReason?: string;
+  rejectedByName?: string;
+  rejectedAt?: string;
+  approvedByName?: string;
+  approvedAt?: string;
+  // Kontrak Eksternal yang menaungi pekerjaan ini — begitu diisi, status
+  // Pekerjaan Legal TIDAK LAGI dipilih manual (lihat LEGAL_JOB_WORKFLOW_STATUSES
+  // di App.tsx): tampilannya WAJIB mengikuti status Contract ini apa adanya,
+  // dihitung ulang tiap kali dibaca (lihat withLinkedContract di server.ts) —
+  // supaya status di tabel Pekerjaan Legal & Monitoring Kontrak selalu satu
+  // sumber kebenaran yang sama, tidak pernah bisa berbeda/basi.
+  linkedContractId?: string;
+  notes: LegalJobNote[];
+  timeline: LegalJobTimelineEntry[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// Link formulir eksternal — satu per tenant, bisa di-generate ulang (token
+// lama langsung tidak berlaku begitu diganti, sama seperti pola
+// externalReviewToken pada Contract).
+export interface LegalFormLink {
+  tenantId: string;
+  token: string;
+  active: boolean;
+  createdAt: string;
+  regeneratedAt?: string;
+}

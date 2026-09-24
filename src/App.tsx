@@ -24,6 +24,7 @@ import {
   Sparkles,
   RefreshCw,
   ChevronRight,
+  ChevronLeft,
   ArrowLeftRight,
   Check,
   AlertTriangle,
@@ -71,6 +72,36 @@ import {
   Send,
   Percent,
   Lock,
+  Sun,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  RotateCcw,
+  RotateCw,
+  Strikethrough,
+  Eraser,
+  AlignLeft,
+  AlignCenter,
+  AlignRight,
+  AlignJustify,
+  List,
+  ListOrdered,
+  Quote,
+  Edit3,
+  Link2,
+  Table2,
+  Minus as MinusIcon,
+  Rows3,
+  Columns3,
+  Palette,
+  QrCode,
+  X,
+  Filter,
+  Inbox,
+  FileX,
+  ThumbsUp,
+  ThumbsDown,
+  StickyNote,
 } from "lucide-react";
 import {
   Clause,
@@ -90,6 +121,8 @@ import {
   ContractVendorSnapshot,
   ContractApprovalStep,
   UserRole,
+  ContractAttachmentSection,
+  LegalJob,
 } from "./types";
 
 // Mirrors dcs/pdf-compose.ts's layoutFlowGraph 1:1 (same algorithm, TS
@@ -1171,6 +1204,193 @@ function ExternalReviewPage({ token }: { token: string }) {
   );
 }
 
+// PUBLIK (tanpa akun) — Formulir Eksternal "Tambah Pekerjaan Legal". Dibuka
+// via link/QR yang dibagikan Staff Legal (?legalFormToken=...), diisi pihak
+// luar (partner/marketing/divisi lain). Submission masuk sbg status
+// "menunggu_persetujuan" — TIDAK langsung ke alur kerja utama (lihat
+// /api/legal-form/:token/submit di server.ts). Sama pola dgn ExternalReviewPage:
+// di-scope oleh token, tanpa login, rate-limited di server.
+function LegalExternalFormPage({ token }: { token: string }) {
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+  const [meta, setMeta] = useState<{ tenantName: string; docTypeOptions: string[]; partnerSuggestions: string[]; picSuggestions: string[] } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(false);
+  const { notice, notify, dismissNotice } = useGuestNotice();
+
+  const [form, setForm] = useState({
+    title: "", partnerName: "", docType: "", picName: "", deadline: "",
+    description: "", submitterName: "", submitterEmail: "",
+  });
+  const [file, setFile] = useState<File | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      try {
+        const res = await fetch(`/api/legal-form/${token}`);
+        const j = await res.json();
+        if (!res.ok) { setErr(j.error || "Link tidak valid."); }
+        else { setMeta(j); setErr(""); }
+      } catch { setErr("Gagal memuat formulir. Periksa koneksi."); }
+      finally { setLoading(false); }
+    })();
+  }, [token]);
+
+  const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) =>
+    setForm((f) => ({ ...f, [k]: e.target.value }));
+
+  const onPickFile = (f: File | null) => {
+    if (!f) { setFile(null); return; }
+    const okType = ["application/pdf", "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "image/jpeg", "image/png"].includes(f.type);
+    if (!okType) { notify("Format berkas tidak didukung. Gunakan PDF, DOC, DOCX, XLS, XLSX, JPG, atau PNG."); return; }
+    if (f.size > 10 * 1024 * 1024) { notify("Ukuran berkas maksimal 10MB."); return; }
+    setFile(f);
+  };
+
+  const submit = async () => {
+    if (!form.title.trim()) return notify("Judul Pekerjaan wajib diisi.");
+    if (!form.partnerName.trim()) return notify("Partner/Pihak wajib diisi.");
+    if (!form.docType.trim()) return notify("Jenis Dokumen wajib dipilih.");
+    if (!form.picName.trim()) return notify("PIC Pemberi Pekerjaan wajib diisi.");
+    if (!form.deadline) return notify("Deadline wajib diisi.");
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      Object.entries(form).forEach(([k, v]) => fd.append(k, String(v)));
+      if (file) fd.append("file", file);
+      const res = await fetch(`/api/legal-form/${token}/submit`, { method: "POST", body: fd });
+      const j = await res.json();
+      if (!res.ok) notify(j.error || "Gagal mengirim formulir.");
+      else setDone(true);
+    } catch { notify("Gagal mengirim formulir. Periksa koneksi."); }
+    finally { setBusy(false); }
+  };
+
+  if (loading) return <div className="min-h-screen bg-slate-900 flex items-center justify-center text-slate-300 text-sm">Memuat formulir…</div>;
+  if (err) return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6">
+      <div className="max-w-md text-center space-y-2">
+        <p className="text-4xl">🔒</p>
+        <h1 className="text-lg font-bold text-slate-100">Link Formulir Tidak Berlaku</h1>
+        <p className="text-sm text-slate-400">{err}</p>
+      </div>
+    </div>
+  );
+  if (done) return (
+    <div className="min-h-screen bg-slate-900 flex items-center justify-center p-6">
+      <div className="max-w-md text-center space-y-3 bg-slate-950/50 border border-slate-800 rounded-2xl p-8">
+        <p className="text-5xl">✅</p>
+        <h1 className="text-lg font-bold text-slate-100">Terkirim!</h1>
+        <p className="text-sm text-slate-400 leading-relaxed">Terima kasih, permintaan Anda sudah kami terima dan akan diproses oleh tim Legal.</p>
+        <button
+          onClick={() => { setDone(false); setForm({ title: "", partnerName: "", docType: "", picName: "", deadline: "", description: "", submitterName: "", submitterEmail: "" }); setFile(null); }}
+          className="mt-2 text-xs font-semibold text-indigo-400 hover:text-indigo-300 cursor-pointer"
+        >
+          Kirim permintaan lain
+        </button>
+      </div>
+    </div>
+  );
+
+  const inputCls = "w-full px-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500 placeholder:text-slate-600";
+  const labelCls = "text-[12.5px] font-semibold text-slate-300";
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans">
+      <GuestNotice notice={notice} onDismiss={dismissNotice} />
+      <div className="max-w-2xl mx-auto p-4 sm:p-8 space-y-5">
+        <header className="bg-slate-950/60 border border-slate-800 rounded-2xl p-6 text-center space-y-1.5">
+          <p className="text-[11px] uppercase tracking-wide text-indigo-400 font-bold">Formulir Eksternal</p>
+          <h1 className="text-xl font-bold">Tambah Pekerjaan Legal</h1>
+          <p className="text-xs text-slate-400">{meta?.tenantName} · Diisi oleh partner/pihak eksternal</p>
+        </header>
+
+        <div className="bg-slate-950/40 border border-slate-800 rounded-2xl p-5 sm:p-7 space-y-5">
+          <div className="space-y-1.5">
+            <label className={labelCls}>Judul Pekerjaan <span className="text-rose-500">*</span></label>
+            <input value={form.title} onChange={set("title")} placeholder='Contoh: "PKS ASMaT ZTrans"' className={inputCls} />
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className={labelCls}>Partner / Pihak <span className="text-rose-500">*</span></label>
+              <input value={form.partnerName} onChange={set("partnerName")} placeholder="Nama partner/mitra" list="partner-suggestions" className={inputCls} />
+              <datalist id="partner-suggestions">{meta?.partnerSuggestions.map((p) => <option key={p} value={p} />)}</datalist>
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelCls}>Jenis Dokumen <span className="text-rose-500">*</span></label>
+              <select value={form.docType} onChange={set("docType")} className={inputCls}>
+                <option value="">Pilih jenis</option>
+                {meta?.docTypeOptions.map((d) => <option key={d} value={d}>{d}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div className="grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className={labelCls}>PIC Pemberi Pekerjaan <span className="text-rose-500">*</span></label>
+              <input value={form.picName} onChange={set("picName")} placeholder="Marketing, AE, Business Dev, dll" list="pic-suggestions" className={inputCls} />
+              <datalist id="pic-suggestions">{meta?.picSuggestions.map((p) => <option key={p} value={p} />)}</datalist>
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelCls}>Deadline <span className="text-rose-500">*</span></label>
+              <input type="date" value={form.deadline} onChange={set("deadline")} className={inputCls} />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={labelCls}>Keterangan <span className="text-slate-500 font-normal">(opsional)</span></label>
+            <textarea value={form.description} onChange={set("description")} rows={3} placeholder="Deskripsi tambahan pekerjaan" className={inputCls} />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className={labelCls}>Upload Dokumen <span className="text-slate-500 font-normal">(opsional)</span></label>
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); onPickFile(e.dataTransfer.files?.[0] || null); }}
+              className="border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-xl p-5 text-center cursor-pointer transition"
+            >
+              <input ref={fileInputRef} type="file" className="hidden" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
+                onChange={(e) => onPickFile(e.target.files?.[0] || null)} />
+              {file ? (
+                <p className="text-xs text-emerald-400 font-semibold">📎 {file.name} <button onClick={(e) => { e.stopPropagation(); setFile(null); }} className="ml-2 text-slate-500 hover:text-rose-400 cursor-pointer">Hapus</button></p>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-400">Drag &amp; drop file di sini atau klik untuk memilih file</p>
+                  <p className="text-[10px] text-slate-600 mt-1">Format: PDF, DOC, DOCX, XLS, JPG, PNG (Maks. 10MB)</p>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="pt-2 border-t border-slate-800 grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className={labelCls}>Nama Anda <span className="text-slate-500 font-normal">(opsional)</span></label>
+              <input value={form.submitterName} onChange={set("submitterName")} placeholder="Untuk memudahkan komunikasi" className={inputCls} />
+            </div>
+            <div className="space-y-1.5">
+              <label className={labelCls}>Email Anda <span className="text-slate-500 font-normal">(opsional)</span></label>
+              <input type="email" value={form.submitterEmail} onChange={set("submitterEmail")} placeholder="Info status akan dikirim ke sini" className={inputCls} />
+            </div>
+          </div>
+
+          <button onClick={submit} disabled={busy}
+            className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-sm font-bold rounded-xl cursor-pointer transition">
+            {busy ? "Mengirim…" : "Kirim Permintaan"}
+          </button>
+        </div>
+        <p className="text-center text-[10px] text-slate-600 py-4">Formulir aman berbasis token. Permintaan Anda akan direview oleh Tim Legal sebelum diproses.</p>
+      </div>
+    </div>
+  );
+}
+
 // Sorot kutipan komentar di dalam teks bagian dokumen (quote-based, mirip
 // pola yang sama dipakai halaman review eksternal Kontrak) — khusus dipakai
 // DcsExternalReviewPage karena anchor DCS (field/sectionIndex/quote) beda
@@ -1396,7 +1616,7 @@ const looksLikeHtml = (s: string) => /<[a-z][\s\S]*>/i.test(s || "");
 const escapeHtml = (s: string) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 // Tag/atribut yang diizinkan di HTML narasi — cukup untuk format teks Word-like,
 // tanpa script/iframe/dll. Dipakai saat render (DOMPurify) & saat simpan.
-const RICH_ALLOWED = { ALLOWED_TAGS: ["p", "br", "b", "strong", "i", "em", "u", "s", "span", "div", "ul", "ol", "li", "h3", "h4", "font"], ALLOWED_ATTR: ["style", "color", "size", "align"] };
+const RICH_ALLOWED = { ALLOWED_TAGS: ["p", "br", "b", "strong", "i", "em", "u", "s", "span", "div", "ul", "ol", "li", "h3", "h4", "font", "table", "thead", "tbody", "tr", "td", "th", "img", "a", "hr", "blockquote"], ALLOWED_ATTR: ["style", "color", "size", "align", "src", "href", "target", "rel", "alt", "colspan", "rowspan", "contenteditable"] };
 const sanitizeRich = (html: string): string => DOMPurify.sanitize(html || "", RICH_ALLOWED as any) as unknown as string;
 // Substitusi {{Token}} lalu render HTML aman. Nilai token di-escape agar tak
 // bisa menyuntik tag lewat data kontrak.
@@ -1610,7 +1830,1510 @@ function RichTextEditor({ valueHtml, onChange, tokens, minHeight = 120 }: {
   );
 }
 
+// Palet token cepat utk dropdown "Sisipkan" di DocToolbar — gabungan dari
+// PREAMBLE_TOKENS & CLAUSE_TOKENS (yg letaknya di dalam App(), tidak bisa
+// diakses dari komponen top-level ini), supaya satu toolbar tetap bisa
+// menyisipkan token konfigurasi data (Pihak Pertama, tanggal, dll) di mana
+// pun dipakai — naskah, pasal, ATAUPUN lampiran.
+const DOC_INSERT_TOKENS: { label: string; token: string }[] = [
+  { label: "Nama Pihak 1", token: "{{Party1Name}}" },
+  { label: "Alamat Pihak 1", token: "{{Party1Address}}" },
+  { label: "Perwakilan Pihak 1", token: "{{Party1Representative}}" },
+  { label: "Jabatan Perwakilan Pihak 1", token: "{{Party1RepTitle}}" },
+  { label: "Nama Pihak 2", token: "{{Party2Name}}" },
+  { label: "Alamat Pihak 2", token: "{{Party2Address}}" },
+  { label: "Nama Perusahaan (PT)", token: "{{CompanyName}}" },
+  { label: "Nama Vendor/Pihak 2", token: "{{VendorName}}" },
+  { label: "Nilai Kontrak", token: "{{ContractValue}}" },
+  { label: "Mata Uang", token: "{{Currency}}" },
+  { label: "Termin Bayar", token: "{{PaymentTerm}}" },
+  { label: "Tanggal Mulai", token: "{{StartDate}}" },
+  { label: "Tanggal Selesai", token: "{{EndDate}}" },
+  { label: "Alamat", token: "{{Address}}" },
+];
+
+// Hapus deklarasi font-family dari HTML hasil paste (mis. dari Microsoft
+// Word yang selalu menyisipkan "font-family:Calibri" dkk di setiap span) —
+// supaya teks yang ditempel ikut font default dokumen (Times New Roman),
+// BUKAN font asal file sumbernya. Formatting lain (bold/italic/warna/dll)
+// tetap dipertahankan, cuma font-family-nya yang dibuang.
+const stripPastedFontFamily = (html: string): string =>
+  html
+    .replace(/font-family\s*:[^;"']*;?/gi, "")
+    .replace(/<font\b([^>]*)\sface="[^"]*"([^>]*)>/gi, "<font$1$2>")
+    .replace(/\bface="[^"]*"/gi, "");
+
+// Pelacak elemen struktural (tabel/sel/gambar) yang barusan diklik di dalam
+// InlineRich manapun — dibaca DocToolbar utk tombol edit-tabel & hapus
+// terpadu. Sengaja module-level (bukan React state) supaya tidak memicu
+// render ulang tiap klik; toolbar cuma butuh nilai TERKINI saat tombolnya
+// ditekan, bukan reaktif.
+let activeStructural: { table: HTMLTableElement | null; cell: HTMLTableCellElement | null; img: HTMLElement | null } = { table: null, cell: null, img: null };
+
+// Toolbar tunggal ala img2 (undo/redo, B/I/U/S, align x4, list x2, quote) —
+// TIDAK terikat ke satu contentEditable tertentu. execCommand bekerja atas
+// SELEKSI DOM aktif, jadi satu toolbar ini otomatis "ngikutin" contentEditable
+// manapun yang barusan difokus, asal tombolnya sendiri tidak pernah mencuri
+// fokus (onMouseDown preventDefault, sama pola dgn Btn di RichTextEditor).
+function DocToolbar() {
+  const exec = (cmd: string, arg?: string) => {
+    try { document.execCommand("styleWithCSS", false, "true"); } catch { /* noop */ }
+    document.execCommand(cmd, false, arg);
+  };
+  // Sisipkan PDF sebagai gambar — poin revisi "import PDF di Lampiran".
+  // Mengikuti konvensi industri utk lampiran (bukti/dokumen pendukung):
+  // ditempel sebagai gambar per-halaman (bisa dilihat langsung + ikut
+  // ke-export saat "Export to PDF", persis seperti foto JPG yang sudah
+  // bisa disisipkan sejak awal), BUKAN diekstrak jadi teks — beda dari
+  // fitur "Upload Dokumen" utama yang memang mengekstrak isi jadi pasal.
+  // pdfjs-dist di-import DINAMIS (bukan di top-level file) supaya library
+  // ini (lumayan besar) cuma dimuat SAAT tombol ini dipakai, tidak
+  // menambah beban awal aplikasi & tidak berisiko ke fitur lain kalau
+  // gagal dimuat (kegagalannya kekurung di dalam fungsi ini saja).
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const insertPdfAsImages = async (file: File) => {
+    setPdfBusy(true);
+    try {
+      const pdfjsLib = await import("pdfjs-dist");
+      pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+        "pdfjs-dist/build/pdf.worker.mjs",
+        import.meta.url,
+      ).toString();
+      const buf = await file.arrayBuffer();
+      const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
+      let html = "";
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        // scale 2 = cukup tajam utk dibaca & dicetak ulang lewat "Export to
+        // PDF" (yang sendiri men-screenshot preview di scale hingga 2x —
+        // lihat generateContractPdf), tanpa bikin ukuran dokumen membengkak.
+        const viewport = page.getViewport({ scale: 2 });
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) continue;
+        await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+        // JPEG (bukan PNG) — halaman PDF hasil scan biasanya berupa foto
+        // penuh (bukan garis/teks tajam), jauh lebih kecil ukurannya sbg
+        // JPEG tanpa kehilangan kualitas yang kentara.
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+        // display:block (bukan inline-block ala wrapper gambar JPG biasa)
+        // supaya tiap halaman PDF turun ke barisnya sendiri-sendiri secara
+        // berurutan, bukan berjejer menyamping. width:100% otomatis
+        // menyesuaikan lebar kolom dokumen (sama seperti foto lampiran
+        // biasa), height:auto menjaga rasio asli halaman PDF-nya.
+        html += `<span contenteditable="false" data-img-wrap="1" style="display:block;width:100%;line-height:0;margin:4px 0;"><img src="${dataUrl}" style="width:100%;height:auto;display:block;" /></span>`;
+      }
+      exec("insertHTML", html);
+    } catch (err) {
+      console.error("Gagal memproses PDF:", err);
+      window.alert("Gagal membaca file PDF ini. Pastikan filenya tidak rusak/terkunci password, lalu coba lagi.");
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+  const Btn = ({ onClick, title, children }: { onClick: () => void; title: string; children: any }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
+      className="min-w-[34px] h-[34px] px-2 text-sm font-bold bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 hover:border-slate-700 text-slate-200 cursor-pointer flex items-center justify-center transition-colors">
+      {children}
+    </button>
+  );
+  // Revisi (feedback user setelah dicoba): versi SEBELUMNYA pakai CSS
+  // `resize` bawaan browser di TIAP sel (th/td) — ternyata gagang resize
+  // kecil di pojok tiap sel malah NEMPEL/NUTUPIN teks isi sel (apalagi sel
+  // sempit, padding cuma 6px), bikin "teks nya tidak terbaca". Diganti total
+  // dengan gagang resize TUNGGAL di pojok TABEL (bukan per-sel) — pola PERSIS
+  // sama dgn resize gambar yang sudah ada & terbukti nyaman (lihat
+  // ImageSelectionOverlay: klik objek → muncul gagang mengambang, drag utk
+  // resize) — sekarang dipakai lagi utk tabel lewat TableSelectionOverlay di
+  // bawah. th/td jadi POLOS lagi (tanpa resize/overflow), teks selalu penuh
+  // terbaca; ukuran keseluruhan tabel yang dibesar/kecilkan, kolom ikut
+  // menyesuaikan proporsional (table-layout:fixed).
+  const TABLE_TH_STYLE = "border:1px solid #64748b;background:#86efac;padding:6px 8px;";
+  const TABLE_TD_STYLE = "border:1px solid #64748b;padding:6px 8px;";
+  const addTableRow = () => {
+    const t = activeStructural.table;
+    if (!t) return;
+    const lastRow = t.rows[t.rows.length - 1];
+    const colCount = lastRow ? lastRow.cells.length : 1;
+    const row = t.insertRow(-1);
+    for (let i = 0; i < colCount; i++) {
+      const cell = row.insertCell(-1);
+      cell.setAttribute("style", TABLE_TD_STYLE);
+      cell.innerHTML = "&nbsp;";
+    }
+  };
+  const addTableCol = () => {
+    const t = activeStructural.table;
+    if (!t) return;
+    for (const row of Array.from(t.rows)) {
+      const isHeaderRow = row.querySelectorAll("th").length > 0;
+      const cell = row.insertCell(-1) as HTMLTableCellElement;
+      if (isHeaderRow && row.cells[0]?.tagName === "TH") {
+        const th = document.createElement("th");
+        th.setAttribute("style", TABLE_TH_STYLE);
+        th.innerHTML = "Kolom Baru";
+        row.replaceChild(th, cell);
+      } else {
+        cell.setAttribute("style", TABLE_TD_STYLE);
+        cell.innerHTML = "&nbsp;";
+      }
+    }
+  };
+  const removeTableRow = () => {
+    const cell = activeStructural.cell;
+    const t = activeStructural.table;
+    if (!t || !cell) return;
+    const row = cell.closest("tr");
+    if (row && t.rows.length > 1) row.remove();
+  };
+  const removeTableCol = () => {
+    const cell = activeStructural.cell;
+    const t = activeStructural.table;
+    if (!t || !cell) return;
+    const idx = Array.from(cell.parentElement?.children || []).indexOf(cell);
+    if (idx < 0) return;
+    for (const row of Array.from(t.rows)) {
+      if (row.cells.length > 1 && row.cells[idx]) row.deleteCell(idx);
+    }
+  };
+  const colorTableHeader = () => {
+    const t = activeStructural.table;
+    if (!t) return;
+    const color = window.prompt("Warna header tabel (nama warna atau kode hex):", "#86efac");
+    if (!color) return;
+    t.querySelectorAll("th").forEach((th) => { (th as HTMLElement).style.background = color; });
+  };
+  const deleteSelectedElement = () => {
+    if (activeStructural.table) { activeStructural.table.remove(); activeStructural.table = null; activeStructural.cell = null; return; }
+    if (activeStructural.img) { activeStructural.img.remove(); activeStructural.img = null; return; }
+  };
+  // Judul tiap seksi — desain baru meniru pola "kartu bersekat" (label besar
+  // di atas, lalu isinya) supaya pemula bisa langsung tahu dari judulnya
+  // seksi mana yang mengatur apa, tanpa harus menghover satu-satu dulu.
+  const SectionTitle = ({ children }: { children: any }) => (
+    <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">{children}</p>
+  );
+  // Kartu tombol besar (ikon di atas, label di bawah) — dipakai khusus utk
+  // seksi "Sisipkan Dokumen", meniru tampilan kartu grid yang diminta.
+  const InsertCard = ({ onClick, title, icon, label }: { onClick: () => void; title: string; icon: any; label: string }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
+      className="flex flex-col items-center justify-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 hover:bg-slate-800 hover:border-slate-700 py-3 px-2 text-slate-300 cursor-pointer transition-colors">
+      {icon}
+      <span className="text-[10.5px] font-medium leading-none text-center">{label}</span>
+    </button>
+  );
+  // Sama seperti InsertCard, tapi utk aksi yg butuh <input type="file"> atau
+  // <select> tersembunyi di atasnya (dipakai spt file input Gambar/PDF yang
+  // sebelumnya juga berupa <label> — polanya dipertahankan, cuma tampilannya
+  // dibesarkan jadi kartu).
+  const InsertCardWrap = ({ title, icon, label, disabled, children }: { title: string; icon: any; label: string; disabled?: boolean; children: any }) => (
+    <label
+      onMouseDown={(e) => e.preventDefault()}
+      title={title}
+      className={`relative flex flex-col items-center justify-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 py-3 px-2 text-slate-300 transition-colors ${disabled ? "opacity-50 cursor-wait" : "hover:bg-slate-800 hover:border-slate-700 cursor-pointer"}`}
+    >
+      {icon}
+      <span className="text-[10.5px] font-medium leading-none text-center">{label}</span>
+      {children}
+    </label>
+  );
+  // Tombol ikon + teks label sejajar (bukan dropdown) — dipakai khusus utk
+  // seksi "Table Tools". Revisi (feedback user): dropdown "Baris & Kolom…"
+  // dianggap kurang jelas krn aksinya tersembunyi di balik klik dropdown
+  // dulu; dikembalikan jadi tombol langsung yang kelihatan semua sekaligus.
+  const LabelBtn = ({ onClick, title, icon, label, danger }: { onClick: () => void; title: string; icon: any; label: string; danger?: boolean }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
+      className={`h-[34px] px-2.5 text-xs font-medium bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 hover:border-slate-700 flex items-center gap-1.5 cursor-pointer transition-colors ${danger ? "text-rose-400" : "text-slate-300"}`}>
+      {icon}<span>{label}</span>
+    </button>
+  );
+  return (
+    <div className="p-3 border border-slate-800 rounded-2xl bg-slate-900 shadow-xl mb-3 space-y-3.5">
+      {/* Baris bantuan singkat — cuma sekali tampil di paling atas, supaya
+          pemula tahu tiap ikon punya keterangan kalau kursor diarahkan ke
+          situ, tanpa harus dijelaskan ulang di tiap tombol. */}
+      <p className="text-[10px] text-slate-500 flex items-center gap-1">
+        <HelpCircle className="w-3 h-3 shrink-0" /> Arahkan kursor ke tiap tombol untuk melihat fungsinya.
+      </p>
+
+      {/* Seksi 1: "Text Styling" — Undo/Redo, gaya paragraf + font (dropdown
+          diperbesar), lalu Bold/Italic/Underline/dst. */}
+      <div>
+        <SectionTitle>Text Styling</SectionTitle>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Btn onClick={() => exec("undo")} title="Undo — batalkan perubahan terakhir"><RotateCcw className="w-4 h-4" /></Btn>
+          <Btn onClick={() => exec("redo")} title="Redo — ulangi perubahan yang dibatalkan"><RotateCw className="w-4 h-4" /></Btn>
+          <span className="w-px h-5 bg-slate-800 mx-1" />
+          <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("formatBlock", e.target.value); e.target.selectedIndex = 0; }}
+            title="Gaya teks" className="h-[34px] px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 cursor-pointer min-w-[110px]">
+            <option value="">Teks Normal</option>
+            <option value="h3">Judul</option>
+            <option value="blockquote">Kutipan</option>
+          </select>
+          <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("fontName", e.target.value); e.target.selectedIndex = 0; }}
+            title="Jenis huruf" className="h-[34px] px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 cursor-pointer min-w-[90px]">
+            <option value="">Font</option>
+            {RICH_FONT_OPTIONS.map((f) => (
+              <option key={f} value={f} style={{ fontFamily: /\s/.test(f) ? `'${f}'` : f }}>{f}</option>
+            ))}
+          </select>
+          <span className="w-px h-5 bg-slate-800 mx-1" />
+          <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+            <Btn onClick={() => exec("bold")} title="Tebal (Bold)"><b>B</b></Btn>
+            <Btn onClick={() => exec("italic")} title="Miring (Italic)"><i>I</i></Btn>
+            <Btn onClick={() => exec("underline")} title="Garis bawah (Underline)"><u>U</u></Btn>
+            <Btn onClick={() => exec("strikeThrough")} title="Coret (Strikethrough)"><Strikethrough className="w-4 h-4" /></Btn>
+          </div>
+          <Btn onClick={() => exec("removeFormat")} title="Bersihkan semua format teks yang dipilih"><Eraser className="w-4 h-4" /></Btn>
+        </div>
+      </div>
+
+      {/* Seksi 2: "Paragraph & Lists" — perataan teks + daftar/bullet. */}
+      <div>
+        <SectionTitle>Paragraph &amp; Lists</SectionTitle>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+            <Btn onClick={() => exec("justifyLeft")} title="Rata kiri"><AlignLeft className="w-4 h-4" /></Btn>
+            <Btn onClick={() => exec("justifyCenter")} title="Rata tengah"><AlignCenter className="w-4 h-4" /></Btn>
+            <Btn onClick={() => exec("justifyRight")} title="Rata kanan"><AlignRight className="w-4 h-4" /></Btn>
+            <Btn onClick={() => exec("justifyFull")} title="Rata kiri-kanan (rapi di kedua sisi)"><AlignJustify className="w-4 h-4" /></Btn>
+          </div>
+          <span className="w-px h-5 bg-slate-800 mx-1" />
+          <Btn onClick={() => exec("insertUnorderedList")} title="Daftar butir (bullet list)">
+            <List className="w-4 h-4" />
+          </Btn>
+          <span className="text-[10px] text-slate-500 -ml-1">Bullet</span>
+          <Btn onClick={() => exec("insertOrderedList")} title="Daftar bernomor">
+            <ListOrdered className="w-4 h-4" />
+          </Btn>
+          <span className="text-[10px] text-slate-500 -ml-1">Lists</span>
+          <Btn onClick={() => exec("formatBlock", "blockquote")} title="Kutipan"><Quote className="w-4 h-4" /></Btn>
+        </div>
+      </div>
+
+      {/* Seksi 3: "Document Insertion" — SEMUA tombol tambah-sesuatu jadi
+          kartu grid besar dengan ikon + label, meniru tampilan kartu yang
+          diminta (Insert Image / Insert Link / Insert Table / dst). */}
+      <div>
+        <SectionTitle>Document Insertion</SectionTitle>
+        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-1.5">
+          <InsertCardWrap
+            title="Sisipkan gambar (JPG/PNG) — klik gambarnya lagi setelah disisipkan utk memperbesar/menggeser"
+            icon={<ImageIcon className="w-4 h-4" />}
+            label="Insert Image"
+          >
+            <input
+              type="file"
+              accept="image/*"
+              className="absolute inset-0 opacity-0 cursor-pointer"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (!f) return;
+                const reader = new FileReader();
+                // Dibungkus <span contenteditable="false" style="resize:
+                // horizontal;..."> — SENGAJA cuma horizontal (bukan "both"),
+                // karena img di dalamnya width:100% + height:AUTO (proporsional
+                // ngikutin lebar, bukan dipaksa 100% tinggi wrapper) — itu yg
+                // bikin versi sebelumnya gepeng saat wrapper di-resize bebas 2
+                // arah. Drag gagang di kanan = lebar berubah, tinggi ikut
+                // otomatis, rasio selalu terjaga. Wrapper contenteditable=false
+                // jadi satu unit atomik yg bisa digeser-pindah (drag) dlm teks.
+                reader.onload = () =>
+                  exec(
+                    "insertHTML",
+                    `<span contenteditable="false" data-img-wrap="1" style="display:inline-block;resize:horizontal;overflow:hidden;max-width:100%;width:280px;line-height:0;vertical-align:middle;"><img src="${String(reader.result || "")}" style="width:100%;height:auto;display:block;" /></span>&nbsp;`,
+                  );
+                reader.readAsDataURL(f);
+                e.target.value = "";
+              }}
+            />
+          </InsertCardWrap>
+          <InsertCard
+            onClick={() => { const url = window.prompt("Masukkan URL tautan:"); if (url) exec("createLink", url); }}
+            title="Sisipkan tautan/link ke halaman web"
+            icon={<Link2 className="w-4 h-4" />}
+            label="Insert Link"
+          />
+          <InsertCard
+            onClick={() =>
+              exec(
+                "insertHTML",
+                // table-layout:fixed WAJIB — supaya lebar kolom ditentukan oleh
+                // lebar sel HEADER (baris pertama) saja & konsisten ke semua
+                // baris di bawahnya. Tanpa ini, drag-resize di th tidak akan
+                // benar-benar mengubah lebar kolom (browser hitung ulang lebar
+                // dari konten terlebar di kolom itu, bukan dari style width).
+                '<table style="width:100%;border-collapse:collapse;table-layout:fixed;margin:8px 0;"><tbody>' +
+                  `<tr><th style="${TABLE_TH_STYLE}">Kolom 1</th><th style="${TABLE_TH_STYLE}">Kolom 2</th><th style="${TABLE_TH_STYLE}">Kolom 3</th></tr>` +
+                  `<tr><td style="${TABLE_TD_STYLE}">&nbsp;</td><td style="${TABLE_TD_STYLE}">&nbsp;</td><td style="${TABLE_TD_STYLE}">&nbsp;</td></tr>` +
+                  `<tr><td style="${TABLE_TD_STYLE}">&nbsp;</td><td style="${TABLE_TD_STYLE}">&nbsp;</td><td style="${TABLE_TD_STYLE}">&nbsp;</td></tr>` +
+                  "</tbody></table>",
+              )
+            }
+            title="Sisipkan tabel (3 kolom) — klik tabelnya lagi setelah disisipkan utk memperbesar/memperkecil ukurannya"
+            icon={<Table2 className="w-4 h-4" />}
+            label="Insert Table"
+          />
+          <InsertCardWrap
+            title={pdfBusy ? "Memproses PDF…" : "Sisipkan file PDF — tiap halamannya otomatis jadi gambar, ditempel berurutan"}
+            icon={<FileDigit className="w-4 h-4" />}
+            label={pdfBusy ? "Memproses…" : "Insert PDF"}
+            disabled={pdfBusy}
+          >
+            <input
+              type="file"
+              accept="application/pdf,.pdf"
+              className="absolute inset-0 opacity-0 cursor-pointer disabled:cursor-wait"
+              disabled={pdfBusy}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (!f) return;
+                void insertPdfAsImages(f);
+              }}
+            />
+          </InsertCardWrap>
+          <InsertCard
+            onClick={() => exec("insertHorizontalRule")}
+            title="Sisipkan garis pemisah horizontal"
+            icon={<MinusIcon className="w-4 h-4" />}
+            label="Insert Line"
+          />
+          <InsertCardWrap
+            title="Sisipkan token konfigurasi data (Pihak Pertama, tanggal, PT, dll) — otomatis terisi dari data kontrak"
+            icon={<ChevronRight className="w-4 h-4 text-indigo-400" />}
+            label="Dynamic Field"
+          >
+            <select
+              onMouseDown={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                const tok = e.target.value;
+                if (tok) exec("insertText", tok);
+                e.target.selectedIndex = 0;
+              }}
+              className="absolute inset-0 opacity-0 cursor-pointer"
+            >
+              <option value="">+ Data Kontrak…</option>
+              {DOC_INSERT_TOKENS.map((t) => (
+                <option key={t.token} value={t.token}>{t.label}</option>
+              ))}
+            </select>
+          </InsertCardWrap>
+        </div>
+      </div>
+
+      {/* Seksi 4: Edit tabel — tombol LANGSUNG (bukan dropdown), supaya semua
+          aksi kelihatan sekaligus tanpa perlu klik buka dulu. Klik dulu DI
+          DALAM tabel yang mau diubah, baru pilih tombol aksinya di sini. */}
+      <div>
+        <SectionTitle>Table Tools</SectionTitle>
+        <p className="text-[10px] text-slate-500 -mt-1 mb-1.5">Klik dulu di dalam tabel yang mau diubah, lalu pilih aksi di bawah ini.</p>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <LabelBtn onClick={addTableRow} title="Tambah baris baru di bagian bawah tabel" icon={<Rows3 className="w-3.5 h-3.5" />} label="+ Baris" />
+          <LabelBtn onClick={addTableCol} title="Tambah kolom baru di tabel" icon={<Columns3 className="w-3.5 h-3.5" />} label="+ Kolom" />
+          <LabelBtn onClick={removeTableRow} title="Hapus baris tempat sel yang terakhir Anda klik" icon={<Rows3 className="w-3.5 h-3.5" />} label="− Baris" />
+          <LabelBtn onClick={removeTableCol} title="Hapus kolom tempat sel yang terakhir Anda klik" icon={<Columns3 className="w-3.5 h-3.5" />} label="− Kolom" />
+          <LabelBtn onClick={colorTableHeader} title="Ubah warna baris header tabel" icon={<Palette className="w-3.5 h-3.5" />} label="Warna Header" />
+          <span className="w-px h-5 bg-slate-800 mx-1" />
+          <LabelBtn onClick={deleteSelectedElement} title="Hapus tabel atau gambar yang terakhir Anda klik" icon={<Trash2 className="w-3.5 h-3.5" />} label="Hapus" danger />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// contentEditable polos TANPA toolbar sendiri (dikontrol oleh DocToolbar di
+// atas preview) — dipakai utk mode edit inline di dalam preview (naskah
+// pembuka, pasal, lampiran dst). Simpan HANYA saat blur (bukan tiap keystroke)
+// supaya tidak spam PUT ke server. onClick melacak tabel/sel/gambar yg
+// diklik ke activeStructural, dibaca tombol edit-tabel & hapus di DocToolbar.
+function InlineRich({ html, onSave, className, placeholder }: { html: string; onSave: (html: string) => void; className?: string; placeholder?: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (ref.current && ref.current.innerHTML !== (html || "")) ref.current.innerHTML = html || ""; }, [html]);
+  return (
+    <div
+      ref={ref}
+      contentEditable
+      suppressContentEditableWarning
+      data-placeholder={placeholder}
+      onBlur={() => { if (ref.current) onSave(sanitizeRich(ref.current.innerHTML)); }}
+      onPaste={(e) => {
+        // Paste dari Word/aplikasi lain bawa font-family sendiri (mis.
+        // Calibri) menempel di tiap <span style="...">. Dibuang di sini
+        // supaya teks yang ditempel IKUT font default dokumen (Times New
+        // Roman / pilihan dropdown Font), bukan font asal sumbernya —
+        // formatting lain (bold/italic/list/dll) tetap dipertahankan.
+        e.preventDefault();
+        const html = e.clipboardData.getData("text/html");
+        const text = e.clipboardData.getData("text/plain");
+        const cleaned = html ? sanitizeRich(stripPastedFontFamily(html)) : "";
+        try { document.execCommand("styleWithCSS", false, "true"); } catch { /* noop */ }
+        document.execCommand("insertHTML", false, cleaned || text.replace(/\n/g, "<br>"));
+      }}
+      onClick={(e) => {
+        const target = e.target as HTMLElement;
+        const img = target.closest("img") as HTMLImageElement | null;
+        // Kalau gambar dibungkus span resizable (lihat tombol sisip gambar
+        // di DocToolbar), yang perlu dihapus/dilacak itu WRAPPER-nya (satu
+        // unit utuh), bukan cuma <img> di dalamnya.
+        const imgUnit = img ? ((img.closest('span[data-img-wrap="1"]') as HTMLElement) || img) : null;
+        activeStructural = {
+          table: (target.closest("table") as HTMLTableElement) || null,
+          cell: (target.closest("td, th") as HTMLTableCellElement) || null,
+          img: (imgUnit as any) || null,
+        };
+        // Kontrol mengambang ala Canva (lihat ImageSelectionOverlay) — muncul
+        // nempel di gambar yang baru diklik, ilang kalau klik bagian lain.
+        window.dispatchEvent(new CustomEvent("docimg:select", { detail: imgUnit }));
+        // Sama utk tabel (lihat TableSelectionOverlay) — TAPI cuma dipasang
+        // kalau yang diklik BUKAN gambar, supaya klik gambar di dalam sel
+        // tabel (jarang, tapi mungkin) tetap memunculkan overlay gambar,
+        // bukan overlay tabel keduanya sekaligus tumpang-tindih.
+        window.dispatchEvent(new CustomEvent("doctable:select", { detail: imgUnit ? null : (target.closest("table") as HTMLTableElement | null) }));
+      }}
+      className={className || "focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1 empty:before:content-[attr(data-placeholder)] empty:before:text-slate-600"}
+    />
+  );
+}
+
+// Kontrol gambar mengambang ala Canva/Google Docs — nempel PERSIS di gambar
+// yang barusan diklik (bukan di toolbar atas yg jauh), muncul gagang resize
+// di pojok kanan-bawah + strip tombol align/hapus tepat di atasnya. Dipasang
+// SEKALI di root App (fixed position, lepas dari alur dokumen) dan
+// mendengarkan event "docimg:select" yang di-dispatch InlineRich tiap ada
+// klik pada gambar (atau null kalau klik di luar gambar, utk menyembunyikan).
+function ImageSelectionOverlay() {
+  const [el, setEl] = useState<HTMLElement | null>(null);
+  const [, bump] = useState(0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onSelect = (e: Event) => setEl(((e as CustomEvent).detail as HTMLElement) || null);
+    window.addEventListener("docimg:select", onSelect as EventListener);
+    return () => window.removeEventListener("docimg:select", onSelect as EventListener);
+  }, []);
+  useEffect(() => {
+    if (!el) return;
+    const reposition = () => bump((t) => t + 1);
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    // Klik di luar overlay & di luar gambar yg sedang aktif → sembunyikan.
+    // Dicek capture-phase SEBELUM handler onClick InlineRich sempat
+    // dispatch ulang, supaya klik ke elemen lain (bukan gambar lain) juga
+    // ikut menutup overlay, bukan cuma saat InlineRich yg nge-dispatch null.
+    const onDocClick = (ev: MouseEvent) => {
+      const t = ev.target as Node;
+      if (boxRef.current?.contains(t)) return;
+      if (el.contains(t) || el === t) return;
+      setEl(null);
+    };
+    document.addEventListener("mousedown", onDocClick, true);
+    return () => {
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+      document.removeEventListener("mousedown", onDocClick, true);
+    };
+  }, [el]);
+  if (!el || !document.contains(el)) return null;
+  const rect = el.getBoundingClientRect();
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startWidth = rect.width;
+    const onMove = (ev: PointerEvent) => {
+      const next = Math.max(40, Math.round(startWidth + (ev.clientX - startX)));
+      el.style.width = next + "px";
+      bump((t) => t + 1);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+  const align = (mode: "left" | "center" | "right") => {
+    if (mode === "left") { el.style.float = "left"; el.style.display = "inline-block"; el.style.margin = "4px 12px 4px 0"; }
+    if (mode === "center") { el.style.float = "none"; el.style.display = "block"; el.style.margin = "8px auto"; }
+    if (mode === "right") { el.style.float = "right"; el.style.display = "inline-block"; el.style.margin = "4px 0 4px 12px"; }
+    bump((t) => t + 1);
+  };
+  const resizeBy = (factor: number) => {
+    const next = Math.max(40, Math.round(rect.width * factor));
+    el.style.width = next + "px";
+    bump((t) => t + 1);
+  };
+  const OverlayBtn = ({ onClick, title, children }: { onClick: () => void; title: string; children: any }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
+      className="w-7 h-7 flex items-center justify-center rounded hover:bg-slate-800 text-slate-200 cursor-pointer">
+      {children}
+    </button>
+  );
+  return (
+    <div ref={boxRef}>
+      {/* Strip kontrol mengambang, nempel tepat di atas gambar. */}
+      <div
+        style={{ position: "fixed", top: Math.max(4, rect.top - 40), left: rect.left, zIndex: 9999 }}
+        className="flex items-center gap-0.5 bg-slate-900 border border-indigo-500 rounded-lg shadow-2xl px-1 py-0.5"
+      >
+        <OverlayBtn onClick={() => align("left")} title="Rata kiri"><AlignLeft className="w-3.5 h-3.5" /></OverlayBtn>
+        <OverlayBtn onClick={() => align("center")} title="Rata tengah"><AlignCenter className="w-3.5 h-3.5" /></OverlayBtn>
+        <OverlayBtn onClick={() => align("right")} title="Rata kanan"><AlignRight className="w-3.5 h-3.5" /></OverlayBtn>
+        <span className="w-px h-4 bg-slate-700 mx-0.5" />
+        <OverlayBtn onClick={() => resizeBy(0.85)} title="Perkecil"><span className="text-sm leading-none">−</span></OverlayBtn>
+        <OverlayBtn onClick={() => resizeBy(1.15)} title="Perbesar"><span className="text-sm leading-none">+</span></OverlayBtn>
+        <span className="w-px h-4 bg-slate-700 mx-0.5" />
+        <OverlayBtn onClick={() => { el.remove(); setEl(null); }} title="Hapus gambar"><Trash2 className="w-3.5 h-3.5 text-rose-400" /></OverlayBtn>
+      </div>
+      {/* Garis seleksi (bingkai biru) + gagang resize pojok kanan-bawah —
+          drag gagang ini utk resize langsung di tempat, rasio gambar
+          terjaga otomatis (lihat height:auto di img saat disisipkan). */}
+      <div style={{ position: "fixed", top: rect.top, left: rect.left, width: rect.width, height: rect.height, border: "2px solid #6366f1", pointerEvents: "none", zIndex: 9998, boxSizing: "border-box" }} />
+      <div
+        onPointerDown={startResize}
+        style={{ position: "fixed", top: rect.top + rect.height - 6, left: rect.left + rect.width - 6, width: 12, height: 12, background: "#6366f1", borderRadius: 9999, cursor: "nwse-resize", zIndex: 9999, border: "2px solid white" }}
+      />
+    </div>
+  );
+}
+
+// Kontrol resize tabel mengambang — SAMA POLA PERSIS dengan
+// ImageSelectionOverlay di atas (klik tabel → gagang mengambang muncul,
+// drag pojok kanan-bawah utk memperbesar/memperkecil), cuma target elemennya
+// <table>, bukan gambar. Dibuat SEBAGAI PENGGANTI resize per-sel (CSS
+// `resize` bawaan browser di tiap th/td) yang sebelumnya dicoba — ternyata
+// gagang kecil di tiap sel malah menutupi/mepet ke teks isi sel (feedback
+// user: "teks nya tidak terbaca"). Dengan cara ini, sel-selnya sendiri POLOS
+// (lihat TABLE_TH_STYLE/TABLE_TD_STYLE di DocToolbar, sudah tidak ada
+// resize/overflow lagi) — yang di-resize itu TABEL-nya sebagai satu objek
+// utuh, table-layout:fixed otomatis membagi ulang lebar kolom secara
+// proporsional, sama seperti drag gagang tabel di Word.
+function TableSelectionOverlay() {
+  const [el, setEl] = useState<HTMLTableElement | null>(null);
+  const [, bump] = useState(0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onSelect = (e: Event) => setEl(((e as CustomEvent).detail as HTMLTableElement) || null);
+    window.addEventListener("doctable:select", onSelect as EventListener);
+    return () => window.removeEventListener("doctable:select", onSelect as EventListener);
+  }, []);
+  useEffect(() => {
+    if (!el) return;
+    const reposition = () => bump((t) => t + 1);
+    window.addEventListener("scroll", reposition, true);
+    window.addEventListener("resize", reposition);
+    const onDocClick = (ev: MouseEvent) => {
+      const t = ev.target as Node;
+      if (boxRef.current?.contains(t)) return;
+      if (el.contains(t) || el === t) return;
+      setEl(null);
+    };
+    document.addEventListener("mousedown", onDocClick, true);
+    return () => {
+      window.removeEventListener("scroll", reposition, true);
+      window.removeEventListener("resize", reposition);
+      document.removeEventListener("mousedown", onDocClick, true);
+    };
+  }, [el]);
+  if (!el || !document.contains(el)) return null;
+  const rect = el.getBoundingClientRect();
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const startX = e.clientX;
+    const startWidth = rect.width;
+    const onMove = (ev: PointerEvent) => {
+      // Minimal 120px — di bawah itu isi sel jadi tidak muat sama sekali
+      // (mirip batas 40px punya gambar, disesuaikan krn tabel biasanya
+      // berkolom banyak).
+      const next = Math.max(120, Math.round(startWidth + (ev.clientX - startX)));
+      el.style.width = next + "px";
+      bump((t) => t + 1);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+  const resizeBy = (factor: number) => {
+    const next = Math.max(120, Math.round(rect.width * factor));
+    el.style.width = next + "px";
+    bump((t) => t + 1);
+  };
+  // Perataan tabel di dalam kolom dokumen — baru kelihatan efeknya SETELAH
+  // tabel diperkecil (selebar 100% penuh, rata kiri/tengah/kanan sama saja
+  // tidak ada ruang kosong). Dipakai supaya sisa ruang kosong akibat resize
+  // (persis yg dikeluhkan user di screenshot — tabel mengecil tapi nempel
+  // rata kiri, ruang di kanannya nganggur) bisa diarahkan sesuai mau user.
+  // margin-left/right "auto" (bukan float, beda dari align gambar di atas)
+  // karena <table> itu elemen block biasa — teknik standar utk block box
+  // yang lebarnya sudah eksplisit (bukan 100%).
+  const align = (mode: "left" | "center" | "right") => {
+    el.style.marginLeft = mode === "left" ? "0" : "auto";
+    el.style.marginRight = mode === "right" ? "0" : "auto";
+    bump((t) => t + 1);
+  };
+  const OverlayBtn = ({ onClick, title, children }: { onClick: () => void; title: string; children: any }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
+      className="w-7 h-7 flex items-center justify-center rounded hover:bg-slate-800 text-slate-200 cursor-pointer">
+      {children}
+    </button>
+  );
+  return (
+    <div ref={boxRef}>
+      <div
+        style={{ position: "fixed", top: Math.max(4, rect.top - 40), left: rect.left, zIndex: 9999 }}
+        className="flex items-center gap-0.5 bg-slate-900 border border-indigo-500 rounded-lg shadow-2xl px-1 py-0.5"
+      >
+        <OverlayBtn onClick={() => align("left")} title="Rata kiri"><AlignLeft className="w-3.5 h-3.5" /></OverlayBtn>
+        <OverlayBtn onClick={() => align("center")} title="Rata tengah"><AlignCenter className="w-3.5 h-3.5" /></OverlayBtn>
+        <OverlayBtn onClick={() => align("right")} title="Rata kanan"><AlignRight className="w-3.5 h-3.5" /></OverlayBtn>
+        <span className="w-px h-4 bg-slate-700 mx-0.5" />
+        <span className="text-[10px] text-slate-400 px-1">Ukuran</span>
+        <OverlayBtn onClick={() => resizeBy(0.85)} title="Perkecil"><span className="text-sm leading-none">−</span></OverlayBtn>
+        <OverlayBtn onClick={() => resizeBy(1.15)} title="Perbesar"><span className="text-sm leading-none">+</span></OverlayBtn>
+        <span className="w-px h-4 bg-slate-700 mx-0.5" />
+        <OverlayBtn onClick={() => { el.style.width = "100%"; el.style.marginLeft = ""; el.style.marginRight = ""; bump((t) => t + 1); }} title="Kembalikan ke lebar penuh"><RotateCcw className="w-3.5 h-3.5" /></OverlayBtn>
+        <OverlayBtn onClick={() => { el.remove(); setEl(null); }} title="Hapus tabel"><Trash2 className="w-3.5 h-3.5 text-rose-400" /></OverlayBtn>
+      </div>
+      <div style={{ position: "fixed", top: rect.top, left: rect.left, width: rect.width, height: rect.height, border: "2px solid #6366f1", pointerEvents: "none", zIndex: 9998, boxSizing: "border-box" }} />
+      <div
+        onPointerDown={startResize}
+        style={{ position: "fixed", top: rect.top + rect.height - 6, left: rect.left + rect.width - 6, width: 12, height: 12, background: "#6366f1", borderRadius: 9999, cursor: "nwse-resize", zIndex: 9999, border: "2px solid white" }}
+      />
+    </div>
+  );
+}
+
+// Label & urutan status kerja Pekerjaan Legal — dipakai kartu ringkasan,
+// filter tabel, dan tombol "lanjut tahap" di detail. Cocok dengan
+// LEGAL_JOB_WORKFLOW_STATUSES di src/types.ts (tanpa menunggu_persetujuan/ditolak,
+// yang masing-masing punya tabel/kartu sendiri).
+const LEGAL_STATUS_LABEL: Record<string, string> = {
+  menunggu_persetujuan: "Menunggu Persetujuan",
+  draft: "Draft",
+  review_internal: "Review Internal",
+  review_eksternal: "Review Eksternal",
+  revisi_negosiasi: "Revisi/Negosiasi",
+  finalisasi: "Finalisasi",
+  penomoran: "Penomoran",
+  ttd: "Proses TTD",
+  distribusi: "Distribusi",
+  arsip: "Arsip",
+  selesai: "Selesai",
+  ditolak: "Ditolak",
+};
+const LEGAL_WORKFLOW_ORDER = ["draft", "review_internal", "review_eksternal", "revisi_negosiasi", "finalisasi", "penomoran", "ttd", "distribusi", "arsip", "selesai"];
+const LEGAL_PRIORITY_STYLE: Record<string, string> = {
+  Tinggi: "bg-rose-500/15 text-rose-400 border-rose-500/25",
+  Sedang: "bg-amber-500/15 text-amber-400 border-amber-500/25",
+  Rendah: "bg-slate-500/15 text-slate-400 border-slate-500/25",
+};
+// Label & warna badge status KONTRAK — duplikat sengaja dari
+// contractStatusLabel/contractStatusBadgeClass di dalam komponen App (yang
+// terikat closure App, tidak bisa dipakai komponen top-level seperti
+// PekerjaanLegalPage). Dipakai untuk menampilkan status Pekerjaan Legal yang
+// SUDAH TERTAUT ke Kontrak — supaya labelnya identik dengan yang tampil di
+// Monitoring Kontrak, bukan cuma "mirip".
+const CONTRACT_STATUS_LABEL_ID: Record<string, string> = {
+  Draft: "Draft", OnReview: "Sedang Ditinjau", FullyApproved: "Disetujui Penuh",
+  Aktif: "Aktif", TidakAktif: "Tidak Aktif", Archived: "Diarsipkan", Terminated: "Diakhiri",
+  ReviewInternalEksternal: "Review Internal/Eksternal", RevisiNegosiasi: "Revisi/Negosiasi",
+  Finalisasi: "Finalisasi", ProsesTTD: "Proses TTD",
+};
+const CONTRACT_STATUS_BADGE_CLASS: Record<string, string> = {
+  Aktif: "bg-emerald-500/15 text-emerald-400 border-emerald-500/25",
+  TidakAktif: "bg-orange-500/15 text-orange-400 border-orange-500/25",
+  Draft: "bg-amber-500/15 text-amber-400 border-amber-500/25",
+  OnReview: "bg-indigo-500/15 text-indigo-400 border-indigo-500/25",
+  FullyApproved: "bg-teal-500/15 text-teal-400 border-teal-500/25",
+  Archived: "bg-purple-500/15 text-purple-400 border-purple-500/25",
+  Terminated: "bg-rose-500/15 text-rose-400 border-rose-500/25",
+  ReviewInternalEksternal: "bg-sky-500/15 text-sky-400 border-sky-500/25",
+  RevisiNegosiasi: "bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/25",
+  Finalisasi: "bg-indigo-500/15 text-indigo-400 border-indigo-500/25",
+  ProsesTTD: "bg-teal-500/15 text-teal-400 border-teal-500/25",
+};
+// Bentuk LegalJob yang dikembalikan API (lihat withLinkedContract di
+// server.ts) — nempel field `linkedContract` di atas LegalJob biasa, dihitung
+// ulang dari Contract tiap request, BUKAN disalin sekali (jadi selalu akurat).
+type LegalJobWithLink = LegalJob & {
+  linkedContract?: { id: string; title: string; contractNumber: string; status: string } | null;
+};
+function fmtDateID(s?: string): string {
+  if (!s) return "—";
+  try { return new Date(s).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "numeric" }); } catch { return s; }
+}
+function fmtDateTimeID(s?: string): string {
+  if (!s) return "—";
+  try { return new Date(s).toLocaleString("id-ID", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }); } catch { return s; }
+}
+
+// Halaman "Pekerjaan Legal" — tombol Tambah Pekerjaan Legal membuka modal
+// Bagikan Link Formulir (bukan form internal lagi); pekerjaan yang masuk
+// dari form eksternal direview lewat tabel "Pekerjaan Masuk" sebelum masuk
+// ke tabel utama. Lihat Spek-Dashboard-Pekerjaan-Legal.docx bagian 4.
+function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any; onOpenContract: (contractId: string) => void }) {
+  const [jobs, setJobs] = useState<LegalJobWithLink[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState<{ text: string; kind: "error" | "success" } | null>(null);
+  const notify = (text: string, kind: "error" | "success" = "error") => {
+    setToast({ text, kind });
+    window.setTimeout(() => setToast(null), 5000);
+  };
+
+  const [shareOpen, setShareOpen] = useState(false);
+  const [approveJob, setApproveJob] = useState<LegalJob | null>(null);
+  const [rejectJob, setRejectJob] = useState<LegalJob | null>(null);
+  const [detailJob, setDetailJob] = useState<LegalJobWithLink | null>(null);
+  const [statusFilter, setStatusFilter] = useState<string>("semua");
+
+  const fetchJobs = async () => {
+    try {
+      const res = await fetch("/api/legal-jobs");
+      if (res.ok) setJobs(await res.json());
+    } catch { /* diam-diam gagal, tabel tetap tampil kosong/lama */ }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { fetchJobs(); }, []);
+
+  const incoming = jobs.filter((j) => j.status === "menunggu_persetujuan").sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const rejected = jobs.filter((j) => j.status === "ditolak").sort((a, b) => (b.rejectedAt || "").localeCompare(a.rejectedAt || ""));
+  const mainJobs = jobs.filter((j) => j.status !== "menunggu_persetujuan" && j.status !== "ditolak")
+    .filter((j) => statusFilter === "semua" || j.status === statusFilter)
+    .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+
+  const cardStatuses = ["menunggu_persetujuan", "draft", "review_internal", "review_eksternal", "revisi_negosiasi", "finalisasi", "ttd", "selesai"];
+  const countOf = (s: string) => jobs.filter((j) => j.status === s).length;
+
+  const refreshAfter = async (fn: () => Promise<Response>, successMsg: string, onDone?: () => void) => {
+    try {
+      const res = await fn();
+      const j = await res.json();
+      if (!res.ok) { notify(j.error || "Terjadi kesalahan."); return; }
+      notify(successMsg, "success");
+      await fetchJobs();
+      onDone?.();
+    } catch { notify("Gagal terhubung ke server."); }
+  };
+
+  return (
+    <div className="space-y-6">
+      {toast && (
+        <div className={`fixed top-5 right-5 z-[100] animate-fadeIn shadow-2xl flex items-center gap-2.5 pl-3.5 pr-4 py-3 rounded-lg border bg-white max-w-sm ${toast.kind === "error" ? "border-rose-400" : "border-emerald-400"}`}>
+          {toast.kind === "error" ? <AlertTriangle className="text-rose-500 w-4 h-4 shrink-0" /> : <CheckCircle className="text-emerald-500 w-4 h-4 shrink-0" />}
+          <p className="text-[13px] font-semibold leading-snug text-slate-800">{toast.text}</p>
+        </div>
+      )}
+
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <h2 className="text-xl font-semibold text-slate-100 tracking-tight">Pekerjaan Legal</h2>
+          <p className="text-[13px] text-slate-500 max-w-xl">Kelola seluruh pekerjaan Legal dari awal hingga selesai.</p>
+        </div>
+        <button onClick={() => setShareOpen(true)} className="flex items-center gap-2 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[13px] font-semibold transition cursor-pointer shrink-0">
+          <Plus className="w-4 h-4" /> Tambah Pekerjaan Legal
+        </button>
+      </div>
+
+      {/* Kartu ringkasan status — klik untuk filter tabel utama di bawah. */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+        {cardStatuses.map((s) => (
+          <button key={s} onClick={() => setStatusFilter(s === statusFilter ? "semua" : s)}
+            className={`text-left p-3 rounded-xl border transition cursor-pointer ${statusFilter === s ? "bg-indigo-600/20 border-indigo-500/40" : "bg-slate-900/60 border-slate-800 hover:border-slate-700"}`}>
+            <p className="text-lg font-bold text-slate-100">{countOf(s)}</p>
+            <p className="text-[10.5px] text-slate-500 leading-tight mt-0.5">{LEGAL_STATUS_LABEL[s]}</p>
+          </button>
+        ))}
+      </div>
+
+      {/* ===== Tabel "Pekerjaan Masuk" (Belum Diproses) ===== */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+        <div className="p-4 flex items-center gap-2 border-b border-slate-800">
+          <Inbox className="w-4 h-4 text-amber-400" />
+          <h3 className="text-sm font-semibold text-slate-100">Pekerjaan Masuk <span className="text-slate-500 font-normal">(Belum Diproses)</span></h3>
+          <span className="ml-auto text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25 font-semibold">{incoming.length} menunggu</span>
+        </div>
+        {loading ? (
+          <p className="p-6 text-center text-xs text-slate-500">Memuat…</p>
+        ) : incoming.length === 0 ? (
+          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan masuk dari formulir eksternal.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12.5px]">
+              <thead>
+                <tr className="text-left text-slate-500 border-b border-slate-800">
+                  <th className="p-3 font-semibold">Judul Pekerjaan</th>
+                  <th className="p-3 font-semibold">Partner/Pihak</th>
+                  <th className="p-3 font-semibold">Jenis</th>
+                  <th className="p-3 font-semibold">PIC Pemberi</th>
+                  <th className="p-3 font-semibold">Deadline</th>
+                  <th className="p-3 font-semibold">Dokumen</th>
+                  <th className="p-3 font-semibold">Tanggal Masuk</th>
+                  <th className="p-3 font-semibold text-right">Aksi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {incoming.map((j) => (
+                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
+                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                    <td className="p-3 text-slate-400">{j.partnerName}</td>
+                    <td className="p-3 text-slate-400">{j.docType}</td>
+                    <td className="p-3 text-slate-400">{j.picName}</td>
+                    <td className="p-3 text-slate-400">{fmtDateID(j.deadline)}</td>
+                    <td className="p-3">
+                      {j.documents.length > 0 ? (
+                        <a href={j.documents[0].url} target="_blank" rel="noreferrer" className="text-indigo-400 hover:underline text-[11.5px]">Lihat berkas</a>
+                      ) : <span className="text-slate-600">—</span>}
+                    </td>
+                    <td className="p-3 text-slate-500">{fmtDateTimeID(j.createdAt)}</td>
+                    <td className="p-3">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <button onClick={() => setApproveJob(j)} title="Setujui" className="p-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 cursor-pointer"><ThumbsUp className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => setRejectJob(j)} title="Tidak Disetujui" className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 cursor-pointer"><ThumbsDown className="w-3.5 h-3.5" /></button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ===== Tabel "Pekerjaan Legal" Utama ===== */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+        <div className="p-4 flex flex-wrap items-center gap-2 border-b border-slate-800">
+          <Layers className="w-4 h-4 text-indigo-400" />
+          <h3 className="text-sm font-semibold text-slate-100">Pekerjaan Legal</h3>
+          <div className="ml-auto flex items-center gap-2">
+            <Filter className="w-3.5 h-3.5 text-slate-500" />
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="bg-slate-950 border border-slate-800 rounded-lg text-[12px] px-2 py-1.5 text-slate-300 focus:outline-none focus:border-indigo-500">
+              <option value="semua">Semua Status</option>
+              {LEGAL_WORKFLOW_ORDER.map((s) => <option key={s} value={s}>{LEGAL_STATUS_LABEL[s]}</option>)}
+            </select>
+          </div>
+        </div>
+        {mainJobs.length === 0 ? (
+          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan pada status ini.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12.5px]">
+              <thead>
+                <tr className="text-left text-slate-500 border-b border-slate-800">
+                  <th className="p-3 font-semibold">Judul Pekerjaan</th>
+                  <th className="p-3 font-semibold">Jenis</th>
+                  <th className="p-3 font-semibold">Partner</th>
+                  <th className="p-3 font-semibold">PIC Pemberi</th>
+                  <th className="p-3 font-semibold">Status</th>
+                  <th className="p-3 font-semibold">Deadline</th>
+                  <th className="p-3 font-semibold">Prioritas</th>
+                  <th className="p-3 font-semibold text-right">Aksi</th>
+                </tr>
+              </thead>
+              <tbody>
+                {mainJobs.map((j) => (
+                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
+                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                    <td className="p-3 text-slate-400">{j.docType}</td>
+                    <td className="p-3 text-slate-400">{j.partnerName}</td>
+                    <td className="p-3 text-slate-400">{j.picName}</td>
+                    <td className="p-3">
+                      {j.linkedContract ? (
+                        <div className="flex flex-col gap-0.5 w-fit">
+                          <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[j.linkedContract.status] || "bg-slate-500/15 text-slate-400 border-slate-500/25"}`}>
+                            {CONTRACT_STATUS_LABEL_ID[j.linkedContract.status] || j.linkedContract.status}
+                          </span>
+                          <button onClick={() => onOpenContract(j.linkedContract!.id)} className="text-[9.5px] text-indigo-400 hover:underline text-left cursor-pointer">mengikuti Kontrak →</button>
+                        </div>
+                      ) : (
+                        <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold whitespace-nowrap">{LEGAL_STATUS_LABEL[j.status]}</span>
+                      )}
+                    </td>
+                    <td className="p-3 text-slate-400">{fmtDateID(j.deadline)}</td>
+                    <td className="p-3">{j.priority && <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}</td>
+                    <td className="p-3 text-right">
+                      <button onClick={() => setDetailJob(j)} className="text-indigo-400 hover:underline text-[12px] font-semibold cursor-pointer">Lihat Detail</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ===== Tabel "Ditolak / Arsip Penolakan" ===== */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+        <div className="p-4 flex items-center gap-2 border-b border-slate-800">
+          <FileX className="w-4 h-4 text-rose-400" />
+          <h3 className="text-sm font-semibold text-slate-100">Ditolak <span className="text-slate-500 font-normal">/ Arsip Penolakan</span></h3>
+          <span className="ml-auto text-[11px] px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-400 border border-rose-500/25 font-semibold">{rejected.length}</span>
+        </div>
+        {rejected.length === 0 ? (
+          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan yang ditolak.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[12.5px]">
+              <thead>
+                <tr className="text-left text-slate-500 border-b border-slate-800">
+                  <th className="p-3 font-semibold">Judul Pekerjaan</th>
+                  <th className="p-3 font-semibold">Partner</th>
+                  <th className="p-3 font-semibold">Alasan Penolakan</th>
+                  <th className="p-3 font-semibold">Ditolak oleh</th>
+                  <th className="p-3 font-semibold">Tanggal</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rejected.map((j) => (
+                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
+                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                    <td className="p-3 text-slate-400">{j.partnerName}</td>
+                    <td className="p-3 text-slate-400 max-w-xs truncate" title={j.rejectionReason}>{j.rejectionReason}</td>
+                    <td className="p-3 text-slate-400">{j.rejectedByName}</td>
+                    <td className="p-3 text-slate-500">{fmtDateTimeID(j.rejectedAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {shareOpen && <ShareFormLinkModal onClose={() => setShareOpen(false)} notify={notify} />}
+      {approveJob && (
+        <ApprovePriorityModal
+          job={approveJob}
+          onClose={() => setApproveJob(null)}
+          onConfirm={(priority) => refreshAfter(
+            () => fetch(`/api/legal-jobs/${approveJob.id}/approve`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ priority }) }),
+            "Pekerjaan disetujui dan masuk ke alur kerja utama.",
+            () => setApproveJob(null),
+          )}
+        />
+      )}
+      {rejectJob && (
+        <RejectReasonModal
+          job={rejectJob}
+          onClose={() => setRejectJob(null)}
+          onConfirm={(reason) => refreshAfter(
+            () => fetch(`/api/legal-jobs/${rejectJob.id}/reject`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }),
+            "Pekerjaan ditolak dan dipindahkan ke arsip penolakan.",
+            () => setRejectJob(null),
+          )}
+        />
+      )}
+      {detailJob && (
+        <LegalJobDetailDrawer
+          job={jobs.find((j) => j.id === detailJob.id) || detailJob}
+          currentUser={currentUser}
+          onClose={() => setDetailJob(null)}
+          onChanged={fetchJobs}
+          notify={notify}
+          onOpenContract={onOpenContract}
+        />
+      )}
+    </div>
+  );
+}
+
+// Modal "Bagikan Link Formulir" — pengganti tombol "Tambah Pekerjaan Legal"
+// yang dulu membuka form internal. Ambil/buat link tenant saat dibuka,
+// tampilkan Copy/QR/Generate Ulang (lihat /api/legal-form-link* di server.ts).
+function ShareFormLinkModal({ onClose, notify }: { onClose: () => void; notify: (t: string, k?: "error" | "success") => void }) {
+  const [data, setData] = useState<{ token: string; url: string; qrDataUrl: string } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [confirmRegen, setConfirmRegen] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const res = await fetch("/api/legal-form-link");
+      if (res.ok) setData(await res.json());
+      else notify("Gagal memuat link formulir.");
+    } catch { notify("Gagal terhubung ke server."); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); /* eslint-disable-next-line */ }, []);
+
+  const copyLink = async () => {
+    if (!data) return;
+    try { await navigator.clipboard.writeText(data.url); setCopied(true); window.setTimeout(() => setCopied(false), 2000); }
+    catch { notify("Gagal menyalin link."); }
+  };
+
+  const regenerate = async () => {
+    setBusy(true);
+    try {
+      const res = await fetch("/api/legal-form-link/regenerate", { method: "POST" });
+      const j = await res.json();
+      if (!res.ok) notify(j.error || "Gagal membuat link baru.");
+      else { setData(j); notify("Link baru diterbitkan — link lama sudah tidak berlaku.", "success"); }
+    } catch { notify("Gagal terhubung ke server."); }
+    finally { setBusy(false); setConfirmRegen(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
+        <div className="p-5 border-b border-slate-800 flex items-center justify-between">
+          <h3 className="font-bold text-slate-100 text-sm">Bagikan Link Formulir</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-200 cursor-pointer"><X className="w-4 h-4" /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          <p className="text-[12.5px] text-slate-400 leading-relaxed">Bagikan link ini ke pihak eksternal (marketing, partner, divisi lain) untuk mengajukan Pekerjaan Legal. Prioritas ditentukan oleh Staff Legal saat approve, bukan oleh pengisi.</p>
+          {loading ? (
+            <p className="text-xs text-slate-500 text-center py-4">Memuat…</p>
+          ) : data ? (
+            <>
+              <div className="flex items-center gap-2">
+                <input readOnly value={data.url} className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-[11.5px] text-slate-300 font-mono truncate" />
+                <button onClick={copyLink} className="shrink-0 flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg cursor-pointer">
+                  <Copy className="w-3.5 h-3.5" /> {copied ? "Tersalin!" : "Copy"}
+                </button>
+              </div>
+              <div className="flex flex-col items-center gap-2 py-3 border-y border-slate-800">
+                <img src={data.qrDataUrl} alt="QR Code formulir" className="w-40 h-40 rounded-lg bg-white p-2" />
+                <p className="text-[10.5px] text-slate-500 flex items-center gap-1"><QrCode className="w-3 h-3" /> Scan untuk membuka formulir</p>
+              </div>
+              {!confirmRegen ? (
+                <button onClick={() => setConfirmRegen(true)} className="w-full text-center text-[12px] font-semibold text-rose-400 hover:text-rose-300 cursor-pointer">Generate Ulang Link</button>
+              ) : (
+                <div className="bg-rose-500/10 border border-rose-500/25 rounded-xl p-3 space-y-2">
+                  <p className="text-[11.5px] text-rose-300">Link lama akan langsung tidak berlaku. Lanjutkan?</p>
+                  <div className="flex gap-2">
+                    <button onClick={regenerate} disabled={busy} className="flex-1 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg cursor-pointer">{busy ? "Memproses…" : "Ya, Generate Ulang"}</button>
+                    <button onClick={() => setConfirmRegen(false)} className="flex-1 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer">Batal</button>
+                  </div>
+                </div>
+              )}
+            </>
+          ) : (
+            <p className="text-xs text-rose-400 text-center py-4">Gagal memuat link.</p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ApprovePriorityModal({ job, onClose, onConfirm }: { job: LegalJob; onClose: () => void; onConfirm: (priority: string) => void }) {
+  const [priority, setPriority] = useState<string>("");
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden">
+        <div className="p-5 space-y-3">
+          <h3 className="font-bold text-slate-100 text-sm">Setujui &amp; Pilih Prioritas</h3>
+          <p className="text-[12px] text-slate-400">"{job.title}" — {job.partnerName}</p>
+          <div className="grid grid-cols-3 gap-2 pt-1">
+            {["Tinggi", "Sedang", "Rendah"].map((p) => (
+              <button key={p} onClick={() => setPriority(p)}
+                className={`py-2 rounded-xl text-xs font-bold border cursor-pointer transition ${priority === p ? LEGAL_PRIORITY_STYLE[p] + " ring-1 ring-inset" : "bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700"}`}>
+                {p}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="p-4 border-t border-slate-800 flex justify-end gap-2.5">
+          <button onClick={onClose} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl cursor-pointer">Batal</button>
+          <button onClick={() => priority && onConfirm(priority)} disabled={!priority} className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold rounded-xl cursor-pointer">Simpan</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RejectReasonModal({ job, onClose, onConfirm }: { job: LegalJob; onClose: () => void; onConfirm: (reason: string) => void }) {
+  const [reason, setReason] = useState("");
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden">
+        <div className="p-5 space-y-3">
+          <h3 className="font-bold text-slate-100 text-sm">Alasan Penolakan</h3>
+          <p className="text-[12px] text-slate-400">"{job.title}" — {job.partnerName}</p>
+          <textarea autoFocus value={reason} onChange={(e) => setReason(e.target.value)} rows={4} placeholder="Wajib diisi — alasan ini akan tersimpan di arsip penolakan."
+            className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-rose-500" />
+        </div>
+        <div className="p-4 border-t border-slate-800 flex justify-end gap-2.5">
+          <button onClick={onClose} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl cursor-pointer">Batal</button>
+          <button onClick={() => reason.trim() && onConfirm(reason.trim())} disabled={!reason.trim()} className="px-5 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white text-xs font-bold rounded-xl cursor-pointer">Tidak Disetujui</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Detail per pekerjaan — Info umum, tombol lanjut tahap workflow, dan tab
+// Dokumen/Timeline/Catatan (lihat sketsa: tidak double dgn Dokumen/Timeline
+// milik kontrak lain, ini khusus pekerjaan ybs).
+function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, onOpenContract }: {
+  job: LegalJobWithLink; currentUser: any; onClose: () => void; onChanged: () => void; notify: (t: string, k?: "error" | "success") => void;
+  onOpenContract: (contractId: string) => void;
+}) {
+  const [tab, setTab] = useState<"dokumen" | "timeline" | "catatan">("timeline");
+  const [noteText, setNoteText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const addNote = async () => {
+    if (!noteText.trim()) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/legal-jobs/${job.id}/notes`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: noteText.trim() }) });
+      if (!res.ok) notify("Gagal menambahkan catatan.");
+      else { setNoteText(""); onChanged(); }
+    } catch { notify("Gagal terhubung ke server."); }
+    finally { setBusy(false); }
+  };
+
+  const uploadDoc = async (file: File) => {
+    setBusy(true);
+    try {
+      const fd = new FormData(); fd.append("file", file);
+      const res = await fetch(`/api/legal-jobs/${job.id}/documents`, { method: "POST", body: fd });
+      if (!res.ok) { const j = await res.json(); notify(j.error || "Gagal mengunggah dokumen."); }
+      else { notify("Dokumen diunggah.", "success"); onChanged(); }
+    } catch { notify("Gagal terhubung ke server."); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-black/50 backdrop-blur-sm animate-fadeIn">
+      <div className="bg-slate-900 border-l border-slate-800 w-full max-w-lg h-full overflow-y-auto shadow-2xl">
+        <div className="p-5 border-b border-slate-800 flex items-start justify-between sticky top-0 bg-slate-900 z-10">
+          <div>
+            <p className="text-[10.5px] uppercase tracking-wide text-slate-500 font-bold">Detail Pekerjaan Legal</p>
+            <h3 className="font-bold text-slate-100 text-base mt-0.5">{job.title}</h3>
+          </div>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-200 cursor-pointer"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="p-5 space-y-5">
+          {/* Info umum */}
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[12.5px]">
+            <InfoField label="Jenis" value={job.docType} />
+            <InfoField label="Partner" value={job.partnerName} />
+            <InfoField label="PIC Pemberi" value={job.picName} />
+            <InfoField label="Deadline" value={fmtDateID(job.deadline)} />
+            <InfoField label="Status" value={job.linkedContract
+              ? <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${CONTRACT_STATUS_BADGE_CLASS[job.linkedContract.status] || ""}`}>{CONTRACT_STATUS_LABEL_ID[job.linkedContract.status] || job.linkedContract.status}</span>
+              : <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold">{LEGAL_STATUS_LABEL[job.status]}</span>} />
+            <InfoField label="Prioritas" value={job.priority ? <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[job.priority]}`}>{job.priority}</span> : "—"} />
+            <InfoField label="Sumber" value={job.source === "eksternal" ? "Formulir Eksternal" : "Input Internal"} />
+            <InfoField label="Tgl. Request" value={fmtDateID(job.createdAt)} />
+          </div>
+          {job.description && (
+            <div>
+              <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Keterangan</p>
+              <p className="text-[12.5px] text-slate-300 leading-relaxed">{job.description}</p>
+            </div>
+          )}
+
+          {/* Status di sini SELALU tampilan saja (read-only) — tidak ada
+              lagi tombol "lanjut ke tahap" manual. Kalau sudah tertaut ke
+              Kontrak, status ikut Contract.status otomatis (lihat
+              withLinkedContract di server.ts); kalau belum, statusnya cuma
+              menunggu ditautkan lewat form Buat Kontrak Eksternal. */}
+          {job.linkedContract ? (
+            <div className="p-3.5 bg-indigo-500/10 border border-indigo-500/25 rounded-xl space-y-2.5">
+              <p className="text-[11.5px] text-indigo-300 leading-relaxed">Status pekerjaan ini <b>otomatis mengikuti</b> status Kontrak yang terhubung — tidak bisa diubah manual dari sini.</p>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-[12px] font-semibold text-slate-100 truncate">{job.linkedContract.title}</p>
+                  <p className="text-[10.5px] text-slate-500">{job.linkedContract.contractNumber}</p>
+                </div>
+                <span className={`shrink-0 text-[11px] px-2 py-0.5 rounded-full border font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[job.linkedContract.status] || ""}`}>
+                  {CONTRACT_STATUS_LABEL_ID[job.linkedContract.status] || job.linkedContract.status}
+                </span>
+              </div>
+              <button onClick={() => onOpenContract(job.linkedContract!.id)}
+                className="w-full flex items-center justify-center gap-2 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-[12.5px] font-bold rounded-xl cursor-pointer">
+                <ArrowRight className="w-3.5 h-3.5" /> Buka Kontrak
+              </button>
+            </div>
+          ) : (
+            <div className="p-3.5 bg-slate-950/60 border border-slate-800 rounded-xl">
+              <p className="text-[11.5px] text-slate-500 leading-relaxed">Status di atas belum berjalan otomatis — akan mengikuti status Kontrak begitu pekerjaan ini ditautkan lewat form <b className="text-slate-300">Buat Kontrak Eksternal</b> (dropdown "Pilih Judul Pekerjaan Legal").</p>
+            </div>
+          )}
+
+          {/* Tabs */}
+          <div className="flex border-b border-slate-800 gap-1">
+            {[
+              { id: "dokumen", label: `Dokumen (${job.documents.length})`, Icon: FolderOpen },
+              { id: "timeline", label: `Timeline (${job.timeline.length})`, Icon: History },
+              { id: "catatan", label: `Catatan (${job.notes.length})`, Icon: StickyNote },
+            ].map((t) => (
+              <button key={t.id} onClick={() => setTab(t.id as any)}
+                className={`flex items-center gap-1.5 px-3 py-2 text-[12px] font-semibold border-b-2 -mb-px cursor-pointer transition ${tab === t.id ? "border-indigo-500 text-indigo-400" : "border-transparent text-slate-500 hover:text-slate-300"}`}>
+                <t.Icon className="w-3.5 h-3.5" /> {t.label}
+              </button>
+            ))}
+          </div>
+
+          {tab === "dokumen" && (
+            <div className="space-y-2">
+              {job.documents.length === 0 && <p className="text-xs text-slate-500 text-center py-4">Belum ada dokumen.</p>}
+              {job.documents.map((d) => (
+                <a key={d.id} href={d.url} target="_blank" rel="noreferrer" className="flex items-center gap-2.5 p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl hover:border-slate-700">
+                  <FileText className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[12px] text-slate-200 truncate">{d.name}</p>
+                    <p className="text-[10.5px] text-slate-500">{d.uploadedBy} · {fmtDateTimeID(d.uploadedAt)}</p>
+                  </div>
+                  <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                </a>
+              ))}
+              <button onClick={() => fileInputRef.current?.click()} disabled={busy}
+                className="w-full flex items-center justify-center gap-2 py-2 border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-xl text-[12px] text-slate-400 cursor-pointer">
+                <Upload className="w-3.5 h-3.5" /> Upload Dokumen
+              </button>
+              <input ref={fileInputRef} type="file" className="hidden" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadDoc(f); e.target.value = ""; }} />
+            </div>
+          )}
+
+          {tab === "timeline" && (
+            <div className="space-y-3">
+              {job.timeline.slice().reverse().map((t) => (
+                <div key={t.id} className="flex gap-3">
+                  <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />
+                  <div className="min-w-0 flex-1 pb-1">
+                    <p className="text-[12px] text-slate-200">{t.label}</p>
+                    {t.detail && <p className="text-[11px] text-slate-500 mt-0.5">{t.detail}</p>}
+                    <p className="text-[10.5px] text-slate-600 mt-0.5">{t.actor ? `${t.actor} · ` : ""}{fmtDateTimeID(t.at)}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {tab === "catatan" && (
+            <div className="space-y-3">
+              {job.notes.length === 0 && <p className="text-xs text-slate-500 text-center py-4">Belum ada catatan.</p>}
+              {job.notes.slice().reverse().map((n) => (
+                <div key={n.id} className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl">
+                  <p className="text-[12px] text-slate-300 whitespace-pre-wrap">{n.text}</p>
+                  <p className="text-[10.5px] text-slate-500 mt-1">{n.authorName} · {fmtDateTimeID(n.createdAt)}</p>
+                </div>
+              ))}
+              <div className="flex gap-2">
+                <textarea value={noteText} onChange={(e) => setNoteText(e.target.value)} rows={2} placeholder="Tulis catatan…"
+                  className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500" />
+                <button onClick={addNote} disabled={busy || !noteText.trim()} className="px-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"><Send className="w-3.5 h-3.5" /></button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+function InfoField({ label, value }: { label: string; value: React.ReactNode }) {
+  return (
+    <div>
+      <p className="text-[10.5px] font-semibold text-slate-500 uppercase tracking-wide">{label}</p>
+      <div className="text-slate-200 mt-0.5">{value}</div>
+    </div>
+  );
+}
+
+// Halaman "Dashboard Legal" — ringkasan real-time semua data Pekerjaan Legal
+// + Monitoring Kontrak (pakai data kontrak yang sudah ada), berdasar
+// /api/legal-dashboard di server.ts. Kartu "Surat-Menyurat" ditandai belum
+// tersedia apa adanya — modul itu belum ada di sistem ini, di luar cakupan
+// 2 halaman yang diminta, sehingga TIDAK ditampilkan sbg angka nol palsu.
+function DashboardLegalPage({ currentUser, onOpenPekerjaanLegal }: { currentUser: any; onOpenPekerjaanLegal: () => void }) {
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/legal-dashboard");
+        if (res.ok) setData(await res.json());
+      } catch { /* diam-diam gagal, tampilkan state kosong */ }
+      finally { setLoading(false); }
+    })();
+  }, []);
+
+  if (loading) return <p className="text-xs text-slate-500 text-center py-10">Memuat dashboard…</p>;
+  if (!data) return <p className="text-xs text-rose-400 text-center py-10">Gagal memuat data dashboard.</p>;
+
+  const cardStatuses = ["menunggu_persetujuan", "draft", "review_internal", "review_eksternal", "revisi_negosiasi", "finalisasi", "ttd", "selesai"];
+  const maxChart = Math.max(1, ...data.chartByStatus.map((c: any) => c.count));
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <h2 className="text-xl font-semibold text-slate-100 tracking-tight">Dashboard Legal</h2>
+          <p className="text-[13px] text-slate-500 max-w-xl">Ringkasan kondisi semua pekerjaan legal — data real-time, klik kartu untuk melihat daftarnya.</p>
+        </div>
+      </div>
+
+      {/* Ringkasan Pekerjaan Legal */}
+      <div>
+        <h3 className="text-[12px] font-bold text-slate-500 uppercase tracking-wide mb-2">Ringkasan Pekerjaan Legal</h3>
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+          {cardStatuses.map((s) => (
+            <button key={s} onClick={onOpenPekerjaanLegal}
+              className="text-left p-3 rounded-xl border bg-slate-900/60 border-slate-800 hover:border-indigo-500/40 transition cursor-pointer">
+              <p className="text-lg font-bold text-slate-100">{data.statusCounts[s] || 0}</p>
+              <p className="text-[10.5px] text-slate-500 leading-tight mt-0.5">{LEGAL_STATUS_LABEL[s]}</p>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4">
+        {/* Surat-Menyurat */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
+          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-3"><Send className="w-4 h-4 text-slate-500" /> Surat-Menyurat</h3>
+          {data.suratMenyurat.available === false ? (
+            <p className="text-[12px] text-slate-500 italic py-2">Modul Surat-Menyurat belum tersedia di sistem ini.</p>
+          ) : (
+            <p className="text-[12px] text-slate-500">—</p>
+          )}
+        </div>
+
+        {/* Monitoring Kontrak */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
+          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-3"><FileCheck className="w-4 h-4 text-emerald-400" /> Monitoring Kontrak</h3>
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div><p className="text-lg font-bold text-emerald-400">{data.monitoringKontrak.aktif}</p><p className="text-[10px] text-slate-500">Aktif</p></div>
+            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir30}</p><p className="text-[10px] text-slate-500">&lt;30 hari</p></div>
+            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir60}</p><p className="text-[10px] text-slate-500">30–60 hari</p></div>
+            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir90}</p><p className="text-[10px] text-slate-500">60–90 hari</p></div>
+            <div><p className="text-lg font-bold text-rose-400">{data.monitoringKontrak.expired}</p><p className="text-[10px] text-slate-500">Expired</p></div>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4">
+        {/* Yang Perlu Ditindaklanjuti */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
+            <ShieldAlert className="w-4 h-4 text-amber-400" />
+            <h3 className="text-sm font-semibold text-slate-100">Yang Perlu Ditindaklanjuti</h3>
+          </div>
+          {data.needsFollowUp.length === 0 ? (
+            <p className="p-5 text-center text-xs text-slate-500">Tidak ada yang mendesak saat ini.</p>
+          ) : (
+            <div className="divide-y divide-slate-800/60">
+              {data.needsFollowUp.map((j: any) => (
+                <button key={j.id} onClick={onOpenPekerjaanLegal} className="w-full text-left p-3 flex items-center justify-between gap-3 hover:bg-slate-800/20 cursor-pointer">
+                  <div className="min-w-0">
+                    <p className="text-[12.5px] text-slate-200 truncate">{j.title}</p>
+                    <p className="text-[10.5px] text-slate-500">{j.partnerName} · {LEGAL_STATUS_LABEL[j.status]}</p>
+                  </div>
+                  <div className="text-right shrink-0">
+                    {j.priority && <span className={`text-[10px] px-1.5 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}
+                    <p className="text-[10.5px] text-slate-500 mt-0.5">{fmtDateID(j.deadline)}</p>
+                  </div>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Aktivitas Terbaru */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
+            <History className="w-4 h-4 text-indigo-400" />
+            <h3 className="text-sm font-semibold text-slate-100">Aktivitas Terbaru</h3>
+          </div>
+          {data.recentActivity.length === 0 ? (
+            <p className="p-5 text-center text-xs text-slate-500">Belum ada aktivitas.</p>
+          ) : (
+            <div className="divide-y divide-slate-800/60 max-h-80 overflow-y-auto">
+              {data.recentActivity.map((a: any, i: number) => (
+                <div key={i} className="p-3">
+                  <p className="text-[12px] text-slate-300"><span className="font-semibold text-slate-100">{a.jobTitle}</span> — {a.label}</p>
+                  <p className="text-[10.5px] text-slate-500 mt-0.5">{a.actor ? `${a.actor} · ` : ""}{fmtDateTimeID(a.at)}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-2 gap-4">
+        {/* Deadline Minggu Ini */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
+          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
+            <CalendarDays className="w-4 h-4 text-rose-400" />
+            <h3 className="text-sm font-semibold text-slate-100">Deadline Minggu Ini</h3>
+          </div>
+          {data.deadlineThisWeek.length === 0 ? (
+            <p className="p-5 text-center text-xs text-slate-500">Tidak ada deadline dalam 7 hari ke depan.</p>
+          ) : (
+            <table className="w-full text-[12px]">
+              <tbody>
+                {data.deadlineThisWeek.map((j: any) => (
+                  <tr key={j.id} className="border-b border-slate-800/60 last:border-0 hover:bg-slate-800/20 cursor-pointer" onClick={onOpenPekerjaanLegal}>
+                    <td className="p-3 text-slate-500 whitespace-nowrap">{fmtDateID(j.deadline)}</td>
+                    <td className="p-3 text-slate-200">{j.title}</td>
+                    <td className="p-3 text-slate-500">{j.docType}</td>
+                    <td className="p-3"><span className="text-[10.5px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold whitespace-nowrap">{LEGAL_STATUS_LABEL[j.status]}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Grafik Pekerjaan Legal */}
+        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
+          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-4"><PieChart className="w-4 h-4 text-indigo-400" /> Grafik Pekerjaan Legal</h3>
+          <div className="flex items-end gap-2 h-40">
+            {data.chartByStatus.map((c: any) => (
+              <div key={c.status} className="flex flex-col items-center gap-1 flex-1 group">
+                <span className="text-[10px] font-bold text-slate-300">{c.count}</span>
+                <div className={`w-full rounded-t transition-all ${c.count > 0 ? "bg-indigo-500/70" : "bg-slate-800"}`} style={{ height: `${Math.max(4, (c.count / maxChart) * 110)}px` }} />
+                <span className="text-[9px] text-slate-500 text-center leading-tight">{LEGAL_STATUS_LABEL[c.status]}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  // ===== THEME (dark/light) =====
+  // Persisted in localStorage; falls back to the OS preference on first
+  // visit. Toggling just flips a class on <html> — every color in the app
+  // resolves through the CSS variables in index.css (see the comment there),
+  // so nothing else needs to change per component.
+  const [theme, setTheme] = useState<"light" | "dark">(() => {
+    if (typeof window === "undefined") return "light";
+    const saved = window.localStorage.getItem("clm_theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  });
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    window.localStorage.setItem("clm_theme", theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+
+  // Sidebar bisa disembunyikan/dimunculkan lewat tombol di navbar.
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Kotak pencarian di navbar — Enter akan membawa ke "Tabel Semua Dokumen"
+  // dengan filter yang sama dipakai di sana (matchContract, dst).
+  const [navbarSearch, setNavbarSearch] = useState("");
+  const [navbarSearchFocused, setNavbarSearchFocused] = useState(false);
+
   // ===== AUTH =====
   const [currentUser, setCurrentUser] = useState<any>(null);
   // RBAC menu sidebar — id di sini HARUS sama dengan activeTab id yang dipakai
@@ -1619,6 +3342,8 @@ export default function App() {
   // kepanjangan. Dipakai UI Konfigurasi > Hak Akses untuk render matriksnya.
   const MENU_ITEMS: { id: string; label: string }[] = [
     { id: "dashboard", label: "Dashboard" },
+    { id: "dashboard-legal", label: "Dashboard Legal" },
+    { id: "pekerjaan-legal", label: "Pekerjaan Legal" },
     { id: "monitoring", label: "Monitoring Kontrak" },
     { id: "kontrak-karyawan", label: "Kontrak Karyawan" },
     { id: "clauses", label: "Library Klausul & Template" },
@@ -1867,6 +3592,21 @@ export default function App() {
 
   // PDF Export State
   const [isExportingPdf, setIsExportingPdf] = useState(false);
+  // Lihat file input "Berkas Dokumen/Template Kontrak" di wizard mode Upload
+  // — true selagi /api/master-contracts/extract-text lagi baca & memecah
+  // teks berkas jadi pasal-pasal.
+  const [isParsingUploadedFile, setIsParsingUploadedFile] = useState(false);
+  // Mode Edit vs Mode Preview/Output pada panel dokumen live — bukan disimpan
+  // ke server (murni sakelar tampilan lokal). Edit = token mentah {{Token}}
+  // + semua bagian (naskah/pasal/lampiran) jadi contentEditable via DocToolbar
+  // tunggal di atas preview. Preview = tampilan default lama (token sudah
+  // disubstitusi, read-only) — TIDAK ada perubahan perilaku di mode ini.
+  const [docEditMode, setDocEditMode] = useState(false);
+  // Hasil pengukuran DOM "pasal mana yg satu halaman dgn TTD/meterai" — lihat
+  // generateContractPdf. null = belum diukur (atau bukan lagi proses export),
+  // dipakai clauseListBlock/signatureRow di preview utk memutuskan pasal mana
+  // yg diulang per rangkap fisik (BUKAN semua pasal dari awal lagi).
+  const [rangkapCutIndex, setRangkapCutIndex] = useState<number | null>(null);
   const [isTranslating, setIsTranslating] = useState(false);
 
   // Sidebar "AI Tools" collapsible group
@@ -2189,7 +3929,7 @@ export default function App() {
     const t = masterData.documentTypography;
     const fam = t.fontFamily === "sans" ? "'Inter', ui-sans-serif, system-ui, sans-serif"
       : t.fontFamily === "mono" ? "ui-monospace, 'Courier New', monospace"
-      : "Georgia, 'Times New Roman', serif";
+      : "'Times New Roman', Times, serif";
     return { fontFamily: fam, fontSize: `${t.fontSizePt}pt`, lineHeight: t.lineHeight, textAlign: t.align };
   };
   const reminderOptions: number[] = appSettings.reminderDefaults || [7, 14, 30, 60, 90];
@@ -2373,6 +4113,50 @@ export default function App() {
     return null;
   };
 
+  // ===== SEARCH BAR NAVBAR =====
+  // Digabung dari 2 sumber supaya "cari" di navbar beneran nyambung ke
+  // SEMUA fitur (bukan cuma tabel dokumen): (1) daftar menu/halaman yang
+  // memang bisa diakses role ini (MENU_ITEMS + canSee), dan (2) kontrak yang
+  // cocok lewat index pencarian yang sama dipakai "Tabel Semua Dokumen".
+  const navbarFeatureResults = useMemo(() => {
+    const q = navbarSearch.trim().toLowerCase();
+    if (!q) return [];
+    return MENU_ITEMS.filter(
+      (m) => canSee(m.id) && (m.label.toLowerCase().includes(q) || m.id.toLowerCase().includes(q))
+    ).slice(0, 6);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navbarSearch, appSettings, currentUser]);
+
+  const navbarDocResults = useMemo(() => {
+    const q = navbarSearch.trim();
+    if (!q) return [] as Contract[];
+    return contracts.filter((c) => matchContract(c, q) !== null).slice(0, 5);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [navbarSearch, contracts, contractSearchIndex]);
+
+  const goToNavbarFeature = (menuId: string) => {
+    setActiveTab(menuId);
+    setSelectedContract(null);
+    setNavbarSearch("");
+    setNavbarSearchFocused(false);
+  };
+
+  const goToNavbarDoc = (c: Contract) => {
+    handleOpenWorkspace(c);
+    setNavbarSearch("");
+    setNavbarSearchFocused(false);
+  };
+
+  const submitNavbarSearch = () => {
+    if (!navbarSearch.trim()) return;
+    setAllDocsSearch(navbarSearch.trim());
+    setAllDocsPage(1);
+    setActiveTab("all-docs");
+    setSelectedContract(null);
+    setNavbarSearch("");
+    setNavbarSearchFocused(false);
+  };
+
   /** Cuplikan sekitar kata kunci, untuk ditampilkan di baris hasil. */
   const contentSnippet = (c: Contract, query: string, span = 60): string => {
     const q = query.trim().toLowerCase();
@@ -2434,6 +4218,29 @@ export default function App() {
     : status === "Terminated" ? "Diakhiri"
     : status;
 
+  // Cermin dari computeUnifiedLegalStatus di server.ts (satu-satunya sumber
+  // kebenaran ASLI ada di server, dipakai GET /api/contracts & GET
+  // /api/contracts/:id lewat field unifiedStatus). Fungsi ini HANYA fallback
+  // untuk sesaat setelah aksi (approve/sign/dll) yang responsnya belum
+  // membawa unifiedStatus terbaru dari server — supaya badge status utama di
+  // halaman detail kontrak TIDAK PERNAH tampil beda dari badge yang sama di
+  // tabel Monitoring Kontrak / Pekerjaan Legal (mis. "Disetujui Penuh" di
+  // sini padahal "Proses TTD" di tabel — itu status yang sama, cuma beda
+  // representasi: FullyApproved berarti isi kontrak sudah disetujui penuh
+  // TAPI TTD basah belum diunggah, makanya di tabel disebut "Proses TTD").
+  const computeUnifiedContractStatusClient = (c: Contract): string => {
+    if (c.status === "Draft") {
+      if ((c.externalApprovals?.length || 0) > 0) return "RevisiNegosiasi";
+      if (c.externalReviewToken) return "ReviewInternalEksternal";
+      return "Draft";
+    }
+    if (c.status === "OnReview") return "Finalisasi";
+    if (c.status === "FullyApproved") return "ProsesTTD";
+    return c.status;
+  };
+  const unifiedContractStatusOf = (c: Contract): string =>
+    (c as any).unifiedStatus || computeUnifiedContractStatusClient(c);
+
   // Untuk Arsip per Folder: kontrak dianggap "sudah ditandatangani" (bucket
   // Approve) kalau sudah pernah lolos aktivasi (upload bukti TTD basah) —
   // status Aktif/TidakAktif/Archived/Terminated semuanya sudah lewat titik
@@ -2493,6 +4300,7 @@ export default function App() {
     title: "",
     docType: "",
     startDate: "",
+    endDate: "",
     party1Address: "",
     party1Position: "",
     party1IdLabel: "",
@@ -2555,6 +4363,10 @@ export default function App() {
 
   // New Contract Form State
   const [isCreating, setIsCreating] = useState(false);
+  // Daftar Pekerjaan Legal yang boleh ditautkan ke kontrak baru (sudah
+  // disetujui, belum tertaut) — dipakai dropdown "Pilih Judul Pekerjaan
+  // Legal" di wizard Buat Kontrak Eksternal.
+  const [legalJobsForLinking, setLegalJobsForLinking] = useState<{ id: string; title: string; partnerName: string; docType: string; status: string }[]>([]);
   const [creationStep, setCreationStep] = useState(1);
   // Sembunyikan detail pihak (jabatan/alamat/no. identitas) secara default —
   // wizard tetap simpel utk kasus umum, buka hanya kalau memang dibutuhkan.
@@ -2590,6 +4402,9 @@ export default function App() {
     // Override narasi pembuka khusus kontrak ini (opsional) — lihat comment
     // Contract.customOpeningParagraph di types.ts.
     customOpeningParagraph: "",
+    // Hasil auto-parse "kalimat penutup" dari file upload (opsional) — lihat
+    // handler onChange input file mode Upload & closingStatement di types.ts.
+    closingStatement: "",
     startDate: "",
     endDate: "",
     contractValue: 0,
@@ -2610,6 +4425,10 @@ export default function App() {
     // dari master data vendor/customer yang disinkronkan (lihat handleSyncFromVendor).
     sharingFeeItems: [] as ContractSharingFeeItem[],
     vendorId: "" as string,
+    // Menautkan kontrak ini ke Pekerjaan Legal yang sudah disetujui (opsional)
+    // — begitu diisi, status Pekerjaan Legal itu otomatis mengikuti status
+    // kontrak ini (lihat PekerjaanLegalPage & server.ts withLinkedContract).
+    linkedLegalJobId: "" as string,
   });
 
   // Clause Library Form State
@@ -3475,6 +5294,17 @@ export default function App() {
     showToast(data.message || data.error || "Test push dikirim", res.ok ? "success" : "warning");
   };
 
+  // Muat daftar Pekerjaan Legal yang bisa ditautkan setiap kali wizard Buat
+  // Kontrak dibuka — supaya opsinya selalu terbaru (bukan basi dari saat App
+  // pertama dimuat).
+  useEffect(() => {
+    if (!isCreating) return;
+    fetch("/api/legal-jobs/available-for-contract")
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setLegalJobsForLinking)
+      .catch(() => setLegalJobsForLinking([]));
+  }, [isCreating]);
+
   const handleChangePassword = async () => {
     if (pwForm.newPassword !== pwForm.confirmPassword) {
       showToast("Konfirmasi kata sandi baru tidak cocok", "warning");
@@ -3988,13 +5818,23 @@ export default function App() {
   // Handle Create Contract
   const handleCreateContract = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newContractForm.title || !newContractForm.party2Name || !newContractForm.startDate || !newContractForm.endDate) {
-      showToast("Harap isi semua field utama kontrak", "warning");
-      return;
-    }
-    if (!isEndDateAfterStart(newContractForm.startDate, newContractForm.endDate)) {
-      showToast("Tanggal selesai harus setelah tanggal mulai", "warning");
-      return;
+    if (newContractForm.creationMode === "upload") {
+      // Mode Upload: form disederhanakan jadi Judul, Nomor Kontrak, Kategori,
+      // Upload Dokumen saja (lihat Tahap 1) — isi kontrak sudah ada di
+      // berkasnya, jadi Pihak Kedua/Tanggal TIDAK ditanya lagi di sini.
+      if (!newContractForm.title.trim()) {
+        showToast("Judul Kontrak wajib diisi", "warning");
+        return;
+      }
+    } else {
+      if (!newContractForm.title || !newContractForm.party2Name || !newContractForm.startDate || !newContractForm.endDate) {
+        showToast("Harap isi semua field utama kontrak", "warning");
+        return;
+      }
+      if (!isEndDateAfterStart(newContractForm.startDate, newContractForm.endDate)) {
+        showToast("Tanggal selesai harus setelah tanggal mulai", "warning");
+        return;
+      }
     }
     // Variabel template yang belum dikenal dari field wizard lain (lihat
     // getKnownVariableValue) wajib diisi manual di Tahap 3 — dulu ini
@@ -4054,18 +5894,24 @@ export default function App() {
 
     const payload = {
       ...newContractForm,
-      clauses: newContractForm.creationMode === "smart" ? newContractForm.clauses : [],
+      // Mode upload SEKARANG bisa punya clauses hasil auto-parse (lihat
+      // extract-text & onChange input file) — kirim apa adanya, bukan
+      // dikosongkan paksa lagi seperti dulu (waktu upload = viewer statis).
+      clauses: newContractForm.clauses,
       parties: newContractForm.parties,
       masterPdfUrl: fileUrl,
       // Mode unggah PDF: nomor bebas dari user (kosong = server auto-generate).
       // Mode smart: server selalu auto-generate (manualNumber tak dikirim).
       manualNumber: newContractForm.creationMode === "upload" ? (newContractForm.contractNumber.trim() || undefined) : undefined,
-      // Mode unggah PDF = dokumen yang sudah ditandatangani secara fisik (lihat
-      // teks Tahap 1) — lahir langsung Aktif, sama seperti jalur "Daftarkan
-      // Dokumen Upload" di menu Arsip, supaya tidak perlu diajukan/disetujui
-      // ulang secara internal untuk pasal yang sudah disepakati & ditandatangani
-      // pihak luar. Mode smart tetap lahir Draft seperti biasa (server default).
-      status: newContractForm.creationMode === "upload" ? "Aktif" : undefined,
+      // Mode unggah PDF = pakai TEMPLATE/DOKUMEN MILIK USER SENDIRI sbg isi
+      // kontrak (bukan generate dari template sistem) — BUKAN berarti sudah
+      // 100% final ber-TTD basah, jadi TIDAK boleh langsung lahir Aktif
+      // (dulu disamakan dgn jalur "Daftarkan Dokumen Upload" di menu Arsip —
+      // itu keliru, karena tempat itu memang khusus dokumen yang SUDAH FIX
+      // selesai, sedangkan form kontrak ini upload templatenya bisa saja
+      // masih draft/belum ditandatangani semua pihak). Lahir Draft seperti
+      // mode "smart", status Aktif baru berubah lewat proses aktivasi biasa.
+      status: undefined,
       variables: sharingFeeSummary ? { ...resolvedVariables, SharingFeeSummary: sharingFeeSummary } : resolvedVariables,
     };
 
@@ -4120,8 +5966,60 @@ export default function App() {
           subFolderId: "",
           sharingFeeItems: [],
           vendorId: "",
+          linkedLegalJobId: "",
         });
         fetchInitialData();
+
+        // Mode Upload: kalau ekstraksi teks otomatis (extract-text, lihat
+        // input file di atas) gagal total sehingga kontrak lahir tanpa
+        // pasal sama sekali — biasanya karena berkasnya hasil scan/foto,
+        // bukan PDF/docx dengan teks asli — coba OCR otomatis di
+        // background sekali di sini, supaya preview tidak kosong
+        // menunggu user sadar & klik tombol "OCR -> Teks" manual sendiri
+        // (lihat handleRunOcr). Aman dipanggil begini karena endpoint OCR
+        // HANYA mengisi clauses kalau memang masih kosong (tidak pernah
+        // menimpa apa pun & tidak butuh konfirmasi timpa), jadi tidak
+        // mengganggu jalur mode "smart"/upload yang sudah punya isi.
+        if (
+          newContractForm.creationMode === "upload" &&
+          data.contract?.id &&
+          data.contract?.masterPdfUrl &&
+          (!data.contract.clauses || data.contract.clauses.length === 0)
+        ) {
+          fetch(`/api/contracts/${data.contract.id}/ocr`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ userName: "Ahmad GA" }),
+          })
+            .then((r) => r.json())
+            .then((ocrData) => {
+              if (ocrData.success) {
+                fetchInitialData();
+                // Kalau halaman detail kontrak ini KEBETULAN sudah kebuka
+                // (misalnya user langsung klik ke kontrak yang baru dibuat
+                // sebelum panggilan OCR di atas selesai), fetchInitialData()
+                // di atas cuma me-refresh daftar kontrak — objek
+                // selectedContract yang sedang ditampilkan di preview TIDAK
+                // ikut ter-update, jadi klausul hasil OCR tidak nongol
+                // sampai user pindah halaman & buka ulang. Sinkronkan
+                // langsung di sini kalau ID-nya cocok.
+                setSelectedContract((prev: any) =>
+                  prev && prev.id === ocrData.contract?.id ? ocrData.contract : prev
+                );
+                showToast(
+                  ocrData.simulated
+                    ? "Ekstraksi teks otomatis gagal & OCR otomatis juga belum berhasil membaca isi berkas — jalankan ulang OCR manual di halaman detail kontrak."
+                    : "Ekstraksi teks otomatis gagal (kemungkinan berkas hasil scan) — OCR otomatis berhasil membaca isinya, sudah tampil di preview.",
+                  ocrData.simulated ? "warning" : "success",
+                );
+              }
+            })
+            .catch(() => {
+              // Diam saja: berkas tetap tersimpan, user masih bisa
+              // menjalankan OCR manual sendiri kapan saja dari halaman
+              // detail kontrak seperti sebelumnya.
+            });
+        }
       } else {
         showToast(data.error || "Gagal membuat kontrak", "warning");
       }
@@ -4509,9 +6407,27 @@ export default function App() {
     const prevWidth = el.style.width;
     const prevPadding = el.style.padding;
     const prevBorder = el.style.border;
+    // BUG (poin 3 revisi user — token {{Party1Name}}/{{StartDate}}/dll
+    // muncul MENTAH di PDF hasil export, bukan tersubstitusi jadi data
+    // asli): kalau tombol "Export to PDF" dipencet SAAT "Mode Edit" masih
+    // aktif, previewRef masih menampilkan versi RAW contentEditable (token
+    // {{...}} belum disubstitusi — memang disengaja begitu supaya user bisa
+    // MENGEDIT token-nya), bukan versi "Preview" yang sudah tersubstitusi.
+    // generateContractPdf sebelumnya cuma mem-toggle isExportingPdf (buat
+    // sembunyikan tombol edit draft), TIDAK PERNAH memaksa balik ke mode
+    // Preview — jadi screenshot-nya ikut menangkap token mentah itu.
+    // Fix: paksa docEditMode false SELAMA capture (pola sama dengan
+    // isExportingPdf: disimpan lalu dikembalikan di finally), supaya PDF
+    // yang diekspor SELALU dari tampilan Preview yang sudah tersubstitusi,
+    // apa pun mode yang sedang aktif di layar user saat tombol dipencet.
+    const prevDocEditMode = docEditMode;
     try {
+      setRangkapCutIndex(null);
       setIsExportingPdf(true);
-      // Let React re-render (hides draft-only edit buttons) before capture.
+      if (prevDocEditMode) setDocEditMode(false);
+      // Let React re-render (hides draft-only edit buttons, dan kalau tadi
+      // Mode Edit aktif — beralih ke tampilan Preview yang token-nya sudah
+      // tersubstitusi) sebelum capture.
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       el.style.maxHeight = "none";
@@ -4566,6 +6482,85 @@ export default function App() {
         lastHeight = currentHeight;
       }
       await new Promise((resolve) => setTimeout(resolve, 120));
+
+      // Rangkap Fisik (>1 pihak + meterai nyala): tentukan pasal mana yg
+      // SATU HALAMAN dgn blok TTD — HANYA pasal itu yg akan diulang per
+      // rangkap tambahan (idx>0), bukan semua pasal dari Pasal 1 lagi.
+      // Diukur dari layout SATU salinan alami di atas (rangkapCutIndex masih
+      // null saat ini, jadi clauseListBlock() di atas belum menduplikasi apa
+      // pun — persis kondisi yg perlu diukur). Lihat komentar rangkapCutIndex
+      // & clauseListBlock/signatureRow di JSX preview.
+      if (selectedContract.showMeteraiPlaceholder && (selectedContract.parties?.length || 2) > 1) {
+        const elTop = el.getBoundingClientRect().top;
+        const sigAnchor = el.querySelector('[data-signature-anchor="1"]') as HTMLElement | null;
+        const clauseEls = Array.from(el.querySelectorAll("[data-clause-index]")) as HTMLElement[];
+        let cutIdx = 0; // fallback aman: ulang semua pasal (perilaku lama) kalau pengukuran gagal
+        if (sigAnchor && clauseEls.length > 0) {
+          const pxPerMm = el.getBoundingClientRect().width / 210; // el dipaksa width 210mm di atas
+          const pageContentHeightMm = 297 - m.top - m.bottom;
+          const pageHeightPxCss = pageContentHeightMm * pxPerMm;
+          const sigTopPx = sigAnchor.getBoundingClientRect().top - elTop;
+          // PENTING: batas antar halaman NYATA tidak persis kelipatan tetap
+          // pageHeightPxCss — algoritma potong asli (lihat while-loop capture
+          // di bawah, forceBreakPointsPx/safeBreakPointsPx) MENGGESER potongan
+          // ke batas pasal terdekat (isLastSlice/minCutY 40%), supaya tidak
+          // pernah motong di tengah kalimat. Kalau di sini dipakai kelipatan
+          // tetap yg polos, batas halamannya bisa MELESET dari yg sungguhan
+          // kepakai saat render PDF — persis bug yg dilaporkan (Pasal 6
+          // ketinggalan di halaman "sebelum" padahal nyatanya senasib sama
+          // TTD). Makanya di sini REPLIKASI PERSIS logic bestBreak/minCutY yg
+          // sama, dalam satuan px CSS (bukan px kanvas — scale-nya sama2
+          // dipakai di pembilang & penyebut jadi hasilnya proporsional sama).
+          const breakBoundaryElsMeasure = [
+            ...Array.from(el.children),
+            ...Array.from(el.querySelectorAll(".group\\/clause")),
+          ] as HTMLElement[];
+          const safeBreakPointsPxCss = breakBoundaryElsMeasure.map(
+            (c) => c.getBoundingClientRect().bottom - elTop,
+          );
+          const totalHeightPxCss = el.scrollHeight;
+          let renderedPx = 0;
+          let pageStartPx = 0;
+          while (renderedPx < totalHeightPxCss) {
+            let sliceHeight = Math.min(pageHeightPxCss, totalHeightPxCss - renderedPx);
+            const isLastSlice = renderedPx + sliceHeight >= totalHeightPxCss;
+            if (!isLastSlice) {
+              const idealCutY = renderedPx + sliceHeight;
+              const minCutY = renderedPx + pageHeightPxCss * 0.4;
+              let bestBreak = -1;
+              for (const bp of safeBreakPointsPxCss) {
+                if (bp <= idealCutY && bp > minCutY && bp > bestBreak) bestBreak = bp;
+              }
+              if (bestBreak > 0) sliceHeight = bestBreak - renderedPx;
+            }
+            if (sigTopPx >= renderedPx - 1 && sigTopPx < renderedPx + sliceHeight) {
+              pageStartPx = renderedPx;
+              break;
+            }
+            renderedPx += sliceHeight;
+          }
+          cutIdx = selectedContract.clauses.length;
+          for (const ce of clauseEls) {
+            const top = ce.getBoundingClientRect().top - elTop;
+            if (top >= pageStartPx - 1) { cutIdx = Number(ce.getAttribute("data-clause-index")); break; }
+          }
+        }
+        setRangkapCutIndex(cutIdx);
+        // Tunggu re-render dgn duplikasi baru (clauseListBlock(cutIdx,…) per
+        // rangkap), lalu stabilkan ulang tingginya — sama seperti loop reflow
+        // di atas, karena tinggi dokumen sekarang bertambah (ada pasal +
+        // closing + TTD ekstra per rangkap tambahan).
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        void el.offsetHeight;
+        let lastHeight2 = -1;
+        for (let i = 0; i < 12; i++) {
+          await new Promise((resolve) => requestAnimationFrame(resolve));
+          const currentHeight = el.scrollHeight;
+          if (currentHeight === lastHeight2) break;
+          lastHeight2 = currentHeight;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      }
 
       // html2canvas mengklon dokumen ke "jendela virtual" offscreen untuk
       // capture-nya. Kalau cuma windowHeight yang di-override (seperti
@@ -4628,6 +6623,22 @@ export default function App() {
       const forceBreakPointsPx: number[] = Array.from(
         el.querySelectorAll("[data-pdf-force-break]"),
       ).map((elm) => ((elm as HTMLElement).getBoundingClientRect().top - elTopCss) * scale);
+
+      // Rentang tinggi tiap <img> di dalam preview (kop/logo perusahaan
+      // MAUPUN foto lampiran yang disisipkan lewat toolbar gambar) — dipakai
+      // di bawah supaya potongan halaman TIDAK PERNAH jatuh di TENGAH sebuah
+      // gambar. <img> di lampiran ditempel via dangerouslySetInnerHTML
+      // (bodyHtml section, lihat attachmentSectionsBlock), jadi bukan child
+      // langsung previewRef ataupun `.group/clause` — tidak ikut kehitung di
+      // safeBreakPointsPx di atas, itu sebabnya sebelum ini foto lampiran
+      // bisa kepotong pas separuh kalau titik potong per-halaman kebetulan
+      // jatuh persis di tengah tinggi fotonya.
+      const imageZonesPx: { top: number; bottom: number }[] = Array.from(
+        el.querySelectorAll("img"),
+      ).map((img) => {
+        const r = (img as HTMLElement).getBoundingClientRect();
+        return { top: (r.top - elTopCss) * scale, bottom: (r.bottom - elTopCss) * scale };
+      });
 
       const canvas = await html2canvas(el, {
         scale,
@@ -4711,6 +6722,33 @@ export default function App() {
             // baik daripada halaman kosong sama sekali.
           }
         }
+        // Jangan sampai potongan halaman jatuh di TENGAH sebuah <img> (poin
+        // revisi: foto lampiran kepotong karena kepanjangan). Cuma berlaku
+        // untuk gambar yang MULAI di halaman ini (img.top >= awal slice) —
+        // kalau gambar sudah mulai dari halaman SEBELUMNYA dan masih lanjut
+        // ke sini, itu berarti gambarnya sendiri lebih tinggi dari satu
+        // halaman penuh dan memang tidak mungkin dihindari (dibiarkan apa
+        // adanya, lebih baik daripada halaman kosong tak berujung). Kalau
+        // gambar baru mulai di halaman ini tapi tidak cukup ruang sampai
+        // akhir halaman, potongan digeser ke PERSIS sebelum gambar itu —
+        // otomatis membuat gambar tsb pindah utuh ke halaman berikutnya.
+        for (const img of imageZonesPx) {
+          const cutY = renderedHeightPx + sliceHeightPx;
+          const imgStartsThisSlice = img.top >= renderedHeightPx - 1;
+          const cutInsideImage = cutY > img.top + 1 && cutY < img.bottom - 1;
+          if (imgStartsThisSlice && cutInsideImage) {
+            const pushedBackHeight = img.top - renderedHeightPx;
+            // Guard minimal: kalau gambar itu mulai nyaris di awal halaman
+            // (mis. halaman ini memang KHUSUS diawali gambar itu), menggeser
+            // mundur cuma bikin slice ~0px (loop tak maju) — biarkan potongan
+            // asli jalan, gambar itu sendiri yang lebih tinggi dari 1 halaman.
+            if (pushedBackHeight > pageHeightPx * 0.05) {
+              sliceHeightPx = pushedBackHeight;
+            }
+            break;
+          }
+        }
+
         // Bulatkan ke atas: pageCanvas.height (integer, dibulatkan browser)
         // TIDAK BOLEH lebih kecil dari area yang mau digambar — kalau lebih
         // kecil, sisa barisnya ketinggalan transparan (lihat fillRect di
@@ -4860,6 +6898,10 @@ export default function App() {
       el.style.padding = prevPadding;
       el.style.border = prevBorder;
       setIsExportingPdf(false);
+      setRangkapCutIndex(null);
+      // Kembalikan Mode Edit persis seperti semula — user yang tadi sedang
+      // mengedit draft tidak kehilangan mode kerjanya cuma gara-gara export.
+      if (prevDocEditMode) setDocEditMode(true);
     }
   };
 
@@ -5069,6 +7111,45 @@ export default function App() {
     await handleUpdateContractDraft(`${next ? "Tampilkan" : "Sembunyikan"} placeholder meterai`, updated);
   };
 
+  // Simpan seluruh daftar Lampiran (foto+tabel) sekaligus — dipanggil dari
+  // tiap aksi kecil di editor (tambah section, ubah judul, upload foto,
+  // ubah kolom/baris tabel dst). Sama pola optimistic-update-lalu-PUT dgn
+  // handleToggle* di atas, cuma menerima array lengkap karena editornya
+  // punya banyak sub-field bersarang (per section: foto + tabel dinamis).
+  const handleUpdateAttachmentSections = async (next: ContractAttachmentSection[]) => {
+    if (!selectedContract) return;
+    const updated = { ...selectedContract, attachmentSections: next };
+    setSelectedContract(updated);
+    await handleUpdateContractDraft("Perbarui Halaman Lampiran (foto/tabel)", updated);
+  };
+
+  // "Tambah Halaman Baru" — bebas total (bodyHtml kosong), isi apa saja
+  // (teks/gambar/tabel) disisipkan lewat DocToolbar yang sama dipakai naskah
+  // & pasal, bukan lagi field kaku 1-foto-1-tabel.
+  const handleAddAttachmentSection = () => {
+    if (!selectedContract) return;
+    const current = selectedContract.attachmentSections || [];
+    const nextLetter = String.fromCharCode(65 + current.length); // A, B, C, ...
+    const section: ContractAttachmentSection = {
+      id: `att-${Date.now()}`,
+      title: `LAMPIRAN ${nextLetter}`,
+      bodyHtml: "",
+    };
+    handleUpdateAttachmentSections([...current, section]);
+  };
+
+  const handleRemoveAttachmentSection = (id: string) => {
+    if (!selectedContract) return;
+    handleUpdateAttachmentSections((selectedContract.attachmentSections || []).filter((s) => s.id !== id));
+  };
+
+  const handlePatchAttachmentSection = (id: string, patch: Partial<ContractAttachmentSection>) => {
+    if (!selectedContract) return;
+    handleUpdateAttachmentSections(
+      (selectedContract.attachmentSections || []).map((s) => (s.id === id ? { ...s, ...patch } : s)),
+    );
+  };
+
   // Upload logo Pihak Kedua — cuma unggah berkas & taruh hasilnya di STAGING
   // form (editPartyForm), belum ke draft/server. Sama seperti
   // handleUploadCompanyLogo (yang staging ke appSettings sampai "Simpan
@@ -5099,6 +7180,7 @@ export default function App() {
       title: contract.title || "",
       docType: contract.docType || "",
       startDate: contract.startDate || "",
+      endDate: contract.endDate || "",
       party1Address: contract.party1Address || "",
       party1Position: contract.party1Position || "",
       party1IdLabel: contract.party1IdLabel || "",
@@ -5161,6 +7243,7 @@ export default function App() {
       title: newTitle,
       docType: newDocType,
       startDate: editPartyForm.startDate,
+      endDate: editPartyForm.endDate,
       party1Address: editPartyForm.party1Address.trim() || undefined,
       party1Position: editPartyForm.party1Position.trim() || undefined,
       party1IdLabel: editPartyForm.party1IdLabel.trim() || undefined,
@@ -7994,6 +10077,23 @@ export default function App() {
             const val = variables[key];
             if (val) {
               return <React.Fragment key={index}>{val}</React.Fragment>;
+            } else if (isExportingPdf) {
+              // BUG (poin 3 revisi user): badge "Kosong (Quick-Fix)" di bawah
+              // ini (tombol kuning interaktif, buat isi cepat variabel yang
+              // kosong SAAT diedit di layar) sebelum ini ikut ter-screenshot
+              // apa adanya ke PDF hasil "Export to PDF" — badge tombol
+              // aplikasi (cursor-pointer, hover, border) itu jelas tidak
+              // pantas muncul di dokumen resmi yang siap ditandatangani.
+              // Saat isExportingPdf true, ganti jadi placeholder polos ala
+              // mail-merge ("[Currency]") — TETAP kelihatan datanya belum
+              // lengkap (supaya tidak menyesatkan seolah dokumen sudah utuh),
+              // tapi tanpa chrome tombol/UI aplikasi yang tidak relevan di
+              // atas kertas.
+              return (
+                <span key={index} className="text-rose-500 italic">
+                  [{key}]
+                </span>
+              );
             } else {
               return (
                 <span
@@ -8299,6 +10399,10 @@ export default function App() {
     if (externalToken) return <ExternalReviewPage token={externalToken} />;
     const dcsExternalToken = new URLSearchParams(window.location.search).get("dcsReviewToken");
     if (dcsExternalToken) return <DcsExternalReviewPage token={dcsExternalToken} />;
+    // Formulir eksternal "Tambah Pekerjaan Legal" — dibagikan Staff Legal via
+    // tombol "Bagikan Link Formulir" di halaman Pekerjaan Legal.
+    const legalFormToken = new URLSearchParams(window.location.search).get("legalFormToken");
+    if (legalFormToken) return <LegalExternalFormPage token={legalFormToken} />;
   }
 
   if (!currentUser) {
@@ -8557,6 +10661,10 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
+      {/* Kontrol gambar mengambang ala Canva — global, lepas dari alur
+          dokumen manapun (lihat komentar di definisi komponennya). */}
+      <ImageSelectionOverlay />
+      <TableSelectionOverlay />
       {/* Toast Alert — z-[100], DI ATAS semua modal (z-50): modal disusun
           belakangan di urutan DOM, jadi kalau z-index-nya SAMA (50=50), modal
           menang dan toast tertutup di belakangnya — user tidak tahu simpan
@@ -8581,12 +10689,23 @@ export default function App() {
       })()}
 
       {/* Top Header */}
-      <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur px-6 py-4 flex items-center justify-between sticky top-0 z-40">
-        <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 rounded-lg bg-indigo-500/10 border border-indigo-500/25 flex items-center justify-center">
+      <header className="border-b border-white/5 bg-slate-950/40 backdrop-blur-xl px-6 py-4 flex items-center justify-between sticky top-0 z-40">
+        <div className="flex items-center gap-3 min-w-0">
+          {/* Fallback toggle buat mobile — di desktop dipindah jadi handle
+              di pembatas sidebar (lihat dekat <aside>). */}
+          <button
+            onClick={() => setSidebarOpen((o) => !o)}
+            className="md:hidden p-2 rounded-lg hover:bg-slate-800/40 transition cursor-pointer text-slate-400 hover:text-slate-100 shrink-0"
+            title={sidebarOpen ? "Sembunyikan sidebar" : "Tampilkan sidebar"}
+            aria-label="Tampilkan/sembunyikan sidebar"
+          >
+            {sidebarOpen ? <PanelLeftClose className="w-[18px] h-[18px]" /> : <PanelLeftOpen className="w-[18px] h-[18px]" />}
+          </button>
+
+          <div className="w-9 h-9 rounded-lg bg-indigo-500/10 border border-indigo-500/25 flex items-center justify-center shrink-0">
             <FileText className="text-indigo-400 w-[18px] h-[18px]" strokeWidth={2.25} />
           </div>
-          <div>
+          <div className="hidden sm:block shrink-0">
             <h1 className="font-semibold text-[15px] leading-tight text-slate-100 tracking-tight">
               Smart CLM Enterprise
             </h1>
@@ -8594,19 +10713,133 @@ export default function App() {
               General Affair &amp; Legal · {currentTenant?.name || "…"}
             </p>
           </div>
+
+          {/* Ucapan selamat datang — cuma tampil di Dashboard, ilang di tab lain. */}
+          {activeTab === "dashboard" && (
+            <div className="hidden lg:flex items-center gap-2 pl-4 ml-1 border-l border-slate-800 min-w-0 animate-fadeIn">
+              <span className="text-base leading-none shrink-0">👋</span>
+              <p className="text-[13px] text-slate-300 truncate">
+                Selamat datang kembali, <span className="font-semibold text-slate-100">{currentUser.name}</span>
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="flex items-center gap-3">
-          {/* Quick notification count */}
+          {/* Search bar — ikon di ujung kanan, dalam tombol berwarna (aksen indigo).
+              Dropdown-nya nyari 2 hal sekaligus: fitur/halaman (MENU_ITEMS) dan
+              kontrak yang cocok — supaya bener-bener "search semua fitur", bukan
+              cuma tabel dokumen. */}
+          <div className="relative hidden md:block">
+            <div className="flex items-center gap-1.5 bg-slate-900/50 border border-slate-800 rounded-full pl-4 pr-1.5 py-1.5 w-56 lg:w-80 focus-within:border-indigo-500/50 transition">
+              <input
+                type="text"
+                value={navbarSearch}
+                onChange={(e) => setNavbarSearch(e.target.value)}
+                onFocus={() => setNavbarSearchFocused(true)}
+                onBlur={() => setTimeout(() => setNavbarSearchFocused(false), 150)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submitNavbarSearch();
+                  if (e.key === "Escape") {
+                    setNavbarSearchFocused(false);
+                    (e.target as HTMLInputElement).blur();
+                  }
+                }}
+                placeholder="Cari fitur, kontrak & dokumen…"
+                className="bg-transparent border-none outline-none text-xs text-slate-200 placeholder:text-slate-500 w-full"
+              />
+              <button
+                onClick={submitNavbarSearch}
+                className="shrink-0 w-7 h-7 rounded-full bg-indigo-500 hover:bg-indigo-400 flex items-center justify-center transition cursor-pointer"
+                title="Cari"
+                aria-label="Cari"
+              >
+                <Search className="w-3.5 h-3.5 text-white" />
+              </button>
+            </div>
+
+            {navbarSearchFocused && navbarSearch.trim().length > 0 && (
+              <div className="absolute left-0 right-0 top-full mt-2 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl py-2 max-h-96 overflow-y-auto z-50">
+                {navbarFeatureResults.length > 0 && (
+                  <div className="px-2 pb-1.5">
+                    <p className="px-2.5 py-1 text-[10px] font-bold text-slate-500 uppercase tracking-wide">Fitur &amp; Halaman</p>
+                    {navbarFeatureResults.map((m) => (
+                      <button
+                        key={m.id}
+                        onClick={() => goToNavbarFeature(m.id)}
+                        className="w-full text-left px-2.5 py-2 rounded-lg text-xs text-slate-200 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+                      >
+                        <LayoutDashboard className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {navbarDocResults.length > 0 && (
+                  <div className={`px-2 pt-1.5 ${navbarFeatureResults.length > 0 ? "border-t border-slate-800" : ""}`}>
+                    <p className="px-2.5 py-1 text-[10px] font-bold text-slate-500 uppercase tracking-wide">Kontrak &amp; Dokumen</p>
+                    {navbarDocResults.map((c) => (
+                      <button
+                        key={c.id}
+                        onClick={() => goToNavbarDoc(c)}
+                        className="w-full text-left px-2.5 py-2 rounded-lg text-xs hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+                      >
+                        <FileText className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                        <span className="flex-1 min-w-0">
+                          <span className="block text-slate-200 truncate">{c.title || "Tanpa judul"}</span>
+                          {c.contractNumber && <span className="block text-[10px] text-slate-500 truncate">{c.contractNumber}</span>}
+                        </span>
+                      </button>
+                    ))}
+                    <button
+                      onClick={submitNavbarSearch}
+                      className="w-full text-left px-2.5 py-2 rounded-lg text-[11px] text-indigo-400 hover:bg-slate-900 transition cursor-pointer font-semibold"
+                    >
+                      Lihat semua hasil di Tabel Semua Dokumen →
+                    </button>
+                  </div>
+                )}
+
+                {navbarFeatureResults.length === 0 && navbarDocResults.length === 0 && (
+                  <div className="px-2">
+                    <p className="px-2.5 py-2 text-xs text-slate-500">Tidak ada fitur/kontrak yang cocok dengan "{navbarSearch}".</p>
+                    <button
+                      onClick={submitNavbarSearch}
+                      className="w-full text-left px-2.5 py-2 rounded-lg text-[11px] text-indigo-400 hover:bg-slate-900 transition cursor-pointer font-semibold"
+                    >
+                      Cari tetap di Tabel Semua Dokumen →
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Dark / light theme toggle */}
+          <button
+            onClick={toggleTheme}
+            className="p-2 rounded-lg bg-slate-900/60 border border-slate-800 hover:bg-slate-800 transition cursor-pointer shrink-0"
+            title={theme === "dark" ? "Ganti ke mode terang" : "Ganti ke mode gelap"}
+            aria-label="Ganti tema"
+          >
+            {theme === "dark" ? (
+              <Sun className="w-4 h-4 text-amber-400" />
+            ) : (
+              <Moon className="w-4 h-4 text-slate-400" />
+            )}
+          </button>
+
+          {/* Notifikasi — badge menumpuk di sudut ikon, gaya bulat. */}
           <div className="relative group">
             <button
               onClick={handleMarkNotificationsRead}
-              className="p-2 rounded-lg bg-slate-900 border border-slate-800 hover:bg-slate-800 transition cursor-pointer flex items-center gap-2"
+              className="relative p-2.5 rounded-full hover:bg-slate-800/40 transition cursor-pointer"
               title="Tandai semua telah dibaca"
             >
-              <Bell className="w-4 h-4 text-amber-400" />
+              <Bell className="w-5 h-5 text-slate-300" />
               {notifications.filter((n) => !n.read).length > 0 && (
-                <span className="bg-rose-500 text-white text-[10px] px-1.5 py-0.5 rounded-full font-bold">
+                <span className="absolute top-0.5 right-0.5 bg-rose-500 text-white text-[9px] min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full font-bold ring-2 ring-slate-950">
                   {notifications.filter((n) => !n.read).length}
                 </span>
               )}
@@ -8614,12 +10847,17 @@ export default function App() {
           </div>
 
           <div className="relative group">
-            <button className="flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-lg border border-slate-800 text-xs cursor-pointer hover:border-slate-700 transition">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-              <span className="text-slate-300 font-semibold">{currentUser.name}</span>
-              <span className="text-[9px] bg-indigo-500/20 text-indigo-400 px-1.5 py-0.5 rounded-full font-bold uppercase">
-                {({ super_admin: "Super Admin", admin: "Admin", legal: "Legal", manager: "Manager", staff: "Staff", viewer: "Viewer" } as any)[currentUser.role] || currentUser.role}
-              </span>
+            <button className="flex items-center gap-2.5 pl-1 pr-2 py-1 rounded-full hover:bg-slate-800/40 transition cursor-pointer">
+              <div className="w-8 h-8 rounded-full bg-indigo-500 flex items-center justify-center text-white font-bold text-xs shrink-0">
+                {(currentUser.name || "U").trim().charAt(0).toUpperCase()}
+              </div>
+              <div className="hidden sm:block text-left leading-tight">
+                <p className="text-xs font-bold text-slate-100">{currentUser.name}</p>
+                <p className="text-[10.5px] text-slate-500">
+                  {({ super_admin: "Super Admin", admin: "Admin", legal: "Legal", manager: "Manager", staff: "Staff", viewer: "Viewer" } as any)[currentUser.role] || currentUser.role}
+                </p>
+              </div>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
             </button>
             <div className="absolute right-0 top-full mt-1 w-48 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl py-1.5 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition z-50">
               <button
@@ -8658,7 +10896,22 @@ export default function App() {
 
       {/* Main Body */}
       <div className="flex-1 flex flex-col md:flex-row">
-        <aside className="w-full md:w-64 bg-slate-950/60 border-r border-slate-800 p-4 space-y-4 shrink-0 flex flex-col justify-between">
+        {/* Handle pembatas sidebar — nempel di garis batas sidebar/konten,
+            posisi fixed di tengah layar biar tetap kelihatan walau discroll.
+            Cuma di desktop (mobile tetap pakai tombol di navbar). */}
+        <button
+          onClick={() => setSidebarOpen((o) => !o)}
+          className={`hidden md:flex items-center justify-center fixed top-1/2 -translate-y-1/2 z-30 w-5 h-14 rounded-r-lg bg-slate-900/90 border border-l-0 border-slate-800 hover:bg-slate-800 hover:w-6 transition-all cursor-pointer text-slate-400 hover:text-slate-100 ${
+            sidebarOpen ? "left-64" : "left-0"
+          }`}
+          title={sidebarOpen ? "Sembunyikan sidebar" : "Tampilkan sidebar"}
+          aria-label="Tampilkan/sembunyikan sidebar"
+        >
+          {sidebarOpen ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        </button>
+
+        {sidebarOpen && (
+        <aside className="w-full md:w-64 bg-slate-950/30 backdrop-blur-xl border-r border-white/5 p-4 space-y-4 shrink-0 flex flex-col justify-between animate-fadeIn">
           <div className="space-y-4">
             <div>
               <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-3 mb-2">
@@ -8679,6 +10932,36 @@ export default function App() {
               >
                 <LayoutDashboard className="w-4 h-4" />
                 Dashboard
+              </button>
+              )}
+
+              <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wide px-3 mt-4 mb-1.5">
+                Legal
+              </p>
+              {canSee("dashboard-legal") && (
+              <button
+                onClick={() => { setActiveTab("dashboard-legal"); setSelectedContract(null); }}
+                className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                  activeTab === "dashboard-legal"
+                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
+                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
+                }`}
+              >
+                <LayoutDashboard className="w-4 h-4" />
+                Dashboard Legal
+              </button>
+              )}
+              {canSee("pekerjaan-legal") && (
+              <button
+                onClick={() => { setActiveTab("pekerjaan-legal"); setSelectedContract(null); }}
+                className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
+                  activeTab === "pekerjaan-legal"
+                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
+                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
+                }`}
+              >
+                <ClipboardList className="w-4 h-4" />
+                Pekerjaan Legal
               </button>
               )}
 
@@ -9081,6 +11364,7 @@ export default function App() {
           </div>
 
         </aside>
+        )}
 
         {/* Center Dynamic Content Area */}
         <main className="flex-1 p-6 overflow-y-auto">
@@ -10583,6 +12867,20 @@ export default function App() {
             </div>
           )}
 
+          {/* VIEW: DASHBOARD LEGAL */}
+          {activeTab === "dashboard-legal" && (
+            <DashboardLegalPage currentUser={currentUser} onOpenPekerjaanLegal={() => setActiveTab("pekerjaan-legal")} />
+          )}
+
+          {/* VIEW: PEKERJAAN LEGAL */}
+          {activeTab === "pekerjaan-legal" && (
+            <PekerjaanLegalPage currentUser={currentUser} onOpenContract={(contractId) => {
+              const c = contracts.find((x) => x.id === contractId);
+              if (c) { setSelectedContract(c); setActiveTab("monitoring"); }
+              else showToast("Kontrak terhubung tidak ditemukan.", "warning");
+            }} />
+          )}
+
           {/* VIEW: DASHBOARD */}
           {activeTab === "dashboard" && !selectedContract && (
             <div className="space-y-6">
@@ -11272,18 +13570,19 @@ export default function App() {
               {/* MASTER DATA DROPDOWN DINAMIS */}
               {configTab === "masterdata" && (
                 <div className="space-y-5">
-                  <div className="flex items-start justify-between gap-4">
-                    <p className="text-xs text-slate-400 max-w-2xl">
-                      Semua daftar pilihan (dropdown) di form kontrak dikelola di sini — tidak ada lagi yang baku/hardcoded.
-                      Perubahan berlaku langsung di Form Pendaftaran Dokumen, wizard kontrak, dan pelacakan rangkap.
-                    </p>
-                    <button
-                      onClick={handleSaveSettings}
-                      className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold shrink-0 flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <Check className="w-4 h-4" /> Simpan Master Data
-                    </button>
-                  </div>
+                  {/* Tombol "Simpan Master Data" global yang dulu di sini
+                      dihapus atas permintaan user — tiap kartu di bawah
+                      sekarang punya tombol "Simpan" sendiri (lihat masing-
+                      masing kartu), jadi user tidak perlu scroll balik ke
+                      atas tiap kali mengubah satu bagian. Semua tombol itu
+                      (termasuk yang lama seperti "Simpan Margin"/"Simpan
+                      Jenis") tetap manggil handleSaveSettings yang SAMA —
+                      cuma UI-nya yang berubah, mekanisme simpan di baliknya
+                      tidak disentuh sama sekali. */}
+                  <p className="text-xs text-slate-400 max-w-2xl">
+                    Semua daftar pilihan (dropdown) di form kontrak dikelola di sini — tidak ada lagi yang baku/hardcoded.
+                    Perubahan berlaku langsung di Form Pendaftaran Dokumen, wizard kontrak, dan pelacakan rangkap.
+                  </p>
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     {/* Jenis Kontrak / Dokumen — kini dikelola di tab "Jenis Dokumen" (hub terpadu) */}
@@ -11300,6 +13599,24 @@ export default function App() {
                       >
                         Buka tab Jenis Dokumen →
                       </button>
+                    </div>
+
+                    {/* ==== Section: Format Nomor & Margin Halaman ====
+                        Header + kartu info ditaruh SEBELUM 2 kartu interaktif
+                        di bawahnya (Format Nomor Dokumen, Margin Halaman
+                        Dokumen) supaya pemula baca konsepnya dulu sebelum
+                        ketemu form-nya — bukan sekadar dekorasi. */}
+                    <div className="lg:col-span-2">
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Format Nomor &amp; Margin Halaman</p>
+                    </div>
+
+                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
+                      <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
+                        <FileDigit className="w-4 h-4 text-violet-400" /> Penomoran Terintegrasi per Jenis Dokumen
+                      </h4>
+                      <p className="text-[11px] text-slate-400 leading-relaxed">
+                        Penomoran dokumen disatukan berpatokan pada <strong className="text-slate-200">Jenis Dokumen</strong> (seperti *Perjanjian, MOU, Addendum*). Setiap jenis dokumen memiliki Kode Singkatan dan Format Nomor tersendiri di panel Jenis Kontrak / Dokumen di atas, serta memiliki nomor urut independen yang dimulai dari <code>001</code> tiap tahunnya.
+                      </p>
                     </div>
 
                     {/* ==== Format Nomor Dokumen — SATU kartu, dua mode ====
@@ -11339,9 +13656,56 @@ export default function App() {
 
                       {numberFormatModule === "dcs" ? (
                         <>
-                          <p className="text-[10px] text-slate-500">
-                            Format bawaan untuk jenis dokumen <b className="text-violet-300">DCS</b> (SOP/IK/Memo/Kebijakan) yang belum punya format khusus sendiri. Tiap jenis dokumen bisa di-override lewat tombol "Edit template"-nya masing-masing di tab <b>Jenis Dokumen (Semua Modul)</b>. Token tersedia: <code>{"{DocType} {Department} {Year} {Month} {MonthRoman} {Day} {Sequence:4}"}</code>
-                          </p>
+                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg space-y-2">
+                            <p className="text-[11px] text-slate-300 font-semibold">Cara kerja penomoran (DCS)</p>
+                            <ol className="text-[11px] text-slate-400 space-y-1 list-decimal list-inside leading-relaxed">
+                              <li>Format bawaan untuk jenis dokumen <b className="text-violet-300">DCS</b> (SOP/IK/Memo/Kebijakan) yang belum punya format khusus sendiri.</li>
+                              <li>Tiap jenis dokumen bisa di-override lewat tombol "Edit template"-nya masing-masing di tab <b>Jenis Dokumen (Semua Modul)</b>.</li>
+                              <li>Nomor urut dihitung <b>terpisah per Jenis Dokumen dan per tahun</b> — tiap ganti tahun urutan mulai lagi dari 1.</li>
+                            </ol>
+                          </div>
+                          <div className="space-y-1.5">
+                            <p className="text-[10px] text-slate-500">Klik untuk menyisipkan ke format di bawah:</p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {[
+                                { t: "{DocType}", l: "Jenis dokumen", d: "Kode singkat jenis dokumen, mis. SOP, IK, MEMO" },
+                                { t: "{Department}", l: "Departemen", d: "Kode departemen penyusun, mis. HED" },
+                                { t: "{Year}", l: "Tahun", d: "2026" },
+                                { t: "{Month}", l: "Bulan angka", d: "1 … 12" },
+                                { t: "{MonthRoman}", l: "Bulan Romawi", d: "I, II, III … XII" },
+                                { t: "{Day}", l: "Tanggal", d: "1 … 31" },
+                                { t: "{Sequence:4}", l: "Nomor urut", d: "0001, 0002, 0003 — dihitung per jenis dokumen per tahun. Angka 4 = jumlah digit." },
+                              ].map((tok) => (
+                                <button
+                                  key={tok.t}
+                                  type="button"
+                                  title={`${tok.t} — ${tok.d}`}
+                                  onClick={() => {
+                                    // Sisipkan dengan pemisah "/" otomatis, kalau
+                                    // tidak hasilnya menempel jadi {Year}{Year}.
+                                    const cur = dcsNumberingMaskDraft || "";
+                                    const needsSep = cur.length > 0 && !/[/.\-_]$/.test(cur);
+                                    setDcsNumberingMaskDraft(cur + (needsSep ? "/" : "") + tok.t);
+                                  }}
+                                  className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-violet-500/50 rounded-lg text-[10px] text-slate-300 cursor-pointer transition"
+                                >
+                                  + {tok.l}
+                                </button>
+                              ))}
+                            </div>
+                            {/* Penjelasan tiap token ditampilkan langsung di sini (tidak
+                                hanya lewat hover/title) supaya terlihat tanpa perlu
+                                mengarahkan kursor satu-satu ke tiap chip. */}
+                            <ul className="text-[10px] text-slate-500 space-y-0.5 list-disc list-inside leading-relaxed">
+                              <li><code className="text-slate-400">{"{DocType}"}</code> — Kode singkat jenis dokumen, mis. SOP, IK, MEMO</li>
+                              <li><code className="text-slate-400">{"{Department}"}</code> — Kode departemen penyusun, mis. HED</li>
+                              <li><code className="text-slate-400">{"{Year}"}</code> — Tahun, mis. 2026</li>
+                              <li><code className="text-slate-400">{"{Month}"}</code> — Bulan angka, 1 … 12</li>
+                              <li><code className="text-slate-400">{"{MonthRoman}"}</code> — Bulan angka Romawi, I … XII</li>
+                              <li><code className="text-slate-400">{"{Day}"}</code> — Tanggal, 1 … 31</li>
+                              <li><code className="text-slate-400">{"{Sequence:4}"}</code> — Nomor urut per jenis dokumen per tahun. Angka menentukan jumlah digit, mis. {"{Sequence:4}"} → 0001</li>
+                            </ul>
+                          </div>
                           <div className="flex items-center gap-2">
                             <input
                               type="text"
@@ -11358,9 +13722,14 @@ export default function App() {
                               Simpan
                             </button>
                           </div>
-                          <span className="block text-[10px] font-mono text-slate-600">
-                            Preview: {previewNumberMask(dcsNumberingMaskDraft, { DocType: "SOP", Department: "HED", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1).padStart(2, "0"), Day: String(new Date().getDate()).padStart(2, "0") })}
-                          </span>
+                          {/* Preview diperbesar (sebelumnya text-[10px] abu-abu gelap,
+                              nyaris tak terlihat) supaya jelas terbaca. */}
+                          <div className="px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg">
+                            <p className="text-[10px] text-slate-500 mb-0.5">Preview</p>
+                            <p className="text-sm font-mono font-semibold text-emerald-300 break-all">
+                              {previewNumberMask(dcsNumberingMaskDraft, { DocType: "SOP", Department: "HED", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1).padStart(2, "0"), Day: String(new Date().getDate()).padStart(2, "0") })}
+                            </p>
+                          </div>
                         </>
                       ) : (
                         <>
@@ -11405,7 +13774,21 @@ export default function App() {
                                 </button>
                               ))}
                             </div>
-                            <p className="text-[10px] text-slate-600">Arahkan kursor ke chip untuk melihat artinya. Segmen yang kosong (mis. kode tambahan tak diisi) otomatis dirapikan agar tidak ada garis miring dobel.</p>
+                            {/* Penjelasan tiap token ditampilkan langsung di sini (tidak
+                                hanya lewat hover/title) supaya terlihat tanpa perlu
+                                mengarahkan kursor satu-satu ke tiap chip. */}
+                            <ul className="text-[10px] text-slate-500 space-y-0.5 list-disc list-inside leading-relaxed">
+                              <li><code className="text-slate-400">{"{Sequence:3}"}</code> — Nomor urut, 001/002/003 — dihitung per jenis dokumen per tahun. Angka menentukan jumlah digit.</li>
+                              <li><code className="text-slate-400">{"{DocTypeCode}"}</code> — Kode singkat jenis dokumen, mis. PKS</li>
+                              <li><code className="text-slate-400">{"{Codes}"}</code> — Kode tambahan jenis dokumen bila diisi, mis. TBK</li>
+                              <li><code className="text-slate-400">{"{MonthRoman}"}</code> — Bulan dalam angka Romawi, I … XII</li>
+                              <li><code className="text-slate-400">{"{Year}"}</code> — Tahun, mis. 2026</li>
+                              <li><code className="text-slate-400">{"{Prefix}"}</code> — Prefix kategori, atau Prefix Default di bawah bila kategori tak punya prefix sendiri</li>
+                              <li><code className="text-slate-400">{"{Category}"}</code> — Nama kategori, mis. Vendor</li>
+                              <li><code className="text-slate-400">{"{DocType}"}</code> — Nama lengkap jenis dokumen</li>
+                              <li><code className="text-slate-400">{"{Month}"}</code> — Bulan angka, 1 … 12</li>
+                              <li><code className="text-slate-400">{"{Day}"}</code> — Tanggal, 1 … 31 (token sama juga tersedia di format nomor Dokumen Internal/DCS)</li>
+                            </ul>
                           </div>
                           <div>
                             <label className="block text-[10px] text-slate-500 mb-1">Prefix Default (dipakai token {"{Prefix}"} kalau kategori tak punya prefix sendiri)</label>
@@ -11422,10 +13805,20 @@ export default function App() {
                             onChange={(e) => setAppSettings({ ...appSettings, masterData: { ...appSettings.masterData, defaultNumberMask: e.target.value } })}
                             className="w-full px-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
                           />
-                          <span className="block text-[10px] font-mono text-slate-600">
-                            Preview: {previewNumberMask(masterData.defaultNumberMask, { Prefix: masterData.defaultNumberPrefix, Category: "Vendor", DocType: "", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1), Day: String(new Date().getDate()) })}
-                          </span>
-                          <p className="text-[10px] text-slate-600 italic">Mode Kontrak tersimpan lewat tombol "Simpan Master Data" di atas halaman ini (bukan tombol "Simpan" tersendiri seperti mode DCS).</p>
+                          {/* Preview diperbesar (sebelumnya text-[10px] abu-abu gelap,
+                              nyaris tak terlihat) supaya jelas terbaca. */}
+                          <div className="px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg">
+                            <p className="text-[10px] text-slate-500 mb-0.5">Preview</p>
+                            <p className="text-sm font-mono font-semibold text-emerald-300 break-all">
+                              {previewNumberMask(masterData.defaultNumberMask, { Prefix: masterData.defaultNumberPrefix, Category: "Vendor", DocType: "", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1), Day: String(new Date().getDate()) })}
+                            </p>
+                          </div>
+                          <button
+                            onClick={handleSaveSettings}
+                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg cursor-pointer"
+                          >
+                            Simpan
+                          </button>
                         </>
                       )}
                     </div>
@@ -11484,6 +13877,11 @@ export default function App() {
                         })}
                       </div>
                       <button onClick={handleSaveSettings} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg cursor-pointer">Simpan Margin</button>
+                    </div>
+
+                    {/* ==== Section: Daftar Pilihan (Dropdown Formulir) ==== */}
+                    <div className="lg:col-span-2 pt-2">
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Daftar Pilihan (Dropdown Formulir)</p>
                     </div>
 
                     {/* Daftar string sederhana: tipe pihak, mata uang, status rangkap */}
@@ -11560,19 +13958,19 @@ export default function App() {
                       </div>
                     ))}
 
-                    {/* Informasi Penomoran Terintegrasi */}
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3">
-                      <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                        <FileDigit className="w-4 h-4 text-violet-400" /> Penomoran Terintegrasi per Jenis Dokumen
-                      </h4>
-                      <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Penomoran dokumen disatukan berpatokan pada <strong className="text-slate-200">Jenis Dokumen</strong> (seperti *Perjanjian, MOU, Addendum*). Setiap jenis dokumen memiliki Kode Singkatan dan Format Nomor tersendiri di panel Jenis Kontrak / Dokumen di atas, serta memiliki nomor urut independen yang dimulai dari <code>001</code> tiap tahunnya.
-                      </p>
-                    </div>
-
+                    {/* Kartu "Penomoran Terintegrasi per Jenis Dokumen" dipindah
+                        ke atas, dekat section "Format Nomor & Margin Halaman"
+                        — lebih masuk akal dibaca di situ (menjelaskan konsep
+                        sebelum kartu inputnya), bukan nyempil di antara
+                        daftar dropdown yang topiknya beda sama sekali. */}
                     {/* Kartu "Format Nomor Dokumen Kontrak" yang dulu berdiri sendiri
                         di sini sudah digabung ke kartu "Format Nomor Dokumen"
                         (toggle DCS/Kontrak) di atas — lihat numberFormatModule. */}
+
+                    {/* ==== Section: Pengingat Kontrak ==== */}
+                    <div className="lg:col-span-2 pt-2">
+                      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Pengingat Kontrak</p>
+                    </div>
 
                     {/* Opsi hari reminder */}
                     <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
@@ -12818,7 +15216,14 @@ export default function App() {
                   .filter((c) => (monitorScope === "all" ? true : monitorScope === "aktif" ? !isInactive(c) : isInactive(c)))
                   .filter(healthMatch)
                   .filter((c) => (monitorCategory === "Semua" ? true : c.category === monitorCategory))
-                  .filter((c) => (monitorStatus === "Semua" ? true : c.status === monitorStatus))
+                  // Filter berdasarkan unifiedStatus (status gabungan yang sama
+                  // dipakai badge kolom "Status" di tabel & di Pekerjaan Legal —
+                  // lihat CONTRACT_STATUS_LABEL_ID), BUKAN c.status mentah. Dulu
+                  // di sini pakai c.status mentah sehingga label pilihan filter
+                  // ("Disetujui Penuh"/"Sedang Ditinjau") tidak nyambung dengan
+                  // badge yang justru tampil ("Proses TTD"/"Finalisasi") untuk
+                  // baris yang sama — filter & badge kini satu sumber nilai.
+                  .filter((c) => (monitorStatus === "Semua" ? true : (c.unifiedStatus || c.status) === monitorStatus))
                   // Pencarian kini menembus ISI dokumen (pasal + teks OCR), bukan
                   // cuma judul/nomor/pihak — lihat contractSearchIndex.
                   .filter((c) => matchContract(c, monitorSearch) !== null);
@@ -12930,14 +15335,17 @@ export default function App() {
                         Scope) & perilakunya SAMA PERSIS, cuma lokasi JSX-nya
                         pindah — tidak ada logic yang berubah. */}
                     <div className="flex flex-wrap gap-3">
-                      <input
-                        type="text"
-                        placeholder="Cari judul, nomor, pihak, atau ISI pasal…"
-                        title="Pencarian juga menembus isi pasal dan teks hasil OCR dokumen unggahan."
-                        value={monitorSearch}
-                        onChange={(e) => { setMonitorSearch(e.target.value); setMonitorPage(1); }}
-                        className="px-4 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500 w-full md:w-64"
-                      />
+                      <div className="relative w-full sm:w-72">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                        <input
+                          type="text"
+                          placeholder="Cari judul, nomor, pihak, atau ISI pasal…"
+                          title="Pencarian juga menembus isi pasal dan teks hasil OCR dokumen unggahan."
+                          value={monitorSearch}
+                          onChange={(e) => { setMonitorSearch(e.target.value); setMonitorPage(1); }}
+                          className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
+                        />
+                      </div>
                       <select
                         value={monitorCategory}
                         onChange={(e) => { setMonitorCategory(e.target.value); setMonitorPage(1); }}
@@ -12954,10 +15362,16 @@ export default function App() {
                         className="px-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
                       >
                         <option value="Semua">Semua Status</option>
-                        {Array.from(new Set(contracts.map((c) => c.status)))
+                        {/* Opsi filter dibangun dari unifiedStatus (fallback ke
+                            c.status kalau unifiedStatus belum terisi) — value
+                            & labelnya (CONTRACT_STATUS_LABEL_ID) SAMA PERSIS
+                            dengan yang dipakai badge kolom "Status" di tabel &
+                            di Pekerjaan Legal, supaya memilih sebuah opsi di
+                            sini dijamin cocok dengan badge yang muncul. */}
+                        {Array.from(new Set<string>(contracts.map((c) => c.unifiedStatus || c.status)))
                           .sort()
                           .map((st) => (
-                            <option key={st} value={st}>{contractStatusLabel(st as ContractStatus)}</option>
+                            <option key={st} value={st}>{CONTRACT_STATUS_LABEL_ID[st] || contractStatusLabel(st as ContractStatus)}</option>
                           ))}
                       </select>
                       <select
@@ -13059,7 +15473,11 @@ export default function App() {
                                       {inactive ? "Tidak Aktif" : "Aktif"}
                                     </span>
                                   </td>
-                                  <td className="px-4 py-3 text-slate-300">{contractStatusLabel(c.status)}</td>
+                                  <td className="px-4 py-3">
+                                    <span className={`text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[c.unifiedStatus || c.status] || ""}`}>
+                                      {CONTRACT_STATUS_LABEL_ID[c.unifiedStatus || c.status] || c.unifiedStatus || contractStatusLabel(c.status)}
+                                    </span>
+                                  </td>
                                   <td className="px-4 py-3">
                                     {c.masterPdfUrl ? (
                                       <a
@@ -13180,12 +15598,12 @@ export default function App() {
                 {/* Document list — grouped by Departemen like a folder tree, so a
                     folder always exists first and documents simply land inside it. */}
                 <aside className="space-y-3">
-                  <div className="relative">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                  <div className="relative w-full sm:w-72">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
                     <input
                       type="text" value={dcsSearch} onChange={(e) => setDcsSearch(e.target.value)}
                       placeholder="Cari nomor / judul dokumen..."
-                      className="w-full pl-9 pr-4 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                      className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
                     />
                   </div>
 
@@ -14014,13 +16432,13 @@ export default function App() {
                   atas latar GELAP, jadi nyaris tak kebaca di atas
                   bg-{warna}-600/20 yg pucat di tema terang ini. */}
               <div className="flex flex-wrap items-center gap-2">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
+                <div className="relative w-full sm:w-72">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
                   <input
                     type="text" value={allDocsSearch} onChange={(e) => { setAllDocsSearch(e.target.value); setAllDocsPage(1); }}
                     placeholder="Cari nomor, judul, atau ISI pasal…"
                     title="Untuk kontrak, pencarian juga menembus isi pasal dan teks hasil OCR. Dokumen DCS masih dicari per judul/nomor."
-                    className="pl-8 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500 w-60"
+                    className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
                   />
                 </div>
                 <button
@@ -14117,8 +16535,15 @@ export default function App() {
                             <p className="font-mono text-xs text-slate-500 mt-1">{c.contractNumber}</p>
                           </td>
                           <td className="p-4">
-                            <span className={contractStatusBadgeClass(c.status)}>
-                              {contractStatusLabel(c.status)}
+                            {/* Pakai unifiedStatus (fallback c.status) + peta
+                                CONTRACT_STATUS_LABEL_ID/BADGE_CLASS yang sama
+                                dipakai Monitoring Kontrak & Pekerjaan Legal,
+                                supaya badge di sini tidak lagi beda label
+                                dengan badge status kontrak yang sama di
+                                halaman lain (mis. "Sedang Ditinjau" di sini
+                                vs "Finalisasi" di Monitoring Kontrak). */}
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[c.unifiedStatus || c.status] || contractStatusBadgeClass(c.status)}`}>
+                              {CONTRACT_STATUS_LABEL_ID[c.unifiedStatus || c.status] || contractStatusLabel(c.status)}
                             </span>
                             {pendingStep && (
                               <p className="text-[10px] text-slate-500 mt-1">Menunggu: {pendingStep.approverName}</p>
@@ -14485,8 +16910,13 @@ export default function App() {
                         >
                           <div className="flex items-start justify-between gap-2">
                             <p className="font-bold text-slate-200 text-sm leading-snug">{c.title}</p>
-                            <span className="text-[9px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full font-bold uppercase shrink-0">
-                              {contractStatusLabel(c.status)}
+                            {/* unifiedStatus (fallback c.status) + peta label/warna
+                                yang sama dipakai Monitoring Kontrak & Pekerjaan
+                                Legal — dulu di sini selalu abu-abu & pakai label
+                                status mentah, jadi tidak nyambung dengan badge
+                                kontrak yang sama di halaman lain. */}
+                            <span className={`text-[9px] px-2 py-0.5 rounded-full font-bold uppercase shrink-0 border ${CONTRACT_STATUS_BADGE_CLASS[c.unifiedStatus || c.status] || "bg-slate-800 text-slate-400"}`}>
+                              {CONTRACT_STATUS_LABEL_ID[c.unifiedStatus || c.status] || contractStatusLabel(c.status)}
                             </span>
                           </div>
                           <p className="font-mono text-[10px] text-slate-500">{c.contractNumber}</p>
@@ -14582,36 +17012,51 @@ export default function App() {
                     <span className="font-mono text-sm font-bold bg-indigo-950 text-indigo-400 px-2.5 py-0.5 rounded border border-indigo-900">
                       {selectedContract.contractNumber}
                     </span>
+                    {/* Dipakai unifiedContractStatusOf (bukan selectedContract.status
+                        mentah) supaya badge ini SELALU identik dengan badge status
+                        yang sama di tabel Monitoring Kontrak & Pekerjaan Legal —
+                        sebelumnya di sini baca status mentah ("FullyApproved" ->
+                        "Disetujui Penuh") sedangkan tabel baca unifiedStatus
+                        ("FullyApproved" -> "Proses TTD"), jadi user melihat 2
+                        label berbeda untuk kontrak yang sama. */}
                     <span
-                      className={`text-xs px-2.5 py-0.5 rounded-full font-bold uppercase ${
-                        selectedContract.status === "Aktif"
-                          ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/20"
-                          : selectedContract.status === "TidakAktif"
-                            ? "bg-orange-500/15 text-orange-400 border border-orange-500/20"
-                            : selectedContract.status === "Archived"
-                              ? "bg-purple-500/15 text-purple-400 border border-purple-500/20"
-                              : selectedContract.status === "Terminated"
-                                ? "bg-rose-500/15 text-rose-400 border border-rose-500/20"
-                                : selectedContract.status === "OnReview"
-                                  ? "bg-indigo-500/15 text-indigo-400 border border-indigo-500/20"
-                                  : selectedContract.status === "FullyApproved"
-                                    ? "bg-teal-500/15 text-teal-400 border border-teal-500/20"
-                                    : "bg-amber-500/15 text-amber-400 border border-amber-500/20"
+                      className={`text-xs px-2.5 py-0.5 rounded-full font-bold uppercase border ${
+                        CONTRACT_STATUS_BADGE_CLASS[unifiedContractStatusOf(selectedContract)] ||
+                        "bg-amber-500/15 text-amber-400 border-amber-500/20"
                       }`}
                     >
-                      {contractStatusLabel(selectedContract.status)}
+                      {CONTRACT_STATUS_LABEL_ID[unifiedContractStatusOf(selectedContract)] ||
+                        contractStatusLabel(selectedContract.status)}
                     </span>
                   </div>
                   <h2 className="text-xl font-bold text-slate-100">
                     {selectedContract.title}
                   </h2>
                   <p className="text-xs text-slate-400">
-                    {selectedContract.parties &&
-                    selectedContract.parties.length > 0
-                      ? selectedContract.parties
-                          .map((p) => `${p.role}: ${p.name}`)
-                          .join(" | ")
-                      : `Pihak 1: ${appSettings.companyName || "[Nama perusahaan belum diisi]"} | Pihak 2: ${selectedContract.party2Name} (${selectedContract.party2Type})`}
+                    {(() => {
+                      // BUG: selectedContract.parties itu snapshot yang direkam
+                      // sekali (biasanya saat kontrak dibuat) dan TIDAK PERNAH
+                      // ikut ter-update lagi walau "Edit Data Pihak & Kontrak"
+                      // mengubah appSettings.companyName/party2Name setelahnya
+                      // — makanya baris ini bisa nyangkut nilai lama/placeholder
+                      // padahal isi pasal di preview sudah benar (preview baca
+                      // data live, bukan dari parties). Fix: index 0 & 1 (Pihak
+                      // Pertama & Kedua) SELALU dipaksa ikut data live; index 2+
+                      // (pihak tambahan spt Saksi/Penjamin lewat "Tambah Kolom
+                      // TTD") tetap pakai nama yang tersimpan di situ apa
+                      // adanya, karena pihak itu tidak punya field "legacy" utk
+                      // difallback-kan. Sama persis dipakai lagi di blok TTD
+                      // preview (lihat komentar serupa di dekat signatureRow).
+                      const liveName = (idx: number, fallback: string) =>
+                        idx === 0 ? (appSettings.companyName || fallback)
+                        : idx === 1 ? (selectedContract.party2Name || fallback)
+                        : fallback;
+                      return selectedContract.parties && selectedContract.parties.length > 0
+                        ? selectedContract.parties
+                            .map((p, idx) => `${p.role}: ${liveName(idx, p.name)}`)
+                            .join(" | ")
+                        : `Pihak 1: ${appSettings.companyName || "[Nama perusahaan belum diisi]"} | Pihak 2: ${selectedContract.party2Name} (${selectedContract.party2Type})`;
+                    })()}
                   </p>
                 </div>
 
@@ -14806,8 +17251,10 @@ export default function App() {
 
               {/* Workspace Split Panels */}
               <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-                {/* Left Side: Real-time Live Document Preview (8 cols on large screens) */}
-                <div className="xl:col-span-7 bg-slate-950 rounded-2xl border border-slate-800 p-6 space-y-6 shadow-2xl flex flex-col justify-between">
+                {/* Left: preview dokumen digital SAJA. Editor Pasal Kontrak
+                    Ini dipindah jadi kolom kanan (di bawah) atas permintaan
+                    user, supaya preview & editor sebelahan. */}
+                <div className="xl:col-span-12 bg-slate-950 rounded-2xl border border-slate-800 p-6 space-y-6 shadow-2xl flex flex-col justify-between">
                   <div>
                     {/* Setelah aktivasi via "Unggah Bukti TTD & Aktifkan", dokumen
                         yang MENGIKAT SECARA HUKUM adalah berkas yang diunggah itu
@@ -14875,11 +17322,20 @@ export default function App() {
                         )}
                       </h3>
                       <div className="flex items-center gap-3">
-                        {/* "Buka Berkas" butuh berkas SUNGGUHAN — cek dua sumber
-                            (master upload ATAU hasil export/share), bukan cuma
-                            masterPdfUrl seperti sebelumnya. /api/contracts/:id/
-                            view-pdf di server sudah fallback ke exportedPdfUrl
-                            duluan (lihat komentar dekat handleExportSharePdf). */}
+                        {!isExportingPdf && isContractEditable(selectedContract) && (
+                          <button
+                            type="button"
+                            onClick={() => setDocEditMode((v) => !v)}
+                            title="Mode Edit: ubah naskah/pasal/lampiran langsung di preview, token tampil mentah ({{Token}}). Mode Preview: tampilan hasil akhir (token sudah terisi)."
+                            className={`px-2.5 py-1 text-[11px] font-bold rounded-lg border transition flex items-center gap-1.5 cursor-pointer ${
+                              docEditMode
+                                ? "bg-indigo-600 border-indigo-500 text-white"
+                                : "bg-slate-900 border-slate-800 text-slate-300 hover:border-indigo-500/50"
+                            }`}
+                          >
+                            <Edit3 className="w-3.5 h-3.5" /> {docEditMode ? "Mode Edit (aktif)" : "Mode Edit"}
+                          </button>
+                        )}
                         {(selectedContract.masterPdfUrl || selectedContract.exportedPdfUrl) && (
                           isContractDownloadable(selectedContract) ? (
                             <a
@@ -14923,6 +17379,19 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* Toolbar dibuat "melayang" (sticky) — feedback user: saat
+                        scroll dokumen ke bawah utk edit bagian tertentu,
+                        toolbar ikut ke-scroll ke luar layar dan harus scroll
+                        ke atas lagi tiap mau pakai tombol format. top-[69px]
+                        = pas di bawah header aplikasi (yang juga sticky di
+                        atasnya, lihat <header className="... sticky top-0
+                        z-40">), z-30 (di bawah header) supaya toolbar tetap
+                        kelihatan tapi tidak menimpa header. */}
+                    {docEditMode && (
+                      <div className="sticky top-[69px] z-30">
+                        <DocToolbar />
+                      </div>
+                    )}
                     {/* Standard Indonesian Style Document Formatting */}
                     <div
                       ref={previewRef}
@@ -15130,8 +17599,73 @@ export default function App() {
                           benar apa pun yang diisi) — muncul otomatis sbg baris tambahan
                           hanya kalau field-nya terisi ("ditambahkan sesuai kebutuhan"). */}
                       {(() => {
+                        // Mode Upload: isi file (TERMASUK narasi pembuka aslinya)
+                        // sudah nyatu utuh di pasal pertama (lihat
+                        // extractedTextToSingleClause di server.ts) — jadi blok
+                        // "Narasi Pembuka" bawaan sistem di bawah ini (yang kalau
+                        // kosong jatuh ke DEFAULT_PREAMBLE_TEMPLATE ber-{{Token}})
+                        // DISEMBUNYIKAN di sini, supaya tidak dobel & tidak
+                        // nongolin placeholder token yang tidak relevan buat
+                        // dokumen upload. Kalau user SENGAJA isi
+                        // customOpeningParagraph manual (override eksplisit),
+                        // tetap ditampilkan seperti biasa — itu pilihan sadar dia.
+                        if (selectedContract.creationMode === "upload" && !selectedContract.customOpeningParagraph?.trim()) {
+                          return null;
+                        }
                         const { template: preambleTemplate, tokens: preambleTokens } = getPreambleTemplateAndTokens();
                         const docLang = selectedContract.documentLanguage || "id";
+                        // Mode Edit: contentEditable langsung di preview, token
+                        // TIDAK disubstitusi (tampil mentah {{Token}}) — dikontrol
+                        // DocToolbar di atas. Ganti idEditor/enEditor lama yang
+                        // dulu ada di panel kanan terpisah (lihat komentar
+                        // "Kembalikan ke bawaan" — perilaku override/revert SAMA,
+                        // cuma pindah tempat jadi inline).
+                        if (docEditMode) {
+                          const idOverride = selectedContract.customOpeningParagraph || "";
+                          const idHasOverride = !!idOverride.trim();
+                          const idRaw = idHasOverride ? idOverride : preambleTemplate;
+                          const idBlock = (
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between">
+                                <p className="text-[10px] font-bold text-amber-400 uppercase">Narasi Pembuka (ID)</p>
+                                {idHasOverride && (
+                                  <button type="button" onClick={() => setSelectedContract({ ...selectedContract, customOpeningParagraph: undefined })}
+                                    className="text-[10px] text-rose-400 hover:underline cursor-pointer">Kembalikan ke bawaan</button>
+                                )}
+                              </div>
+                              <InlineRich
+                                html={looksLikeHtml(idRaw) ? idRaw : mdToHtmlForEditor(idRaw)}
+                                onSave={(html) => setSelectedContract({ ...selectedContract, customOpeningParagraph: html })}
+                              />
+                            </div>
+                          );
+                          const enHasCustomEdit = !!selectedContract.preambleEnOriginal && selectedContract.preambleEn !== selectedContract.preambleEnOriginal;
+                          const enBlock = selectedContract.preambleEn ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center justify-between">
+                                <p className="text-[10px] font-bold text-sky-400 uppercase">Opening Narrative (EN)</p>
+                                {enHasCustomEdit && (
+                                  <button type="button" onClick={() => setSelectedContract({ ...selectedContract, preambleEn: selectedContract.preambleEnOriginal })}
+                                    className="text-[10px] text-rose-400 hover:underline cursor-pointer">Kembalikan ke bawaan</button>
+                                )}
+                              </div>
+                              <InlineRich
+                                html={looksLikeHtml(selectedContract.preambleEn) ? selectedContract.preambleEn : mdToHtmlForEditor(selectedContract.preambleEn)}
+                                onSave={(html) => setSelectedContract({ ...selectedContract, preambleEn: html })}
+                              />
+                            </div>
+                          ) : (
+                            <p className="text-[10px] text-slate-500 italic">Belum diterjemahkan — klik toggle EN/ID+EN di header dulu.</p>
+                          );
+                          if (docLang === "id") return idBlock;
+                          if (docLang === "en") return enBlock;
+                          return (
+                            <div className="flex gap-3">
+                              <div className="flex-1 min-w-0">{idBlock}</div>
+                              <div className="flex-1 min-w-0">{enBlock}</div>
+                            </div>
+                          );
+                        }
                         // preambleEn diisi server saat /translate (lihat composeContractPreambleText
                         // + endpoint /api/contracts/:id/translate) — sebelumnya field ini tidak
                         // pernah dibaca di sini, jadi narasi pembuka & identifikasi pihak selalu
@@ -15260,28 +17794,70 @@ export default function App() {
                           </div>
                         );
                       })() : (() => {
-                        // Kalimat baku (bukan hasil AI — memang tidak berubah antar
-                        // dokumen) yang menjembatani narasi pembuka ke daftar pasal.
-                        // Sebelumnya hardcoded Indonesia terus dan tidak pernah ikut
-                        // dikirim ke /translate, jadi "isi surat" ini tidak berubah
-                        // walau mode dokumen sudah "en"/"bilingual".
+                        // Kalimat baku ini dulu hardcoded PENUH, sama persis di
+                        // semua kontrak, tidak ada cara mengeditnya sama sekali
+                        // — sekarang bisa dioverride per kontrak lewat field
+                        // closingStatement/closingStatementEn (lihat editor
+                        // "Kalimat Penutup Pembuka" di bawah preview). Kosong
+                        // = tetap pakai kalimat baku ini seperti sebelumnya,
+                        // jadi kontrak lama yang belum pernah menyentuhnya
+                        // tampil identik seperti dulu.
+                        //
+                        // Mode Upload: sama seperti blok "Narasi Pembuka" di atas,
+                        // isi file (termasuk kalimat penutup pembuka aslinya, jika
+                        // ada) sudah menyatu di pasal pertama hasil ekstraksi — jadi
+                        // kalimat baku bawaan sistem ini DISEMBUNYIKAN di sini
+                        // supaya tidak dobel dengan isi file & tidak menampilkan
+                        // redaksi template yang tidak relevan buat dokumen upload.
+                        // Kalau user SENGAJA isi closingStatement manual (override
+                        // eksplisit), tetap ditampilkan — itu pilihan sadar dia.
+                        if (selectedContract.creationMode === "upload" && !selectedContract.closingStatement?.trim()) {
+                          return null;
+                        }
                         const docLang = selectedContract.documentLanguage || "id";
-                        const closingId = "Masing-masing pihak sepakat untuk mengikatkan diri dalam Perjanjian Kerjasama dengan ketentuan dan pasal-pasal sebagai berikut:";
-                        const closingEn = "Each Party agrees to bind itself to this Cooperation Agreement under the terms and articles set out below:";
-                        if (docLang === "en") return <p>{closingEn}</p>;
+                        const closingIdDefault = "Masing-masing pihak sepakat untuk mengikatkan diri dalam Perjanjian Kerjasama dengan ketentuan dan pasal-pasal sebagai berikut:";
+                        const closingEnDefault = "Each Party agrees to bind itself to this Cooperation Agreement under the terms and articles set out below:";
+                        const closingIdValue = selectedContract.closingStatement || closingIdDefault;
+                        const closingEnValue = selectedContract.closingStatementEn || closingEnDefault;
+                        if (docEditMode) {
+                          const idBlock = (
+                            <InlineRich
+                              html={looksLikeHtml(closingIdValue) ? closingIdValue : mdToHtmlForEditor(closingIdValue)}
+                              onSave={(html) => setSelectedContract({ ...selectedContract, closingStatement: html })}
+                              className="focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1 text-[10px] font-bold text-slate-500 uppercase"
+                            />
+                          );
+                          const enBlock = (
+                            <InlineRich
+                              html={looksLikeHtml(closingEnValue) ? closingEnValue : mdToHtmlForEditor(closingEnValue)}
+                              onSave={(html) => setSelectedContract({ ...selectedContract, closingStatementEn: html })}
+                            />
+                          );
+                          if (docLang === "en") return enBlock;
+                          if (docLang === "bilingual") {
+                            return (
+                              <div className="flex gap-3">
+                                <div className="flex-1 min-w-0">{idBlock}</div>
+                                <div className="flex-1 min-w-0">{enBlock}</div>
+                              </div>
+                            );
+                          }
+                          return idBlock;
+                        }
+                        if (docLang === "en") return <div>{renderPreambleBlock(closingEnValue, {})}</div>;
                         if (docLang === "bilingual") {
                           return (
                             <div className="flex gap-3">
                               <div className="flex-1 min-w-0">
-                                <p>{closingId}</p>
+                                {renderPreambleBlock(closingIdValue, {})}
                               </div>
                               <div className="flex-1 min-w-0">
-                                <p>{closingEn}</p>
+                                {renderPreambleBlock(closingEnValue, {})}
                               </div>
                             </div>
                           );
                         }
-                        return <p>{closingId}</p>;
+                        return <div>{renderPreambleBlock(closingIdValue, {})}</div>;
                       })()}
 
                       {/* Template sumber sudah direvisi setelah dokumen ini dibuat.
@@ -15308,13 +17884,20 @@ export default function App() {
                           menutup celah itu. Tidak ikut tercetak ke PDF. */}
                       {!isExportingPdf
                         && selectedContract.clauses.length === 0
-                        && !selectedContract.masterPdfUrl && (
+                        && (selectedContract.creationMode === "upload" || !selectedContract.masterPdfUrl) && (
                         <div className="my-4 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-start gap-2.5 font-sans">
                           <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                           <div className="text-[11px] text-amber-200/90 leading-relaxed">
                             <span className="font-bold text-amber-300">Dokumen ini belum punya pasal apa pun.</span>{" "}
-                            Badan perjanjian masih kosong — bila diekspor atau diajukan sekarang, yang
-                            tercetak hanya pembuka dan kolom tanda tangan.
+                            {selectedContract.creationMode === "upload" ? (
+                              <>
+                                Kemungkinan ekstraksi teks otomatis dari berkas yang diunggah gagal atau tidak menemukan teks yang bisa dibaca
+                                (misalnya berkas hasil scan/foto/screenshot, bukan PDF dengan teks asli) — berkas aslinya tetap tersimpan dan
+                                bisa dibuka lewat tombol "Buka Berkas" di atas.{" "}
+                              </>
+                            ) : (
+                              "Badan perjanjian masih kosong — bila diekspor atau diajukan sekarang, yang tercetak hanya pembuka dan kolom tanda tangan. "
+                            )}
                             {isContractEditable(selectedContract)
                               ? " Tambahkan pasal lewat \"Editor Pasal Kontrak Ini\" di bawah preview."
                               : ` Status ${contractStatusLabel(selectedContract.status)} mengunci isi pasal — gunakan "Perpanjang / Extend" atau "Buat Addendum" untuk memperbaikinya.`}
@@ -15354,18 +17937,35 @@ export default function App() {
                       )}
 
                       {(() => {
+                        // Bug staleness yang sama dengan baris ringkasan pihak
+                        // di header workspace (lihat komentar di sana) — index
+                        // 0 & 1 dipaksa ikut appSettings.companyName/party2Name
+                        // yang live, pihak ke-3+ (kalau ditambah lewat "Tambah
+                        // Kolom TTD") tetap pakai nama tersimpannya sendiri.
+                        const liveParty1Name = appSettings.companyName || selectedContract.party1Name;
                         const parties = selectedContract.parties?.length
-                          ? selectedContract.parties
+                          ? selectedContract.parties.map((p, idx) => idx === 0
+                              ? { ...p, name: liveParty1Name }
+                              : idx === 1
+                                ? { ...p, name: selectedContract.party2Name || p.name }
+                                : p)
                           : [
-                              { role: "PIHAK PERTAMA", name: selectedContract.party1Name },
+                              { role: "PIHAK PERTAMA", name: liveParty1Name },
                               { role: "PIHAK KEDUA", name: selectedContract.party2Name },
                             ];
 
                         // Persis logic render pasal yang lama (tidak diubah sama
                         // sekali) — cuma dibungkus fungsi supaya bisa dipanggil
                         // ulang per-rangkap saat export+meterai nyala di bawah.
-                        const renderClauseList = () => (
+                        const renderClauseList = (sliceStart = 0, sliceEnd = selectedContract.clauses.length) => (
                         selectedContract.clauses.map((clause, index) => {
+                          // Dipakai fitur "Rangkap Fisik" (lihat rangkapCutIndex
+                          // di generateContractPdf): saat mencetak halaman TTD
+                          // per-rangkap TAMBAHAN, cuma pasal yg SATU HALAMAN
+                          // dgn TTD itu yg diulang, BUKAN semua pasal dari
+                          // awal. Nomor "Pasal N" tetap pakai `index` ASLI
+                          // (bukan diurut ulang) walau sebagian di-skip di sini.
+                          if (index < sliceStart || index >= sliceEnd) return null;
                           const cmtsForClause = clauseComments.filter((c) => c.clauseId === (clause.id || String(index)));
                           const unresolvedCount = cmtsForClause.filter((c) => !c.resolved).length;
                           // ---- Mode bahasa dokumen ----
@@ -15384,8 +17984,72 @@ export default function App() {
                             && String(enBody || "").length <= LONG_CLAUSE_CHARS;
                           const numLabelId = selectedContractAddendumInfo ? null : `Pasal ${index + 1}`;
                           const numLabelEn = selectedContractAddendumInfo ? null : `Article ${index + 1}`;
+                          const updateClauseInline = (patch: any) => {
+                            const updated = selectedContract.clauses.map((x, xi) => (xi === index ? { ...x, ...patch } : x));
+                            setSelectedContract({ ...selectedContract, clauses: updated });
+                          };
+                          if (docEditMode && isContractEditable(selectedContract)) {
+                            const idBlock = (
+                              <div className="space-y-1">
+                                <input
+                                  type="text"
+                                  value={clause.title}
+                                  onChange={(e) => updateClauseInline({ title: e.target.value })}
+                                  placeholder="Judul pasal"
+                                  className="w-full bg-transparent font-bold text-slate-100 focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1"
+                                />
+                                <InlineRich
+                                  html={looksLikeHtml(clause.content) ? clause.content : mdToHtmlForEditor(clause.content)}
+                                  onSave={(html) => updateClauseInline({ content: html })}
+                                  className="text-slate-300 leading-relaxed focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1"
+                                />
+                              </div>
+                            );
+                            const enBlock = (
+                              <div className="space-y-1">
+                                <input
+                                  type="text"
+                                  value={clause.titleEn || ""}
+                                  onChange={(e) => updateClauseInline({ titleEn: e.target.value })}
+                                  placeholder="Article title"
+                                  className="w-full bg-transparent font-bold text-slate-100 focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1"
+                                />
+                                <InlineRich
+                                  html={looksLikeHtml(clause.contentEn || "") ? (clause.contentEn || "") : mdToHtmlForEditor(clause.contentEn || "")}
+                                  onSave={(html) => updateClauseInline({ contentEn: html })}
+                                  className="text-slate-300 leading-relaxed focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1"
+                                  placeholder="Belum diterjemahkan — klik toggle EN/ID+EN di header dulu."
+                                />
+                              </div>
+                            );
+                            return (
+                              <div key={clause.id || index} className="space-y-1 group/clause border border-transparent hover:border-slate-800 rounded-lg p-1.5 -m-1.5">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="flex-1 min-w-0">
+                                    {docLang === "bilingual" ? (
+                                      <div className="flex gap-3">
+                                        <div className="flex-1 min-w-0">{idBlock}</div>
+                                        <div className="flex-1 min-w-0">{enBlock}</div>
+                                      </div>
+                                    ) : docLang === "en" ? enBlock : idBlock}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      const updated = selectedContract.clauses.filter((_, xi) => xi !== index).map((x, xi) => ({ ...x, order: xi + 1 }));
+                                      setSelectedContract({ ...selectedContract, clauses: updated });
+                                    }}
+                                    title="Hapus pasal ini"
+                                    className="text-rose-400 hover:bg-rose-500/10 p-1 rounded shrink-0 cursor-pointer opacity-0 group-hover/clause:opacity-100"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          }
                           return (
-                          <div key={clause.id || index} className="space-y-1 group/clause">
+                          <div key={clause.id || index} data-clause-index={index} className="space-y-1 group/clause">
                             <div className="flex items-center justify-between min-h-[1.375rem]">
                               <div className="flex-1">
                                 {docLang === "bilingual" && hasEn
@@ -15502,9 +18166,42 @@ export default function App() {
                         })
                         );
 
-                        const clauseListBlock = () => (
+                        const clauseListBlock = (sliceStart?: number, sliceEnd?: number) => (
                           <div className={`${isExportingPdf ? "space-y-3 py-2" : "space-y-4 py-4"} text-xs`}>
-                            {renderClauseList()}
+                            {renderClauseList(sliceStart, sliceEnd)}
+                            {docEditMode && isContractEditable(selectedContract) && (sliceStart === undefined) && (
+                              <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-slate-800 font-sans">
+                                <select
+                                  onChange={(e) => {
+                                    const lib = clauses.find((c) => c.id === e.target.value);
+                                    if (!lib) return;
+                                    setSelectedContract({
+                                      ...selectedContract,
+                                      clauses: [...selectedContract.clauses, { id: "draft-cls-" + Date.now(), title: lib.title, content: lib.content, order: selectedContract.clauses.length + 1 }],
+                                    });
+                                    e.target.selectedIndex = 0;
+                                  }}
+                                  className="flex-1 min-w-[200px] px-2 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-300 focus:outline-none cursor-pointer"
+                                >
+                                  <option value="">+ Tambah Pasal dari Library Klausul...</option>
+                                  {clauses.map((c) => (
+                                    <option key={c.id} value={c.id}>{c.title} ({c.category})</option>
+                                  ))}
+                                </select>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setSelectedContract({
+                                      ...selectedContract,
+                                      clauses: [...selectedContract.clauses, { id: "draft-cls-" + Date.now(), title: "Pasal Baru", content: "", order: selectedContract.clauses.length + 1 }],
+                                    })
+                                  }
+                                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1"
+                                >
+                                  <Plus className="w-3.5 h-3.5" /> Pasal Kosong
+                                </button>
+                              </div>
+                            )}
                           </div>
                         );
 
@@ -15538,6 +18235,113 @@ export default function App() {
                         </div>
                       )
                         );
+
+
+                        const attachmentSectionsBlock = () => (
+                      /* Halaman Lampiran BEBAS (freeform) — tiap "page" cuma
+                          judul + bodyHtml bebas, isi apa saja (teks/gambar/
+                          tabel) disisipkan lewat DocToolbar (tombol gambar/
+                          tabel) di atas preview, BUKAN field kaku 1-foto-1-
+                          tabel seperti sebelumnya. Dicetak SETELAH blok tanda
+                          tangan/meterai, tiap halaman dipaksa mulai halaman
+                          PDF baru sendiri (data-pdf-force-break). Field lama
+                          (photoDataUrl/tableColumns dst.) TETAP dirender kalau
+                          bodyHtml kosong — supaya lampiran lama (dibuat sebelum
+                          redesign ini) tidak hilang, cuma sudah tidak ada UI
+                          edit khusus utknya lagi (edit via bodyHtml ke depannya). */
+                      ((selectedContract.attachmentSections && selectedContract.attachmentSections.length > 0) || (docEditMode && isContractEditable(selectedContract))) && (
+                        <div className="space-y-4">
+                          {(selectedContract.attachmentSections || []).map((section) => {
+                            const editing = docEditMode && isContractEditable(selectedContract);
+                            const hasLegacyFields = !!(section.photoDataUrl || (section.tableColumns && section.tableColumns.length > 0));
+                            return (
+                              <div key={section.id} data-pdf-force-break={editing ? undefined : "1"} className={`pt-4 space-y-3 font-sans text-xs ${editing ? "border border-dashed border-slate-800 rounded-xl p-3" : ""}`}>
+                                <div className="text-center relative">
+                                  {editing ? (
+                                    <>
+                                      <input
+                                        type="text"
+                                        value={section.title}
+                                        onChange={(e) => handlePatchAttachmentSection(section.id, { title: e.target.value })}
+                                        placeholder="Judul halaman, mis. LAMPIRAN A"
+                                        className="w-full text-center bg-transparent font-bold text-slate-100 text-sm tracking-wide uppercase focus:outline-none focus:bg-indigo-500/5 rounded"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRemoveAttachmentSection(section.id)}
+                                        title="Hapus halaman ini"
+                                        className="absolute right-0 top-0 text-rose-400 hover:bg-rose-500/10 p-1 rounded cursor-pointer"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </>
+                                  ) : (
+                                    section.title && <h4 className="font-bold text-slate-100 text-sm tracking-wide uppercase">{section.title}</h4>
+                                  )}
+                                </div>
+                                {editing ? (
+                                  <InlineRich
+                                    html={section.bodyHtml || ""}
+                                    onSave={(html) => handlePatchAttachmentSection(section.id, { bodyHtml: html })}
+                                    placeholder="Tulis, tempel, atau sisipkan gambar/tabel lewat toolbar di atas…"
+                                    className="min-h-[80px] text-slate-300 leading-relaxed focus:outline-none focus:bg-indigo-500/5 rounded px-1 -mx-1 [&_table]:text-slate-800 [&_img]:rounded [&_img]:border [&_img]:border-slate-700"
+                                  />
+                                ) : (
+                                  section.bodyHtml && (
+                                    <div
+                                      className="text-slate-300 leading-relaxed [&_table]:text-slate-800 [&_img]:rounded [&_img]:border [&_img]:border-slate-700"
+                                      dangerouslySetInnerHTML={{ __html: sanitizeRich(section.bodyHtml) }}
+                                    />
+                                  )
+                                )}
+                                {/* Fallback lampiran lama (pre-redesign) — hanya tampil kalau
+                                    bodyHtml belum diisi sama sekali. */}
+                                {!section.bodyHtml && hasLegacyFields && (
+                                  <div className="space-y-2">
+                                    {section.subtitle && <p className="text-center text-slate-300">{section.subtitle}</p>}
+                                    {section.photoDataUrl && (
+                                      <div className="flex justify-center">
+                                        <img src={section.photoDataUrl} alt={section.photoCaption || section.title} className="max-w-full max-h-[360px] object-contain border border-slate-700 rounded" />
+                                      </div>
+                                    )}
+                                    {section.tableColumns && section.tableColumns.length > 0 && (
+                                      <table className="w-full border-collapse text-[11px] border border-slate-600">
+                                        <thead>
+                                          <tr>
+                                            {section.tableColumns.map((col, ci) => (
+                                              <th key={ci} className="border border-slate-600 bg-emerald-300 text-slate-50 font-bold py-1.5 px-2 text-center">{col}</th>
+                                            ))}
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {(section.tableRows || []).map((row, ri) => (
+                                            <tr key={ri}>
+                                              {(section.tableColumns || []).map((_c, ci) => (
+                                                <td key={ci} className="border border-slate-600 py-1 px-2 text-slate-200 text-center">{row[ci] || ""}</td>
+                                              ))}
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                          {docEditMode && isContractEditable(selectedContract) && (
+                            <button
+                              type="button"
+                              onClick={handleAddAttachmentSection}
+                              className="w-full py-2 bg-emerald-600/10 hover:bg-emerald-600/20 text-emerald-400 text-xs font-bold rounded-xl border border-dashed border-emerald-500/30 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                            >
+                              <Plus className="w-4 h-4" /> Tambah Halaman Baru
+                            </button>
+                          )}
+                        </div>
+                      )
+                        );
+
 
                         const closingParagraphBlock = () => (
                       /* Closing paragraph — hanya untuk Addendum (kontrak biasa
@@ -15574,7 +18378,7 @@ export default function App() {
                         // pihak yang kolomnya dapat kotak meterai. -1 = tidak ada
                         // yang dapat (meterai mati).
                         const signatureRow = (meteraiPartyIdx: number) => (
-                          <div className={`grid grid-cols-1 md:grid-cols-${parties.length || 2} gap-6 pt-6 text-xs`}>
+                          <div data-signature-anchor="1" className={`grid grid-cols-1 md:grid-cols-${parties.length || 2} gap-6 pt-6 text-xs`}>
                             {parties.map((party: any, idx: number) => (
                               <div key={idx} className="text-center">
                                 <p className="font-semibold text-slate-400 uppercase">
@@ -15595,28 +18399,45 @@ export default function App() {
                           </div>
                         );
 
-                        // Duplikasi pasal + lampiran + penutup + blok TTD SEBARIS
-                        // per RANGKAP, masing² dipaksa mulai halaman PDF baru
-                        // (data-pdf-force-break, lihat forceBreakPointsPx di
-                        // generateContractPdf) — HANYA saat proses export PDF
-                        // sungguhan DAN placeholder Meterai dinyalakan. TTD TETAP
-                        // sebaris semua pihak di tiap rangkap (bukan satu pihak
-                        // per halaman) — yang gantian per rangkap cuma POSISI
-                        // kotak meterainya, sesuai konsep "Rangkap 1: meterai di
-                        // Pihak Pertama, Rangkap 2: meterai di Pihak Kedua" yang
-                        // sudah ada di fitur Rangkap Fisik. Di layar (mode edit
-                        // biasa, isExportingPdf false) TETAP satu salinan seperti
-                        // semula — supaya anotasi/komentar per pasal (Sorot &
-                        // Komentari dkk) tidak dobel.
+                        // Duplikasi per RANGKAP — dulu SELURUH pasal diulang dari
+                        // awal tiap rangkap (salah, bikin rangkap 2 dst nyetak
+                        // ulang Pasal 1 dst yg sebetulnya sudah tercetak sekali
+                        // di halaman sebelumnya). SEKARANG: cuma pasal yg SATU
+                        // HALAMAN dgn blok TTD (mulai dari rangkapCutIndex, hasil
+                        // pengukuran DOM di generateContractPdf — lihat komentar
+                        // di sana) yang diulang per rangkap; pasal SEBELUM itu
+                        // dicetak SEKALI SAJA sbg bagian umum (clauseListBlock(0,
+                        // rangkapCutIndex)) sebelum loop rangkap dimulai. Tiap
+                        // rangkap TAMBAHAN (idx>0) dipaksa mulai halaman PDF baru
+                        // (data-pdf-force-break); rangkap PERTAMA menyambung
+                        // alami tanpa paksaan (posisinya memang sudah pas di
+                        // halaman yg sama dgn bagian umum di atas).
                         if (isExportingPdf && selectedContract.showMeteraiPlaceholder) {
+                          // rangkapCutIndex null = belum diukur (measurement pass
+                          // generateContractPdf) → fallback SATU salinan alami dulu
+                          // (persis seperti tanpa-rangkap), supaya ada layout NYATA
+                          // buat diukur posisi TTD-nya sebelum duplikasi diputuskan.
+                          if (rangkapCutIndex === null) {
+                            return (
+                              <>
+                                {clauseListBlock()}
+                                {lampiranBlock()}
+                                {closingParagraphBlock()}
+                                {signatureRow(0)}
+                                {attachmentSectionsBlock()}
+                              </>
+                            );
+                          }
                           return (
                             <>
+                              {clauseListBlock(0, rangkapCutIndex)}
                               {parties.map((_party: any, rangkapIdx: number) => (
                                 <div key={rangkapIdx} data-pdf-force-break={rangkapIdx > 0 ? "1" : undefined}>
-                                  {clauseListBlock()}
+                                  {clauseListBlock(rangkapCutIndex, selectedContract.clauses.length)}
                                   {lampiranBlock()}
                                   {closingParagraphBlock()}
                                   {signatureRow(rangkapIdx)}
+                                  {attachmentSectionsBlock()}
                                 </div>
                               ))}
                             </>
@@ -15626,12 +18447,16 @@ export default function App() {
                         // Tampilan normal (di layar, ATAU export tanpa meterai): satu
                         // salinan pasal + lampiran + penutup, lalu blok TTD sebaris
                         // tanpa meterai di kolom manapun — persis seperti semula.
+                        // attachmentSectionsBlock() (halaman Lampiran foto+tabel)
+                        // dicetak PALING TERAKHIR, setelah blok TTD/meterai, sesuai
+                        // urutan dokumen fisik: isi -> penutup -> TTD -> lampiran.
                         return (
                           <>
                             {clauseListBlock()}
                             {lampiranBlock()}
                             {closingParagraphBlock()}
                             {signatureRow(-1)}
+                            {attachmentSectionsBlock()}
                           </>
                         );
                       })()}
@@ -15647,284 +18472,16 @@ export default function App() {
                       )}
                     </div>
                   </div>
-
-                  {/* Editor pasal per-baris: judul + isi bisa diedit, baris bisa
-                      dihapus/ditambah — hanya selagi Draft. Persist lewat tombol
-                      "Simpan Draft Baru" (otomatis snapshot versi). */}
-                  {isContractEditable(selectedContract) ? (
-                    <div className="pt-4 border-t border-slate-850 text-xs">
-                      <p className="font-bold text-slate-400 mb-2">
-                        Editor Pasal Kontrak Ini (edit / hapus / tambah baris — simpan via "Simpan Draft Baru"):
-                      </p>
-                      <div className="space-y-3">
-                        {/* Narasi Pembuka — override HANYA utk kontrak ini
-                            (prioritas tertinggi di atas Template.openingParagraph
-                            & narasi kategori). Data pihak/tanggal/judul TIDAK
-                            diedit di sini — itu lewat "Edit Data Pihak & Kontrak"
-                            di header, supaya grammar kalimat pembuka tetap benar
-                            apa pun yang diisi. Konten yang diedit IKUT bahasa
-                            dokumen aktif (toggle ID/EN/ID+EN di header preview)
-                            — bilingual menampilkan ID & EN berdampingan sekaligus,
-                            sama seperti gaya tampilan preview di atasnya. */}
-                        {(() => {
-                          const docLang = selectedContract.documentLanguage || "id";
-
-                          const idEditor = (
-                            <div className="space-y-2">
-                              <p className="font-bold text-amber-400 text-xs">Narasi Pembuka (Indonesia)</p>
-                              {(() => {
-                                // Dulu: kalau belum ada override tersimpan, tampil
-                                // tombol "Muat teks aktif untuk diedit" — user harus
-                                // klik dulu sebelum bisa lihat/edit apa pun, padahal
-                                // sisi EN & preview read-only sama-sama langsung
-                                // menampilkan teks aktif tanpa tombol perantara.
-                                // Sekarang: editor SELALU tampil berisi teks yang
-                                // sedang aktif (override kalau ada, kalau tidak ya
-                                // template bawaan — persis logika yang sama dipakai
-                                // preview read-only via getPreambleTemplateAndTokens).
-                                // customOpeningParagraph BARU tercatat begitu user
-                                // benar-benar mengetik (onChange), jadi sekadar
-                                // membuka form ini TIDAK diam-diam membuat override —
-                                // perilaku itu tidak berubah, cuma langkah klik
-                                // "muat" yang dihapus.
-                                const val = selectedContract.customOpeningParagraph || "";
-                                const hasOverride = !!val.trim();
-                                const { template } = getPreambleTemplateAndTokens();
-                                const displayValue = hasOverride ? val : template;
-                                return (
-                                  <>
-                                    <RichTextEditor
-                                      valueHtml={looksLikeHtml(displayValue) ? displayValue : mdToHtmlForEditor(displayValue)}
-                                      onChange={(html) =>
-                                        setSelectedContract({ ...selectedContract, customOpeningParagraph: html })
-                                      }
-                                      tokens={PREAMBLE_TOKENS}
-                                      minHeight={100}
-                                    />
-                                    <div className="flex items-center justify-between gap-2">
-                                      <p className="text-[10px] text-slate-500">Format teks &amp; chip "Sisipkan" ikut tercetak di PDF.</p>
-                                      {hasOverride && (
-                                        <button
-                                          type="button"
-                                          onClick={() =>
-                                            setSelectedContract({ ...selectedContract, customOpeningParagraph: undefined })
-                                          }
-                                          className="text-[10px] px-2 py-1 text-rose-400 hover:bg-rose-500/10 rounded-lg cursor-pointer shrink-0"
-                                        >
-                                          Kembalikan ke bawaan
-                                        </button>
-                                      )}
-                                    </div>
-                                  </>
-                                );
-                              })()}
-                            </div>
-                          );
-
-                          // preambleEn diisi AI saat toggle EN/ID+EN pertama kali
-                          // diklik — dulu teks mentah markdown (**tebal**), diedit
-                          // via textarea polos. Sekarang disamakan dengan sisi
-                          // Indonesia: RichTextEditor + PREAMBLE_TOKENS yang sama
-                          // (toolbar format teks & chip "Sisipkan" identik), plus
-                          // tombol "Kembalikan ke bawaan" yang balik ke
-                          // preambleEnOriginal (hasil AI translate asli, tersimpan
-                          // terpisah — lihat types.ts). SENGAJA tidak memanggil
-                          // ulang /translate: endpoint itu menerjemahkan SELURUH
-                          // dokumen sekaligus dan akan ikut menimpa editan manual
-                          // di pasal lain, bukan cuma narasi pembuka ini. Value
-                          // lama yang masih markdown otomatis dikonversi ke HTML
-                          // sekali lewat mdToHtmlForEditor (persis pola cl.contentEn
-                          // di enFields pasal di bawah) — sesudah diedit sekali,
-                          // tersimpan sebagai HTML seterusnya.
-                          const enHasCustomEdit = !!selectedContract.preambleEnOriginal
-                            && selectedContract.preambleEn !== selectedContract.preambleEnOriginal;
-                          const enEditor = (
-                            <div className="space-y-2">
-                              <p className="font-bold text-sky-400 text-xs">Opening Narrative (English)</p>
-                              {selectedContract.preambleEn ? (
-                                <>
-                                  <RichTextEditor
-                                    valueHtml={looksLikeHtml(selectedContract.preambleEn) ? selectedContract.preambleEn : mdToHtmlForEditor(selectedContract.preambleEn)}
-                                    onChange={(html) => setSelectedContract({ ...selectedContract, preambleEn: html })}
-                                    tokens={PREAMBLE_TOKENS}
-                                    minHeight={100}
-                                  />
-                                  <div className="flex items-center justify-between gap-2">
-                                    <p className="text-[10px] text-slate-500">Format teks &amp; chip "Sisipkan" ikut tercetak di PDF.</p>
-                                    {enHasCustomEdit && (
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          setSelectedContract({ ...selectedContract, preambleEn: selectedContract.preambleEnOriginal })
-                                        }
-                                        title="Kembali ke hasil terjemahan AI asli, buang editan manual di narasi pembuka ini"
-                                        className="text-[10px] px-2 py-1 text-rose-400 hover:bg-rose-500/10 rounded-lg cursor-pointer shrink-0"
-                                      >
-                                        Kembalikan ke bawaan
-                                      </button>
-                                    )}
-                                  </div>
-                                </>
-                              ) : (
-                                <p className="text-[10px] text-slate-500 italic">
-                                  Belum ada versi Inggris — klik toggle EN atau ID+EN di header preview dulu supaya diterjemahkan otomatis, baru bisa dikoreksi di sini.
-                                </p>
-                              )}
-                            </div>
-                          );
-
-                          return (
-                            <div className="p-2.5 bg-slate-900 border border-amber-500/20 rounded-lg space-y-2">
-                              <p className="text-[10px] text-slate-500">
-                                Judul dokumen, tanggal &amp; identitas Pihak Pertama/Kedua diatur lewat tombol "Edit Data Pihak &amp; Kontrak" di atas — ini cuma kalimat pembukanya.
-                              </p>
-                              {docLang === "id" && idEditor}
-                              {docLang === "en" && enEditor}
-                              {docLang === "bilingual" && (
-                                <div className="flex gap-3">
-                                  <div className="flex-1 min-w-0">{idEditor}</div>
-                                  <div className="flex-1 min-w-0">{enEditor}</div>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })()}
-                        {selectedContract.clauses.map((cl, i) => {
-                          const docLang = selectedContract.documentLanguage || "id";
-                          const updateClause = (patch: any) => {
-                            const updatedClauses = selectedContract.clauses.map((x, xi) =>
-                              xi === i ? { ...x, ...patch } : x,
-                            );
-                            setSelectedContract({ ...selectedContract, clauses: updatedClauses });
-                          };
-                          // Editor pasal per-kontrak — WYSIWYG (format teks + token).
-                          // Pipeline render sudah sadar-HTML. idFields/enFields dipisah
-                          // supaya bisa ditampilkan tunggal (ID/EN) ATAU berdampingan
-                          // (bilingual), tanpa duplikasi kode.
-                          const idFields = (
-                            <div className="space-y-1.5">
-                              <input
-                                type="text"
-                                value={cl.title}
-                                onChange={(e) => updateClause({ title: e.target.value })}
-                                className="w-full bg-slate-950 border border-slate-850 px-2 py-1 rounded text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                                placeholder="Judul pasal"
-                              />
-                              <RichTextEditor
-                                valueHtml={looksLikeHtml(cl.content) ? cl.content : mdToHtmlForEditor(cl.content)}
-                                onChange={(html) => updateClause({ content: html })}
-                                tokens={CLAUSE_TOKENS}
-                                minHeight={80}
-                              />
-                            </div>
-                          );
-                          const enFields = (
-                            <div className="space-y-1.5">
-                              {(cl.titleEn || cl.contentEn) ? (
-                                <>
-                                  <input
-                                    type="text"
-                                    value={cl.titleEn || ""}
-                                    onChange={(e) => updateClause({ titleEn: e.target.value })}
-                                    className="w-full bg-slate-950 border border-slate-850 px-2 py-1 rounded text-xs text-slate-200 focus:outline-none focus:border-sky-500"
-                                    placeholder="Article title"
-                                  />
-                                  <RichTextEditor
-                                    valueHtml={looksLikeHtml(cl.contentEn || "") ? (cl.contentEn || "") : mdToHtmlForEditor(cl.contentEn || "")}
-                                    onChange={(html) => updateClause({ contentEn: html })}
-                                    tokens={CLAUSE_TOKENS}
-                                    minHeight={80}
-                                  />
-                                </>
-                              ) : (
-                                <p className="text-[10px] text-slate-500 italic">
-                                  Belum diterjemahkan — klik toggle EN/ID+EN di header preview dulu.
-                                </p>
-                              )}
-                            </div>
-                          );
-                          return (
-                            <div
-                              key={cl.id}
-                              className="p-2.5 bg-slate-900 border border-slate-800 rounded-lg flex flex-col gap-1.5"
-                            >
-                              <div className="flex items-center justify-between gap-2">
-                                <span className="font-bold text-indigo-400 shrink-0">
-                                  Pasal {i + 1}:
-                                </span>
-                                <button
-                                  onClick={() => {
-                                    const updatedClauses = selectedContract.clauses
-                                      .filter((_, xi) => xi !== i)
-                                      .map((x, xi) => ({ ...x, order: xi + 1 }));
-                                    setSelectedContract({ ...selectedContract, clauses: updatedClauses });
-                                  }}
-                                  title="Hapus pasal ini"
-                                  className="text-rose-400 hover:bg-rose-500/10 p-1.5 rounded-lg cursor-pointer shrink-0"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                              {docLang === "id" && idFields}
-                              {docLang === "en" && enFields}
-                              {docLang === "bilingual" && (
-                                <div className="flex gap-3">
-                                  <div className="flex-1 min-w-0">{idFields}</div>
-                                  <div className="flex-1 min-w-0">{enFields}</div>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
-                        <div className="flex flex-wrap items-center gap-2 pt-1">
-                          <select
-                            value=""
-                            onChange={(e) => {
-                              const lib = clauses.find((c) => c.id === e.target.value);
-                              if (!lib) return;
-                              setSelectedContract({
-                                ...selectedContract,
-                                clauses: [
-                                  ...selectedContract.clauses,
-                                  { id: "draft-cls-" + Date.now(), title: lib.title, content: lib.content, order: selectedContract.clauses.length + 1 },
-                                ],
-                              });
-                            }}
-                            className="flex-1 min-w-[200px] px-2 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-300 focus:outline-none cursor-pointer"
-                          >
-                            <option value="">+ Tambah Pasal dari Library Klausul...</option>
-                            {clauses.map((c) => (
-                              <option key={c.id} value={c.id}>{c.title} ({c.category})</option>
-                            ))}
-                          </select>
-                          <button
-                            onClick={() =>
-                              setSelectedContract({
-                                ...selectedContract,
-                                clauses: [
-                                  ...selectedContract.clauses,
-                                  { id: "draft-cls-" + Date.now(), title: "Pasal Baru", content: "", order: selectedContract.clauses.length + 1 },
-                                ],
-                              })
-                            }
-                            className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1"
-                          >
-                            <Plus className="w-3.5 h-3.5" /> Pasal Kosong
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="pt-4 border-t border-slate-850 text-[11px] text-slate-500">
-                      Kontrak berstatus {contractStatusLabel(selectedContract.status)} — isi pasal terkunci. Gunakan "Perpanjang / Extend" untuk membuat draft baru bila perlu perubahan.
-                    </div>
-                  )}
                 </div>
+              </div>
 
-                {/* Right Side: Tabbed Tools Panel (5 cols) */}
-                <div className="xl:col-span-5 bg-slate-950 rounded-2xl border border-slate-800 p-5 flex flex-col justify-between shadow-2xl">
-                  {/* Workspace Tools Contents */}
-                  <div className="space-y-6">
+              {/* Status & Siklus Kontrak + Riwayat Addendum — dipindah ke
+                  bawah (lebar penuh), atas permintaan user. Dulu jadi kolom
+                  kanan sebelahan preview; sekarang di bawah grid preview+
+                  editor. Isi/logic blok ini TIDAK diubah sama sekali, cuma
+                  dipindah posisi & jadi lebar penuh (bukan 5/12 kolom lagi). */}
+              <div className="bg-slate-950 rounded-2xl border border-slate-800 p-5 shadow-2xl">
+                <div className="space-y-6">
                     {/* SECTION 3: STATUS & SIKLUS KONTRAK (Draft → OnReview →
                         FullyApproved → Aktif → Archived/Terminated) */}
                     <div className="p-4 bg-slate-900 rounded-xl border border-slate-800 space-y-3">
@@ -16203,7 +18760,6 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                  </div>
                 </div>
               </div>
             </div>
@@ -17818,12 +20374,12 @@ export default function App() {
                     <h3 className="font-bold text-sm">
                       Log Forensik Aktivitas Sistem
                     </h3>
-                    <div className="relative">
-                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
+                    <div className="relative w-full sm:w-72">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
                       <input
                         type="text" value={auditSearch} onChange={(e) => { setAuditSearch(e.target.value); setAuditPage(1); }}
                         placeholder="Cari pengguna / aktivitas / detail / no. kontrak..."
-                        className="pl-8 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500 w-72"
+                        className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
                       />
                     </div>
                   </div>
@@ -18082,12 +20638,12 @@ export default function App() {
                     <h3 className="font-bold text-sm">
                       Log Aktivitas Kontrak &amp; DCS
                     </h3>
-                    <div className="relative">
-                      <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500" />
+                    <div className="relative w-full sm:w-72">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
                       <input
                         type="text" value={auditKdSearch} onChange={(e) => { setAuditKdSearch(e.target.value); setAuditKdPage(1); }}
                         placeholder="Cari pengguna / aktivitas / detail / no. kontrak..."
-                        className="pl-8 pr-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500 w-72"
+                        className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
                       />
                     </div>
                   </div>
@@ -18252,12 +20808,18 @@ export default function App() {
                   {creationLockedParty === "employee" ? "Wizard Kontrak Karyawan" : creationLockedParty === "external" ? "Wizard Kontrak Eksternal" : "Smart Contract Creation Wizard"}
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Langkah {creationStep} dari 3:{" "}
-                  {creationStep === 1
-                    ? "Inisiasi & AI Assistance"
-                    : creationStep === 2
-                      ? "Detail & Informasi Kontrak"
-                      : "Variabel & Finalisasi"}
+                  {newContractForm.creationMode === "upload" ? (
+                    "Langkah 1 dari 1: Unggah Dokumen Kontrak"
+                  ) : (
+                    <>
+                      Langkah {creationStep} dari 3:{" "}
+                      {creationStep === 1
+                        ? "Inisiasi & AI Assistance"
+                        : creationStep === 2
+                          ? "Detail & Informasi Kontrak"
+                          : "Variabel & Finalisasi"}
+                    </>
+                  )}
                 </p>
                 <p className="text-[10.5px] text-slate-500 mt-0.5">
                   {creationLockedParty === "employee"
@@ -18279,7 +20841,16 @@ export default function App() {
                 noValidate
                 onSubmit={(e) => {
                   e.preventDefault();
+                  // Mode Upload: form disederhanakan jadi 1 tahap saja (Judul,
+                  // Nomor Kontrak, Kategori, Upload Dokumen) — submit langsung
+                  // dari sini, tidak lagi lanjut ke Tahap 2/3.
+                  if (creationStep === 1 && newContractForm.creationMode === "upload") {
+                    handleCreateContract(e);
+                    return;
+                  }
                   if (creationStep === 2) {
+                    // Hanya mode "smart" yang sampai ke Tahap 2 (mode "upload"
+                    // sudah submit langsung dari Tahap 1 — lihat blok di atas).
                     if (!newContractForm.title.trim()) { showToast("Judul Kontrak wajib diisi", "warning"); return; }
                     if (!newContractForm.party2Name.trim()) { showToast("Nama Pihak Kedua wajib diisi", "warning"); return; }
                     if (!newContractForm.startDate) { showToast("Tanggal Mulai Berlaku wajib diisi", "warning"); return; }
@@ -18326,7 +20897,7 @@ export default function App() {
                       <p className="text-[11px] text-slate-500">
                         {newContractForm.creationMode === "smart"
                           ? "Pasal & klausul akan otomatis tersusun dari template yang dipilih, dan bisa Anda ubah pada tahap berikutnya."
-                          : "Untuk kontrak yang sudah ditandatangani secara fisik (hardcopy discan) atau dokumen softcopy jadi. Cukup unggah filenya dan isi tanggal berlaku, kontrak akan tetap masuk daftar monitoring & reminder."}
+                          : "Pakai dokumen/template kerjasama Anda sendiri (bukan template sistem) sebagai isi kontrak ini. Kontrak tetap lahir berstatus Draft — status baru berubah Aktif lewat proses yang sama seperti kontrak lain (approval/aktivasi), BUKAN otomatis saat unggah, karena file ini belum tentu sudah ditandatangani basah oleh semua pihak. Untuk dokumen yang memang sudah 100% final & ber-TTD basah, unggah lewat menu Arsip Dokumen."}
                       </p>
                     </div>
 
@@ -18338,6 +20909,17 @@ export default function App() {
                         value={newContractForm.category}
                         onChange={(e) => {
                           const newCategory = e.target.value;
+                          if (newContractForm.creationMode === "upload") {
+                            // Mode Upload: JANGAN reset clauses/variables hasil
+                            // ekstraksi file hanya karena Kategori diganti — isi
+                            // kontrak sumbernya dari file yang sudah diupload,
+                            // bukan dari kategori/template sistem. Reset di bawah
+                            // (docType/templateId/clauses/variables/subFolderId)
+                            // cuma relevan utk mode Smart yang memang menyusun
+                            // ulang pasal dari template per-kategori.
+                            setNewContractForm({ ...newContractForm, category: newCategory as any });
+                            return;
+                          }
                           // Reset template & clauses when category changes so the
                           // template list (and any cascaded clauses) stays relevant.
                           setNewContractForm({
@@ -18363,6 +20945,26 @@ export default function App() {
                       </select>
                     </div>
 
+                    {newContractForm.creationMode === "upload" && (
+                      <div className="space-y-1.5">
+                        <label className="block text-sm font-semibold text-slate-300">
+                          Judul Kontrak <span className="text-rose-400">*</span>
+                        </label>
+                        <input
+                          type="text"
+                          required
+                          value={newContractForm.title}
+                          onChange={(e) => setNewContractForm({ ...newContractForm, title: e.target.value })}
+                          placeholder="e.g. Perjanjian Kerja Sama Jasa - CV Solusi Bersama Abadi"
+                          className="w-full px-4 py-3 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                        />
+                        <p className="text-[11px] text-slate-500">
+                          Terisi otomatis dari nama berkas saat diunggah — bisa diganti kapan saja sebelum submit.
+                        </p>
+                      </div>
+                    )}
+
+                    {newContractForm.creationMode === "smart" && (
                     <div className="space-y-1.5">
                       <label className="block text-sm font-semibold text-slate-300">
                         Jenis Dokumen
@@ -18391,6 +20993,7 @@ export default function App() {
                         Menentukan format nomor & (jika dikonfigurasi) template default — bisa diatur di Konfigurasi &gt; Master Data.
                       </p>
                     </div>
+                    )}
 
                     <div className="space-y-1.5">
                       <label className="block text-sm font-semibold text-slate-300 flex items-center gap-1.5">
@@ -18424,7 +21027,7 @@ export default function App() {
                       )}
                     </div>
 
-                    {(() => {
+                    {newContractForm.creationMode === "smart" && (() => {
                       const rootFolders = subFolders.filter(
                         (f) => f.category === newContractForm.category && f.parentId === null,
                       );
@@ -18484,17 +21087,66 @@ export default function App() {
                     {newContractForm.creationMode === "upload" && (
                       <div className="space-y-1.5">
                         <label className="block text-sm font-semibold text-slate-300">
-                          Berkas Dokumen Kontrak (Wajib)
+                          Berkas Dokumen/Template Kontrak (Wajib)
                         </label>
                         <input
                           type="file"
-                          accept=".pdf,.jpg,.jpeg,.png"
-                          onChange={(e) =>
-                            setNewContractForm({
-                              ...newContractForm,
-                              masterPdfFile: e.target.files?.[0] || null,
-                            })
-                          }
+                          accept=".pdf,.docx,.jpg,.jpeg,.png"
+                          onChange={async (e) => {
+                            const file = e.target.files?.[0] || null;
+                            setNewContractForm((prev) => ({
+                              ...prev,
+                              masterPdfFile: file,
+                              clauses: [],
+                              // Auto-isi Judul dari nama file kalau masih kosong —
+                              // mode upload gak wajib isi ulang manual (lihat
+                              // validasi Tahap 2), tinggal diganti kalau mau.
+                              title: prev.title.trim() ? prev.title : (file ? file.name.replace(/\.[^.]+$/, "") : prev.title),
+                            }));
+                            if (!file) return;
+                            // PDF teks-asli / .docx: tarik teksnya SEKARANG JUGA
+                            // (sebelum submit) & taruh UTUH sebagai satu blok
+                            // yang bisa diedit — TIDAK dipecah jadi pasal-pasal
+                            // per PASAL/nomor, karena format dokumen upload
+                            // user bisa macam-macam & auto-split gampang salah
+                            // tebak (lihat komentar di extractedTextToSingleClause
+                            // server.ts). Preview & editornya tetap pakai LAYOUT
+                            // & MODE EDIT YANG SAMA seperti mode "Buat dari
+                            // Template" — cuma bukan cuma nampilin file PDF-nya
+                            // mentah-mentah. .jpg/.png (scan/foto) dilewati di
+                            // sini (tanpa OCR, endpoint akan selalu bilang tidak
+                            // didukung utk itu) — isi diisi manual belakangan.
+                            const isTextExtractable = /\.(pdf|docx)$/i.test(file.name);
+                            if (!isTextExtractable) return;
+                            setIsParsingUploadedFile(true);
+                            try {
+                              const fd = new FormData();
+                              fd.append("file", file);
+                              const r = await fetch("/api/master-contracts/extract-text", { method: "POST", body: fd });
+                              const data = await r.json();
+                              if (data.supported && Array.isArray(data.clauses) && data.clauses.length > 0) {
+                                setNewContractForm((prev) => ({
+                                  ...prev,
+                                  masterPdfFile: file,
+                                  customOpeningParagraph: data.preamble || prev.customOpeningParagraph,
+                                  closingStatement: data.closing || prev.closingStatement,
+                                  clauses: data.clauses.map((c: any, i: number) => ({
+                                    id: `up-cls-${Date.now()}-${i}`,
+                                    title: c.title,
+                                    content: c.content,
+                                    order: i + 1,
+                                  })),
+                                }));
+                                showToast("Isi berkas berhasil ditarik utuh — tampil & bisa diedit bebas di preview, tanpa dipecah-pecah.", "success");
+                              } else {
+                                showToast(data.reason || "Tidak bisa membaca teks dari berkas ini secara otomatis.", "warning");
+                              }
+                            } catch {
+                              showToast("Gagal membaca isi berkas — kontrak tetap bisa dibuat, pasal diisi manual di langkah berikutnya.", "warning");
+                            } finally {
+                              setIsParsingUploadedFile(false);
+                            }
+                          }}
                           className="w-full text-sm text-slate-300 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 bg-slate-900 border border-slate-800 rounded-xl cursor-pointer"
                         />
                         {newContractForm.masterPdfFile && (
@@ -18503,8 +21155,18 @@ export default function App() {
                             {newContractForm.masterPdfFile.name} siap diunggah
                           </p>
                         )}
+                        {isParsingUploadedFile && (
+                          <p className="text-[11px] text-indigo-400 flex items-center gap-1">
+                            <RefreshCw className="w-3 h-3 animate-spin" /> Membaca isi berkas &amp; memecahnya jadi pasal-pasal…
+                          </p>
+                        )}
+                        {!isParsingUploadedFile && newContractForm.clauses.length > 0 && (
+                          <p className="text-[11px] text-emerald-400">
+                            ✓ {newContractForm.clauses.length} pasal terdeteksi dari berkas ini — akan langsung bisa diedit (tambah pasal/lampiran/token) di editor, sama seperti mode Template.
+                          </p>
+                        )}
                         <p className="text-[11px] text-slate-500">
-                          Hasil scan hardcopy (PDF/foto) atau dokumen softcopy tetap diterima. Isi tanggal mulai & selesai pada tahap berikutnya agar kontrak ini otomatis masuk daftar reminder jatuh tempo.
+                          PDF teks-asli atau .docx: isi pasalnya otomatis dibaca &amp; jadi bisa diedit penuh. Hasil scan/foto (JPG/PNG) atau .doc lama: tidak bisa dibaca otomatis (tanpa OCR) — berkasnya tetap tersimpan &amp; bisa dilihat, tapi pasal diisi manual. Isi tanggal mulai &amp; selesai pada tahap berikutnya agar kontrak ini otomatis masuk daftar reminder jatuh tempo.
                         </p>
                       </div>
                     )}
@@ -18574,7 +21236,7 @@ export default function App() {
                         boleh muncul bersamaan untuk kategori yang sama. Vendor DAN
                         Customer sama-sama menarik dari master data vendor yang sama
                         (satu master, dua kategori pemakaian). */}
-                    {(newContractForm.category === "Employment" || newContractForm.category === "Vendor" || newContractForm.category === "Customer") && (
+                    {newContractForm.creationMode === "smart" && (newContractForm.category === "Employment" || newContractForm.category === "Vendor" || newContractForm.category === "Customer") && (
                       <div className="p-4 bg-slate-900 rounded-xl space-y-3">
                         <span className="block text-xs font-bold text-slate-400 uppercase tracking-wide">
                           Integrasi Modul {newContractForm.category === "Employment" ? "HR" : "GA / Master Vendor"} (Opsional)
@@ -18647,6 +21309,7 @@ export default function App() {
                       </div>
                     )}
 
+                    {newContractForm.creationMode === "smart" && (
                     <div className="space-y-1.5 pt-2">
                       <label className="block text-sm font-semibold text-slate-300">
                         Pilih Master Template ({newContractForm.category})
@@ -18673,11 +21336,17 @@ export default function App() {
                         </p>
                       )}
                     </div>
+                    )}
                   </div>
                 )}
 
                 {creationStep === 2 && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+                    {newContractForm.creationMode === "upload" && (
+                      <div className="md:col-span-2 p-3 bg-emerald-500/5 border border-emerald-500/25 rounded-xl text-[11px] text-emerald-300">
+                        Mode Upload: field di bawah ini <b>opsional</b> (kosongkan & lanjut kalau mau) — bisa diisi/diubah belakangan lewat "Edit Data Pihak &amp; Kontrak" di halaman kontrak. Cuma Judul yang tetap wajib.
+                      </div>
+                    )}
                     <div className="space-y-1.5">
                       <label className="block text-xs font-semibold text-slate-300">
                         Judul Kontrak <span className="text-rose-400">*</span>
@@ -18697,9 +21366,25 @@ export default function App() {
                       />
                     </div>
 
+                    <div className="space-y-1.5 md:col-span-2">
+                      <label className="block text-xs font-semibold text-slate-300">
+                        Pilih Judul Pekerjaan Legal <span className="text-slate-500 font-normal">(opsional — status Pekerjaan Legal ini akan otomatis mengikuti status kontrak yang dibuat)</span>
+                      </label>
+                      <select
+                        value={newContractForm.linkedLegalJobId}
+                        onChange={(e) => setNewContractForm({ ...newContractForm, linkedLegalJobId: e.target.value })}
+                        className="w-full px-4 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                      >
+                        <option value="">— Tidak ditautkan —</option>
+                        {legalJobsForLinking.map((j) => (
+                          <option key={j.id} value={j.id}>{j.title} — {j.partnerName} ({LEGAL_STATUS_LABEL[j.status] || j.status})</option>
+                        ))}
+                      </select>
+                    </div>
+
                     <div className="space-y-1.5">
                       <label className="block text-xs font-semibold text-slate-300">
-                        Nama Pihak Kedua <span className="text-rose-400">*</span>
+                        Nama Pihak Kedua {newContractForm.creationMode !== "upload" && <span className="text-rose-400">*</span>}
                       </label>
                       <input
                         type="text"
@@ -18793,11 +21478,11 @@ export default function App() {
 
                     <div className="space-y-1.5">
                       <label className="block text-xs font-semibold text-slate-300">
-                        Tanggal Mulai Berlaku <span className="text-rose-400">*</span>
+                        Tanggal Mulai Berlaku {newContractForm.creationMode !== "upload" && <span className="text-rose-400">*</span>}
                       </label>
                       <input
                         type="date"
-                        required
+                        required={newContractForm.creationMode !== "upload"}
                         value={newContractForm.startDate}
                         onChange={(e) =>
                           setNewContractForm({
@@ -18811,11 +21496,11 @@ export default function App() {
 
                     <div className="space-y-1.5">
                       <label className="block text-xs font-semibold text-slate-300">
-                        Tanggal Selesai Berlaku <span className="text-rose-400">*</span>
+                        Tanggal Selesai Berlaku {newContractForm.creationMode !== "upload" && <span className="text-rose-400">*</span>}
                       </label>
                       <input
                         type="date"
-                        required
+                        required={newContractForm.creationMode !== "upload"}
                         min={newContractForm.startDate || undefined}
                         value={newContractForm.endDate}
                         onChange={(e) =>
@@ -19166,7 +21851,7 @@ export default function App() {
                         { label: "Masa Berlaku", value: f.startDate && f.endDate ? `${f.startDate} s/d ${f.endDate} · ${durationLabel}` : "— belum lengkap —", warn: !f.startDate || !f.endDate },
                         { label: "Nilai Kontrak", value: f.contractValue > 0 ? `${f.currency} ${formatCurrencyDisplay(f.contractValue)}` : "—" },
                         { label: "Jumlah Pasal", value: `${f.clauses.length} pasal`, warn: f.creationMode === "smart" && f.clauses.length === 0 },
-                        ...(f.creationMode === "upload" ? [{ label: "Status Awal", value: "Aktif — langsung masuk monitoring & reminder (dokumen dianggap sudah ditandatangani)" }] : []),
+                        ...(f.creationMode === "upload" ? [{ label: "Status Awal", value: "Draft — dokumen unggahan Anda dipakai sbg isi kontrak, tetap perlu diaktifkan lewat proses biasa (BUKAN otomatis Aktif)" }] : []),
                       ];
                       return (
                         <div className="p-5 bg-indigo-500/5 border border-indigo-500/20 rounded-xl space-y-3">
@@ -19414,10 +22099,12 @@ export default function App() {
                     type="submit"
                     className="px-6 py-3 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-xl transition shadow-lg flex items-center gap-2"
                   >
-                    {creationStep < 3
-                      ? "Lanjut ke Tahap " + (creationStep + 1)
-                      : "Finalisasi & Buat Kontrak"}
-                    {creationStep < 3 && <Sparkles className="w-4 h-4" />}
+                    {newContractForm.creationMode === "upload"
+                      ? "Buat Kontrak"
+                      : creationStep < 3
+                        ? "Lanjut ke Tahap " + (creationStep + 1)
+                        : "Finalisasi & Buat Kontrak"}
+                    {newContractForm.creationMode !== "upload" && creationStep < 3 && <Sparkles className="w-4 h-4" />}
                   </button>
                 </div>
               </form>
@@ -20479,6 +23166,18 @@ export default function App() {
                     type="date"
                     value={editPartyForm.startDate}
                     onChange={(e) => setEditPartyForm({ ...editPartyForm, startDate: e.target.value })}
+                    className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-semibold text-slate-300">Tanggal Berakhir Kontrak</label>
+                  <input
+                    type="date"
+                    value={editPartyForm.endDate}
+                    onChange={(e) => setEditPartyForm({ ...editPartyForm, endDate: e.target.value })}
                     className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                   />
                 </div>

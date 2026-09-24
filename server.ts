@@ -7,7 +7,9 @@ import {
   Clause, Variable, Template, Contract, ContractVersion, ContractStatus,
   ContractApprovalStep, AuditTrail, SystemNotification, EmployeeData, VendorData, User, UserRole,
   ClauseComment, PushSubscription as PushSub, SubFolder, ContractSharingFeeItem, ContractVendorSnapshot,
-  ContractPaymentTerm, ContractObligation, ContractVendorEvaluation, BudgetEntry
+  ContractPaymentTerm, ContractObligation, ContractVendorEvaluation, BudgetEntry,
+  LegalJob, LegalJobStatus, LegalJobPriority, LegalJobDocument, LegalJobNote,
+  LegalJobTimelineEntry, LegalFormLink, LEGAL_JOB_WORKFLOW_STATUSES,
 } from "./src/types";
 import { loadDB, saveDB, initDB, DEFAULT_TENANT_ID, makeDefaultUsers } from "./db.js";
 import { startReminderScheduler, runReminderCheck } from "./reminders.js";
@@ -44,6 +46,11 @@ import { logger } from "./logger.js";
 
 import multer from "multer";
 import { PDFDocument, StandardFonts, rgb, degrees } from "pdf-lib";
+import mammoth from "mammoth";
+// pdf-parse: CommonJS, tapi kalau di-import langsung di top-level ia mencoba
+// membaca file test/data/05-versions-space.pdf bawaannya sendiri di beberapa
+// versi (bug lama paket ini) — import dinamis di dalam handler (lihat
+// extractTextFromUpload) menghindari itu tanpa mengubah cara paket dipakai.
 
 dotenv.config();
 
@@ -181,6 +188,58 @@ function rawSettingsFor(db: any, tid: string): any {
 }
 function setSettingsFor(db: any, tid: string, obj: any) {
   db.settingsByTenant = { ...(db.settingsByTenant || {}), [tid]: obj };
+}
+// ----- Pekerjaan Legal: helper murni (dipakai lintas scope — beberapa route
+// legal ada di dalam startServer(), sedangkan POST /api/contracts ada di
+// scope top-level module ini, jadi helper ini SENGAJA ditaruh top-level
+// supaya kedua sisi bisa memanggilnya). -----
+function legalJobTenantList(db: any, tid: string): LegalJob[] {
+  if (!db.legalJobs) db.legalJobs = [];
+  return (db.legalJobs as LegalJob[]).filter((j) => j.tenantId === tid);
+}
+function findLegalJob(db: any, tid: string, id: string): LegalJob | undefined {
+  if (!db.legalJobs) db.legalJobs = [];
+  return (db.legalJobs as LegalJob[]).find((j) => j.id === id && j.tenantId === tid);
+}
+function pushLegalTimeline(job: LegalJob, entry: Omit<LegalJobTimelineEntry, "id" | "at">, at?: string) {
+  job.timeline.push({ id: "ljt-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6), at: at || new Date().toISOString(), ...entry });
+}
+// ----- Alur status gabungan Pekerjaan Legal <-> Monitoring Kontrak -----
+// Satu fungsi murni, dipakai server-side untuk KEDUANYA (linkedContract di
+// legal-jobs API, dan unifiedStatus di /api/contracts), supaya nilainya
+// dijamin identik di kedua tabel — bukan dihitung ulang terpisah di dua
+// tempat yang bisa diam-diam melenceng.
+// Pemicu tiap tahap (lihat Revisi-Alur-Status-Pekerjaan-Legal-Monitoring-Kontrak.docx):
+//   Draft                     -> Contract.status === "Draft", belum generate link review
+//   ReviewInternalEksternal   -> externalReviewToken sudah dibuat, belum ada respons eksternal
+//   RevisiNegosiasi           -> pihak eksternal sudah isi nama+komentar+Setuju/OK (externalApprovals)
+//   Finalisasi                -> Contract.status === "OnReview" (diajukan, approval matrix berjalan)
+//   ProsesTTD                 -> Contract.status === "FullyApproved" (disetujui penuh, TTD blm diunggah)
+//   Aktif / TidakAktif / Archived / Terminated -> tetap sama seperti Contract.status (tidak diubah)
+type UnifiedLegalStatus = "Draft" | "ReviewInternalEksternal" | "RevisiNegosiasi" | "Finalisasi" | "ProsesTTD" | ContractStatus;
+function computeUnifiedLegalStatus(c: Contract): UnifiedLegalStatus {
+  if (c.status === "Draft") {
+    if ((c.externalApprovals?.length || 0) > 0) return "RevisiNegosiasi";
+    if (c.externalReviewToken) return "ReviewInternalEksternal";
+    return "Draft";
+  }
+  if (c.status === "OnReview") return "Finalisasi";
+  if (c.status === "FullyApproved") return "ProsesTTD";
+  return c.status; // Aktif, TidakAktif, Archived, Terminated — lolos apa adanya
+}
+// dibaca (bukan disalin sekali ke LegalJob) — satu-satunya sumber kebenaran
+// status untuk pekerjaan yang sudah bertaut adalah Contract.status itu sendiri.
+// Ini yang membuat status di tabel Pekerjaan Legal & Monitoring Kontrak WAJIB
+// selalu sama: keduanya baca field yang persis sama, tidak pernah disinkronkan
+// manual (yang rawan lupa/telat).
+function legalJobLinkedContractInfo(db: any, job: LegalJob): { id: string; title: string; contractNumber: string; status: UnifiedLegalStatus } | null {
+  if (!job.linkedContractId) return null;
+  const c = (db.contracts as Contract[]).find((x) => x.id === job.linkedContractId);
+  if (!c) return null;
+  return { id: c.id, title: c.title, contractNumber: c.contractNumber, status: computeUnifiedLegalStatus(c) };
+}
+function withLinkedContract(db: any, job: LegalJob) {
+  return { ...job, linkedContract: legalJobLinkedContractInfo(db, job) };
 }
 // Filter koleksi ke tenant tertentu.
 function scoped<T extends { tenantId?: string }>(arr: T[], tid: string): T[] {
@@ -732,6 +791,27 @@ const uploadLampiran = multer({
   fileFilter: (req, file, cb) => {
     if (ALLOWED_LAMPIRAN_MIME.has(file.mimetype)) cb(null, true);
     else cb(new Error("Tipe berkas tidak didukung. Hanya PDF atau Word (.doc/.docx)."));
+  },
+});
+// Lampiran Pekerjaan Legal (form eksternal & upload internal) — sesuai brief:
+// PDF, DOC, DOCX, XLS/XLSX, JPG, PNG, maksimal 10MB. Instance terpisah dari
+// upload/uploadLampiran di atas supaya daftar mime masing-masing fitur tetap
+// sesempit kebutuhannya sendiri.
+const ALLOWED_LEGAL_JOB_MIME = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "image/jpeg",
+  "image/png",
+]);
+const uploadLegalDoc = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_LEGAL_JOB_MIME.has(file.mimetype)) cb(null, true);
+    else cb(new Error("Tipe berkas tidak didukung. Hanya PDF, DOC, DOCX, XLS, XLSX, JPG, atau PNG."));
   },
 });
 function uploadFileKey(originalname: string): string {
@@ -1650,7 +1730,12 @@ function findOwnedContract(db: any, req: AuthedRequest, id: string): Contract | 
 
 app.get("/api/contracts", requireAuth, (req: AuthedRequest, res) => {
   const db = loadDB();
-  res.json(scoped(db.contracts as Contract[], tenantOf(req)));
+  // unifiedStatus TIDAK menggantikan `status` (banyak logic lain di app masih
+  // pakai `status` asli) — cuma field tambahan utk badge tabel Monitoring
+  // Kontrak, dihitung dari fungsi yang SAMA dipakai linkedContract di
+  // legal-jobs, supaya keduanya dijamin identik.
+  const list = scoped(db.contracts as Contract[], tenantOf(req)).map((c) => ({ ...c, unifiedStatus: computeUnifiedLegalStatus(c) }));
+  res.json(list);
 });
 
 app.get("/api/contracts/generate-number", requireAuth, (req: AuthedRequest, res) => {
@@ -1667,7 +1752,15 @@ app.get("/api/contracts/generate-number", requireAuth, (req: AuthedRequest, res)
 app.get("/api/contracts/:id", requireAuth, (req: AuthedRequest, res) => {
   const db = loadDB();
   const contract = findOwnedContract(db, req, req.params.id);
-  if (contract) res.json(contract);
+  // Sertakan unifiedStatus di sini juga (sebelumnya cuma dihitung di list
+  // GET /api/contracts) — tanpa ini, badge status di halaman detail kontrak
+  // (yang baca selectedContract.status mentah) bisa tampil beda dari badge
+  // di tabel Monitoring Kontrak/Pekerjaan Legal (yang baca unifiedStatus),
+  // contoh: detail bilang "Disetujui Penuh" (Contract.status="FullyApproved")
+  // padahal tabel sudah bilang "Proses TTD" (unifiedStatus hasil mapping
+  // yang sama). computeUnifiedLegalStatus adalah satu-satunya sumber
+  // kebenaran, jadi dipakai lagi di sini, bukan dihitung ulang terpisah.
+  if (contract) res.json({ ...contract, unifiedStatus: computeUnifiedLegalStatus(contract) });
   else res.status(404).json({ error: "Contract not found" });
 });
 
@@ -1941,6 +2034,308 @@ app.post("/api/master-contracts/upload", requireAuth, upload.single('file'), asy
   res.json({ url: stored.url });
 });
 
+// Pecah teks mentah hasil ekstraksi PDF/DOCX jadi array clauses[] siap-edit
+// (satu blok utuh) — dipakai fitur "Upload Dokumen (mode Template Sendiri)":
+// user upload file kontrak sendiri, ISI FILE-NYA (apa adanya, TANPA dipecah
+// per pasal/preamble/closing) jadi bisa diedit penuh di editor yang sama dgn
+// mode "Buat dari Template" (sisip token, dst), BUKAN cuma viewer statis.
+//
+// SENGAJA TIDAK mencoba mendeteksi struktur (heading "PASAL N", numbering
+// polos "1.2.3", "LAMPIRAN A/B", dst) — format kontrak upload user bisa
+// macam-macam & regex apapun cuma cocok utk SEBAGIAN kasus, sementara pas
+// gagal cocok, taruhannya adalah narasi pembuka/isi asli malah HILANG atau
+// ketuker sama placeholder sistem (lihat histori bug sebelumnya). Jadi
+// pendekatannya dibalik: TIDAK ADA pemisah sama sekali, seluruh teks file
+// ditaruh utuh (urut, apa adanya) jadi SATU pasal tanpa judul yang bisa
+// diedit bebas dari atas sampai bawah — lebih jujur & lebih aman drpd
+// auto-split yang gampang salah tebak.
+// Coba deteksi struktur "PASAL N" (dan potong blok tanda tangan di ujung)
+// dari teks hasil ekstraksi, supaya dokumen upload yang formatnya rapi
+// tampil TERPISAH per pasal + narasi pembuka di preview — sama seperti mode
+// "Buat dari Template" — bukan cuma satu blok teks raksasa (lihat komentar
+// extractedTextToSingleClause di atas soal alasan awal kenapa dulu SENGAJA
+// tidak mencoba memisah struktur sama sekali).
+//
+// TETAP KONSERVATIF sesuai alasan di atas: hanya dipakai kalau ditemukan
+// MINIMAL 2 baris "PASAL N" berurutan (heading pasal jelas, bukan kebetulan
+// kata "pasal" nongol sekali di tengah kalimat naratif) — kalau tidak
+// cukup yakin, fungsi ini return null dan caller jatuh balik ke
+// extractedTextToSingleClause (satu blok utuh, perilaku lama, tetap aman
+// utk format dokumen apa pun yang tidak/belum dikenali di sini).
+function extractedTextToStructuredClauses(
+  rawText: string,
+): { preamble: string; closing: string; clauses: { title: string; content: string }[] } | null {
+  const escapeHtml = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const toHtmlParagraphs = (block: string): string => {
+    const trimmed = block.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    if (!trimmed) return "<p></p>";
+    const withBreaks = escapeHtml(trimmed).replace(/\n[ \t]*\n/g, "<br><br>").replace(/\n/g, "<br>");
+    return `<p>${withBreaks}</p>`;
+  };
+  const lines = rawText.replace(/\r\n/g, "\n").split("\n");
+  // "PASAL 1", "Pasal 1:", "PASAL I -", dst — heading pasal, opsional teks
+  // judul menyusul di baris yang sama.
+  const pasalRe = /^\s*PASAL\s+([0-9]+|[IVXLCDM]+)\b\s*[:.\-–]?\s*(.*)$/i;
+  const matches: { idx: number; inline: string }[] = [];
+  lines.forEach((line, idx) => {
+    const m = line.match(pasalRe);
+    if (m) matches.push({ idx, inline: (m[2] || "").trim() });
+  });
+  if (matches.length < 2) return null;
+
+  // Heading judul pasal beda-beda gayanya antar dokumen — kadang HURUF
+  // BESAR SEMUA (mis. "RUANG LINGKUP KERJASAMA"), kadang Title Case biasa
+  // (mis. "Definisi & Penafsiran", "Kerahasiaan Informasi (Non-disclosure)")
+  // — beda dari isi ayat yang berupa kalimat panjang huruf kecil biasa
+  // (mis. "1.1 Pihak Kedua setuju untuk menyediakan..."). Diterima sbg
+  // heading kalau salah satu dari dua pola ini terpenuhi, DAN barisnya
+  // pendek & tidak diakhiri tanda baca kalimat (titik/titik dua/titik
+  // koma — ciri paragraf, bukan judul) & tidak diawali nomor ayat ("1.1 ").
+  const looksLikeHeading = (line: string): boolean => {
+    const t = line.trim();
+    if (!t || t.length > 90) return false;
+    if (/[.:;]$/.test(t)) return false;
+    if (/^\d+[.)]/.test(t)) return false;
+    const letters = t.replace(/[^A-Za-zÀ-ÿ]/g, "");
+    if (letters.length < 3) return false;
+    const upper = letters.replace(/[^A-Z]/g, "");
+    if (upper.length / letters.length > 0.7) return true; // HURUF BESAR SEMUA
+    // Title Case: mayoritas kata (yang punya huruf) diawali huruf besar.
+    const letterWords = t.split(/\s+/).filter((w) => /[A-Za-zÀ-ÿ]/.test(w));
+    if (letterWords.length === 0 || letterWords.length > 8) return false;
+    const titleCaseWords = letterWords.filter((w) => /^[^a-zà-ÿ]*[A-ZÀ-Ý]/.test(w));
+    return titleCaseWords.length / letterWords.length >= 0.6;
+  };
+  // "RUANG LINGKUP KERJASAMA" -> "Ruang Lingkup Kerjasama", supaya konsisten
+  // dgn gaya judul pasal mode Template (numbering "Pasal N" sendiri sudah
+  // ditambah otomatis oleh preview, lihat numLabelId di App.tsx — TIDAK
+  // ikut ditaruh di title di sini, cukup teks judulnya saja).
+  const prettyHeading = (raw: string): string => {
+    const t = raw.trim();
+    if (!t) return t;
+    const isAllCaps = t === t.toUpperCase() && /[A-Z]/.test(t);
+    if (!isAllCaps) return t;
+    return t.toLowerCase().replace(/(^|[\s(])([a-zà-ÿ])/g, (_m, sp, c) => sp + c.toUpperCase());
+  };
+  // Blok tanda tangan ("PIHAK PERTAMA" / "PIHAK KEDUA" + placeholder ttd di
+  // bawahnya) sudah punya bagian tampilan sendiri di preview sistem (lihat
+  // blok TTD sebaris di App.tsx) — kalau ikut kebawa jadi isi pasal
+  // terakhir, jadinya dobel. Potong di titik ini kalau ketemu; sisanya
+  // dibuang dari isi pasal (berkas ASLINYA tetap utuh tersimpan, cuma versi
+  // teks-yang-diedit ini yang tidak mengulang blok ttd).
+  //
+  // Dua gaya baris judul TTD yang ditemukan di dokumen nyata:
+  //  - vertikal: "PIHAK PERTAMA" sendirian di satu baris, "PIHAK KEDUA" di
+  //    baris lain (dipakai contoh sebelumnya);
+  //  - sebaris/kolom: "PIHAK PERTAMA        PIHAK KEDUA" jadi SATU baris
+  //    (kolom kiri-kanan yang di-flatten oleh pdf-parse). Regex kedua HANYA
+  //    cocok kalau baris itu literally DIMULAI dgn satu label & DIAKHIRI
+  //    persis dgn label satunya (boleh ada spasi/pemisah di tengah) — jadi
+  //    kalimat narasi biasa yang kebetulan menyebut kedua label ("...
+  //    disepakati oleh Pihak Pertama dan Pihak Kedua berhak menuntut...")
+  //    TIDAK ikut kepotong, karena ada kata lain sebelum/sesudah label itu.
+  //  Dicari mulai dari heading PASAL TERAKHIR (bukan dari pasal pertama)
+  //  supaya tidak salah kepotong kalau ada pasal di tengah yang kebetulan
+  //  (jarang, tapi tetap dijaga) menyebut label ini di baris tersendiri.
+  const sigLineRe = /^\s*PIHAK\s+(PERTAMA|KEDUA)\s*[:.]?\s*$/i;
+  const sigRowRe =
+    /^\s*PIHAK\s+PERTAMA\b[\s\S]*\bPIHAK\s+KEDUA\s*[:.]?\s*$|^\s*PIHAK\s+KEDUA\b[\s\S]*\bPIHAK\s+PERTAMA\s*[:.]?\s*$/i;
+  let sigIdx = -1;
+  for (let i = matches[matches.length - 1].idx; i < lines.length; i++) {
+    if (sigLineRe.test(lines[i]) || sigRowRe.test(lines[i])) { sigIdx = i; break; }
+  }
+  const bodyEnd = sigIdx !== -1 ? sigIdx : lines.length;
+
+  // Baris-baris PENDEK di paling atas dokumen (sebelum PASAL pertama)
+  // biasanya kop surat asli file-nya sendiri (nama perusahaan, alamat,
+  // telepon, judul dokumen, nomor) — semua ini SUDAH ditampilkan sendiri
+  // oleh kop & judul kontrak versi SISTEM di atas area preview, jadi kalau
+  // ikut masuk ke narasi pembuka di sini, isinya dobel persis. Heuristik:
+  // baris pendek (< 70 karakter — kop/nomor/judul biasanya begitu) di awal
+  // dibuang duluan, SAMPAI ketemu baris yang cukup panjang (kalimat narasi
+  // sungguhan, mis. "Pada hari ini, ... kami yang bertandatangan..."), atau
+  // sampai maksimal 8 baris. Kalau SEMUA baris sebelum PASAL pertama pendek
+  // (dokumennya memang singkat, tidak ada kop terpisah) atau pemotongan ini
+  // akan menghabiskan preamble sampai kosong, TIDAK ADA yang dibuang sama
+  // sekali — lebih aman membiarkan dobel drpd salah buang isi asli.
+  const MAX_HEADER_LINES = 8;
+  const NARRATIVE_MIN_LEN = 70;
+  const rawPreambleLines = lines.slice(0, matches[0].idx);
+  let headerCut = 0;
+  while (
+    headerCut < rawPreambleLines.length &&
+    headerCut < MAX_HEADER_LINES &&
+    rawPreambleLines[headerCut].trim().length < NARRATIVE_MIN_LEN
+  ) {
+    headerCut++;
+  }
+  const trimmedHasContent = rawPreambleLines.slice(headerCut).some((l) => l.trim().length > 0);
+  const preambleLines = trimmedHasContent ? rawPreambleLines.slice(headerCut) : rawPreambleLines;
+
+  // Mode Template punya kotak TERPISAH untuk "Narasi Pembuka" vs "Kalimat
+  // Penutup Pembuka" (baku, mis. "Masing-masing pihak sepakat ... sebagai
+  // berikut:") — lihat closingStatement di App.tsx. Supaya strukturnya
+  // SAMA utk dokumen upload, kalimat transisi baku ini dipisah dari narasi
+  // pembuka di sini, bukan ikut jadi satu paragraf. Cirinya: kalimat
+  // TERAKHIR sebelum PASAL pertama, diakhiri titik dua (":"). Awal
+  // kalimatnya dicari mundur maks 4 baris sampai ketemu baris sebelumnya
+  // yang diakhiri tanda baca kalimat (. / ." / dst) — itu tandanya kalimat
+  // BARU dimulai setelahnya. Kalau tidak ketemu batas yang jelas dalam
+  // jangkauan itu, TIDAK dipisah sama sekali (tetap satu narasi pembuka
+  // utuh seperti sebelumnya) — lebih aman drpd salah potong di tengah
+  // kalimat.
+  let closing = "";
+  let openingLines = preambleLines;
+  let lastNonEmptyIdx = -1;
+  for (let i = preambleLines.length - 1; i >= 0; i--) {
+    if (preambleLines[i].trim()) { lastNonEmptyIdx = i; break; }
+  }
+  if (lastNonEmptyIdx !== -1 && preambleLines[lastNonEmptyIdx].trim().endsWith(":")) {
+    const MAX_BACK = 4;
+    let startIdx = -1;
+    for (let i = lastNonEmptyIdx - 1, back = 0; i >= 0 && back < MAX_BACK; i--, back++) {
+      if (/[."”'")]\s*$/.test(preambleLines[i])) { startIdx = i + 1; break; }
+    }
+    if (startIdx === -1 && lastNonEmptyIdx === 0) startIdx = 0;
+    if (startIdx !== -1) {
+      closing = preambleLines.slice(startIdx, lastNonEmptyIdx + 1).join("\n").trim();
+      openingLines = preambleLines.slice(0, startIdx);
+    }
+  }
+  const preamble = openingLines.join("\n").trim();
+  const clauses = matches.map((m, i) => {
+    const end = i + 1 < matches.length ? matches[i + 1].idx : bodyEnd;
+    let contentStart = m.idx + 1;
+    let heading = m.inline;
+    if (!heading && contentStart < end && looksLikeHeading(lines[contentStart])) {
+      heading = lines[contentStart].trim();
+      contentStart += 1;
+    }
+    const content = lines.slice(contentStart, end).join("\n");
+    return { title: prettyHeading(heading), content: toHtmlParagraphs(content) };
+  });
+  return { preamble, closing, clauses };
+}
+
+function extractedTextToSingleClause(rawText: string): { title: string; content: string }[] {
+  const escapeHtml = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // PENTING: JANGAN nebak mana "baris kosong ganda = paragraf baru" vs mana
+  // "cuma baris tunggal biasa" lalu buang salah satunya — banyak extractor
+  // (pdf-parse termasuk, ketemu pas testing PDF hasil reportlab) BALIKIN
+  // TIAP BARIS dipisah newline TUNGGAL, TERMASUK antar paragraf yang beda
+  // (nggak ada baris kosong sama sekali di teks mentahnya walau di PDF-nya
+  // kelihatan berjarak). Kalau newline tunggal ini di-collapse jadi spasi
+  // (perilaku lama), SEMUA baris nempel jadi satu paragraf raksasa tanpa
+  // jeda — persis bug yang dilaporkan user. Jadi di sini setiap newline,
+  // TUNGGAL ATAUPUN GANDA, SELALU dipertahankan sbg <br> (baris kosong
+  // ganda dapat <br><br> — jarak lebih lega) — tanpa asumsi struktur
+  // apapun, cuma preserve line-break persis apa adanya dari hasil ekstrak.
+  const toHtmlParagraphs = (block: string): string => {
+    const trimmed = block.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    if (!trimmed) return "<p></p>";
+    const withBreaks = escapeHtml(trimmed)
+      .replace(/\n[ \t]*\n/g, "<br><br>")
+      .replace(/\n/g, "<br>");
+    return `<p>${withBreaks}</p>`;
+  };
+  const whole = rawText.trim();
+  return whole ? [{ title: "", content: toHtmlParagraphs(whole) }] : [];
+}
+
+// Ekstrak teks mentah dari PDF (teks asli, BUKAN hasil scan/gambar) atau
+// DOCX, lalu jadikan satu clause siap-edit (lihat extractedTextToSingleClause).
+// SENGAJA tanpa OCR (lihat diskusi produk) — utk PDF hasil scan/foto,
+// pdf-parse akan mengembalikan teks kosong/nyaris kosong, dan endpoint ini
+// otomatis melapor `supported:false` dgn pesan yg jelas, bukan berpura-pura
+// berhasil dgn hasil kosong/berantakan.
+app.post("/api/master-contracts/extract-text", requireAuth, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Tidak ada berkas diunggah" });
+  const name = (req.file.originalname || "").toLowerCase();
+  const mime = req.file.mimetype || "";
+  try {
+    let text = "";
+    let pageCount = 1;
+    if (mime === "application/pdf" || name.endsWith(".pdf")) {
+      // pdf-parse v2: API class-based (PDFParse), BUKAN lagi fungsi
+      // pdf(buffer) seperti v1 — lihat README paketnya utk migrasi.
+      const { PDFParse } = await import("pdf-parse");
+      const parser = new PDFParse({ data: req.file.buffer });
+      const result = await parser.getText();
+      await parser.destroy();
+      text = String(result?.text || "");
+      // pdf-parse v2 menyisipkan marker batas halaman "-- N of M --" di antara
+      // tiap halaman — kalau tidak dibuang, ikut kebawa jadi bagian ISI pasal
+      // terakhir per halaman (ketemu pas smoke test manual). Dibuang di sini,
+      // BUKAN cuma di-trim, karena posisinya bisa di tengah teks (antar
+      // halaman), bukan cuma di ujung.
+      text = text.replace(/^\s*--\s*\d+\s+of\s+\d+\s*--\s*$/gim, "");
+      // Footer/header "Halaman 1 dari 2" / "Page 1 of 2" dari dokumen ASLI
+      // (bukan marker pdf-parse di atas) ikut ke-extract juga karena
+      // posisinya literal di teks halaman — kalau tidak dibuang, muncul
+      // sebagai baris nyempil di tengah pasal (di batas antar halaman) atau
+      // di awal dokumen (ketuker jadi "bagian narasi pembuka"). Dibuang di
+      // sini juga, dgn alasan sama persis: bisa di tengah teks, bukan cuma
+      // di ujung.
+      text = text.replace(/^\s*Halaman\s+\d+\s+dari\s+\d+\s*$/gim, "");
+      text = text.replace(/^\s*Page\s+\d+\s+of\s+\d+\s*$/gim, "");
+      pageCount = Number(result?.total) || 1;
+    } else if (
+      mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+      name.endsWith(".docx")
+    ) {
+      const { value } = await mammoth.extractRawText({ buffer: req.file.buffer });
+      text = String(value || "");
+    } else {
+      return res.json({
+        supported: false,
+        reason: "Format berkas ini (selain PDF/.docx teks-asli) belum bisa dibaca otomatis tanpa OCR — misalnya .doc lama atau hasil scan/gambar.",
+        text: "",
+        clauses: [],
+      });
+    }
+    const cleaned = text.replace(/\u0000/g, "").trim();
+    // Heuristik deteksi "PDF ini sebenarnya hasil scan/gambar (atau raster
+    // hasil export screenshot, mis. html2canvas)" — dicek PER HALAMAN, bukan
+    // cuma total, supaya dokumen panjang tapi tiap halamannya minim teks
+    // (footer doang, isinya gambar) tetap kena deteksi. ~150 karakter/halaman
+    // adalah ambang longgar — kontrak sungguhan biasanya ratusan-ribuan
+    // karakter per halaman.
+    const avgCharsPerPage = cleaned.length / Math.max(1, pageCount);
+    if (cleaned.length < 20 || avgCharsPerPage < 150) {
+      return res.json({
+        supported: false,
+        reason: "Nyaris tidak ada teks yang bisa dibaca dari berkas ini — kemungkinan hasil scan/foto (gambar) atau PDF hasil export gambar, bukan PDF teks asli. Fitur ini sengaja TIDAK memakai OCR, jadi pasal tidak bisa diekstrak otomatis untuk berkas seperti ini.",
+        text: cleaned,
+        clauses: [],
+      });
+    }
+    // Coba dulu deteksi struktur "PASAL N" (lihat
+    // extractedTextToStructuredClauses) supaya dokumen upload yang
+    // formatnya rapi tampil terpisah per pasal + narasi pembuka di preview,
+    // sama seperti mode "Buat dari Template". Kalau tidak cukup yakin
+    // (< 2 heading pasal terdeteksi), jatuh balik ke perilaku lama: seluruh
+    // isi file ikut utuh (urut, apa adanya) jadi SATU pasal tanpa judul,
+    // tanpa preamble terpisah — supaya format dokumen yang tidak dikenali
+    // tetap aman (isi tidak pernah hilang/ketuker cuma karena tebakan
+    // struktur meleset).
+    const structured = extractedTextToStructuredClauses(cleaned);
+    const clauses = structured ? structured.clauses : extractedTextToSingleClause(cleaned);
+    const preambleOut = structured ? structured.preamble : "";
+    const closingOut = structured ? structured.closing : "";
+    res.json({ supported: true, text: cleaned, preamble: preambleOut, clauses, closing: closingOut });
+  } catch (err: any) {
+    logger.error({ err }, "Gagal mengekstrak teks dari berkas upload");
+    res.json({
+      supported: false,
+      reason: "Gagal membaca berkas ini (kemungkinan rusak atau format tidak didukung).",
+      text: "",
+      clauses: [],
+    });
+  }
+});
+
 // Upload lampiran dokumen DCS (Word/PDF langsung, bukan form terstruktur di
 // sistem) — hasilnya cuma URL, dipakai mengisi field `appendix[].url` yang
 // sudah ada, tanpa perubahan skema.
@@ -2051,6 +2446,7 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
     isAutoRenew: !!req.body.isAutoRenew,
     variables: req.body.variables || {},
     clauses: req.body.clauses || [],
+    creationMode: req.body.creationMode === "upload" ? "upload" : "smart",
     masterPdfUrl: req.body.masterPdfUrl || null,
     docType: req.body.docType || undefined,
     notes: req.body.notes || undefined,
@@ -2068,11 +2464,35 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
     party2IdLabel: req.body.party2IdLabel || undefined,
     party2IdNumber: req.body.party2IdNumber || undefined,
     customOpeningParagraph: req.body.customOpeningParagraph || undefined,
+    // closingStatement dari file upload — sekarang jarang terisi lewat
+    // extract-text (isi file sudah nyatu utuh di clause tunggal), tapi field
+    // ini tetap didukung utk override manual lewat editor/create payload.
+    closingStatement: req.body.closingStatement || undefined,
+    attachmentSections: Array.isArray(req.body.attachmentSections) ? req.body.attachmentSections : undefined,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
 
   db.contracts.push(newContract);
+
+  // Tautkan ke Pekerjaan Legal (opsional) — dropdown "Pilih Judul Pekerjaan
+  // Legal" di form ini. Begitu tertaut, status Pekerjaan Legal berhenti bisa
+  // diubah manual (lihat guard di PATCH /api/legal-jobs/:id/status) dan
+  // selalu mengikuti Contract.status ini (lihat withLinkedContract di atas).
+  const linkedLegalJobId = typeof req.body.linkedLegalJobId === "string" ? req.body.linkedLegalJobId.trim() : "";
+  if (linkedLegalJobId) {
+    const linkedJob = findLegalJob(db, tid, linkedLegalJobId);
+    if (linkedJob && !linkedJob.linkedContractId && linkedJob.status !== "menunggu_persetujuan" && linkedJob.status !== "ditolak") {
+      linkedJob.linkedContractId = newContract.id;
+      linkedJob.updatedAt = new Date().toISOString();
+      pushLegalTimeline(linkedJob, {
+        label: `Ditautkan ke Kontrak: ${newContract.title} (${newContract.contractNumber})`,
+        actor: req.user!.name,
+        detail: "Status Pekerjaan Legal ini selanjutnya mengikuti status Kontrak secara otomatis.",
+      }, linkedJob.updatedAt);
+    }
+  }
+
   pushAudit(db, req, {
     contractId: newContract.id, contractNumber: newContract.contractNumber,
     action: isUpload ? "Register Document" : "Create Contract",
@@ -2182,6 +2602,7 @@ app.put("/api/contracts/:id", requireAuth, requireRole("admin", "staff", "legal"
       templateId: req.body.templateId !== undefined ? req.body.templateId : oldContract.templateId,
       notes: req.body.notes !== undefined ? (req.body.notes || undefined) : oldContract.notes,
       amendmentAttachments: req.body.amendmentAttachments !== undefined ? req.body.amendmentAttachments : oldContract.amendmentAttachments,
+      attachmentSections: req.body.attachmentSections !== undefined ? req.body.attachmentSections : oldContract.attachmentSections,
       party1Address: req.body.party1Address !== undefined ? (req.body.party1Address || undefined) : oldContract.party1Address,
       party1Position: req.body.party1Position !== undefined ? (req.body.party1Position || undefined) : oldContract.party1Position,
       party1IdLabel: req.body.party1IdLabel !== undefined ? (req.body.party1IdLabel || undefined) : oldContract.party1IdLabel,
@@ -3149,6 +3570,7 @@ app.post("/api/contracts/:id/addendum", requireAuth, requireRole("admin", "staff
     docType: ADDENDUM_DOC_TYPE,
     amendsContractId: parent.id,
     amendmentAttachments: Array.isArray(req.body.amendmentAttachments) ? req.body.amendmentAttachments : [],
+    attachmentSections: Array.isArray(req.body.attachmentSections) ? req.body.attachmentSections : [],
     // Default 2 rangkap bermeterai (praktik umum: tiap pihak pegang 1 asli
     // bermeterai) — bisa diubah dari form Addendum, sama seperti kontrak baru.
     copies: buildContractCopies(Number(req.body.copyCount) || 2, req.body.hasMaterai !== false),
@@ -3196,8 +3618,15 @@ app.get("/api/contracts/:id/view-pdf", requireAuth, async (req: AuthedRequest, r
   const db = loadDB();
   const contract = findOwnedContract(db, req, req.params.id);
   if (!contract) return res.status(404).json({ error: "Contract not found" });
-  // Sebelum approval matrix selesai, dokumen tidak boleh diunduh sama sekali.
-  if (!["FullyApproved", "Aktif", "TidakAktif", "Archived", "Terminated"].includes(contract.status)) {
+  // Sebelum approval matrix selesai, dokumen TIDAK BOLEH DIBAGIKAN/DIUNDUH ke
+  // luar sistem (lihat gate serupa di /export-share, itu tetap ketat) — tapi
+  // endpoint INI juga dipakai utk sekadar MELIHAT berkas milik sendiri di
+  // dalam app (panel "Dokumen/Template Anda (Diunggah)" & "Berkas Resmi" di
+  // preview kontrak). Draft karenanya diizinkan lewat sini: user berhak lihat
+  // file yang BARU SAJA dia unggah sendiri walau belum diajukan approval —
+  // yang tetap diblokir cuma status "belum jelas sama sekali" (mis. hasil
+  // impor data lama tanpa status valid), bukan Draft yang wajar.
+  if (!["Draft", "FullyApproved", "Aktif", "TidakAktif", "Archived", "Terminated"].includes(contract.status)) {
     return res.status(403).json({ error: "Dokumen belum bisa diunduh — selesaikan approval matriks terlebih dahulu." });
   }
 
@@ -5469,6 +5898,325 @@ app.post("/api/dcs-external-review/:token/approve", apiLimiter, async (req, res)
   });
   saveDB(db);
   res.json({ success: true });
+});
+
+// ===== PEKERJAAN LEGAL (Dashboard Legal & Pekerjaan Legal) =====
+// Alur: Staff Legal generate/bagikan link formulir eksternal → pihak luar
+// mengisi tanpa akun → masuk sbg status "menunggu_persetujuan" → Staff Legal
+// Setujui (pilih Prioritas) → "draft" lalu lanjut alur kerja, ATAU Tidak
+// Disetujui (wajib alasan) → "ditolak". Satu entitas LegalJob dgn field
+// `status` mencakup seluruh siklus — lihat catatan desain di src/types.ts.
+// (Helper murni legalJobTenantList/findLegalJob/pushLegalTimeline/
+// withLinkedContract dipindah ke top-level module, dekat catsFor/rawSettingsFor
+// — lihat komentar di sana perihal kenapa.)
+
+
+// ----- Authed: kelola Pekerjaan Legal -----
+
+app.get("/api/legal-jobs", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const list = legalJobTenantList(db, tenantOf(req)).slice().sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  res.json(list.map((j) => withLinkedContract(db, j)));
+});
+
+// Daftar Pekerjaan Legal yang boleh ditautkan ke Kontrak baru — sudah lolos
+// approval (bukan menunggu_persetujuan/ditolak) dan belum ditautkan ke
+// kontrak lain. Dipakai dropdown "Pilih Judul Pekerjaan Legal" di form buat
+// Kontrak Eksternal.
+app.get("/api/legal-jobs/available-for-contract", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const list = legalJobTenantList(db, tenantOf(req))
+    .filter((j) => j.status !== "menunggu_persetujuan" && j.status !== "ditolak" && !j.linkedContractId)
+    .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+    .map((j) => ({ id: j.id, title: j.title, partnerName: j.partnerName, docType: j.docType, status: j.status }));
+  res.json(list);
+});
+
+app.get("/api/legal-jobs/:id", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  res.json(withLinkedContract(db, job));
+});
+
+// Setujui pekerjaan masuk → tentukan prioritas → pindah ke alur kerja utama (status: draft).
+app.patch("/api/legal-jobs/:id/approve", requireAuth, requireRole("admin", "legal", "manager", "staff"), (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  if (job.status !== "menunggu_persetujuan") return res.status(409).json({ error: "Pekerjaan ini sudah diproses sebelumnya." });
+  const priority = String(req.body?.priority || "") as LegalJobPriority;
+  if (!["Tinggi", "Sedang", "Rendah"].includes(priority)) return res.status(400).json({ error: "Prioritas wajib dipilih (Tinggi/Sedang/Rendah)." });
+  job.status = "draft";
+  job.priority = priority;
+  job.approvedByName = req.user!.name;
+  job.approvedAt = new Date().toISOString();
+  job.updatedAt = job.approvedAt;
+  pushLegalTimeline(job, { label: `Disetujui — Prioritas ${priority}`, actor: req.user!.name, detail: "Masuk ke alur kerja utama (status: Draft)." }, job.approvedAt);
+  pushAudit(db, req, { action: "Approve Pekerjaan Legal", details: `Menyetujui "${job.title}" (${job.partnerName}), prioritas ${priority}.` });
+  saveDB(db);
+  res.json(job);
+});
+
+// Tolak pekerjaan masuk → wajib alasan → arsip penolakan (status: ditolak), TIDAK masuk alur kerja utama.
+app.patch("/api/legal-jobs/:id/reject", requireAuth, requireRole("admin", "legal", "manager", "staff"), async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  if (job.status !== "menunggu_persetujuan") return res.status(409).json({ error: "Pekerjaan ini sudah diproses sebelumnya." });
+  const reason = String(req.body?.reason || "").trim();
+  if (!reason) return res.status(400).json({ error: "Keterangan/alasan penolakan wajib diisi." });
+  job.status = "ditolak";
+  job.rejectionReason = reason;
+  job.rejectedByName = req.user!.name;
+  job.rejectedAt = new Date().toISOString();
+  job.updatedAt = job.rejectedAt;
+  pushLegalTimeline(job, { label: "Tidak Disetujui", actor: req.user!.name, detail: reason }, job.rejectedAt);
+  pushAudit(db, req, { action: "Tolak Pekerjaan Legal", details: `Menolak "${job.title}" (${job.partnerName}). Alasan: ${reason}` });
+  saveDB(db);
+  // Notifikasi email opsional ke pengisi form — honest-degradation seperti fitur email lain (no-op kalau SMTP belum dikonfigurasi).
+  if (job.submitterEmail && isEmailConfigured()) {
+    try {
+      await sendEmail({
+        to: job.submitterEmail,
+        subject: `Permintaan Pekerjaan Legal Ditolak — ${job.title}`,
+        html: emailTemplate({
+          title: "Permintaan Pekerjaan Legal Tidak Disetujui",
+          bodyHtml: `<p>Permintaan Anda <b>"${job.title}"</b> (Partner: ${job.partnerName}) tidak disetujui oleh Tim Legal.</p><p><b>Alasan:</b> ${reason}</p>`,
+        }),
+      });
+    } catch (err) { logger.warn({ err }, "Gagal mengirim email penolakan Pekerjaan Legal"); }
+  }
+  res.json(job);
+});
+
+// Endpoint ini SENGAJA dinonaktifkan (bukan dihapus, supaya jelas kenapa kalau
+// ada yang cari) — status Pekerjaan Legal sekarang murni tampilan (read-only),
+// tidak pernah diubah manual lewat tombol "lanjut tahap" lagi. Satu-satunya
+// cara status berubah adalah mengikuti Contract.status setelah ditautkan
+// lewat form Buat Kontrak Eksternal (lihat withLinkedContract & POST
+// /api/contracts). Ini menjamin tabel Pekerjaan Legal & Monitoring Kontrak
+// tidak pernah bisa berbeda karena keduanya baca sumber yang sama.
+app.patch("/api/legal-jobs/:id/status", requireAuth, (req: AuthedRequest, res) => {
+  res.status(410).json({ error: "Status Pekerjaan Legal tidak lagi bisa diubah manual — status mengikuti Kontrak yang ditautkan secara otomatis." });
+});
+
+app.post("/api/legal-jobs/:id/notes", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ error: "Catatan tidak boleh kosong." });
+  const note: LegalJobNote = { id: "ljn-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6), text, authorName: req.user!.name, createdAt: new Date().toISOString() };
+  job.notes.push(note);
+  job.updatedAt = note.createdAt;
+  pushLegalTimeline(job, { label: "Catatan ditambahkan", actor: req.user!.name, detail: text.slice(0, 120) }, note.createdAt);
+  saveDB(db);
+  res.json(job);
+});
+
+app.post("/api/legal-jobs/:id/documents", requireAuth, uploadLegalDoc.single("file"), async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  if (!req.file) return res.status(400).json({ error: "Berkas wajib diunggah." });
+  try {
+    const key = uploadFileKey(req.file.originalname);
+    const stored = await storeFile(req.file.buffer, key, req.file.mimetype);
+    const doc: LegalJobDocument = {
+      id: "ljd-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+      name: req.file.originalname, url: stored.url, key: stored.key, mimeType: req.file.mimetype,
+      size: req.file.size, uploadedAt: new Date().toISOString(), uploadedBy: req.user!.name,
+    };
+    job.documents.push(doc);
+    job.updatedAt = doc.uploadedAt;
+    pushLegalTimeline(job, { label: `Dokumen diunggah: ${doc.name}`, actor: req.user!.name }, doc.uploadedAt);
+    saveDB(db);
+    res.json(job);
+  } catch (err: any) {
+    logger.error({ err }, "Gagal mengunggah dokumen Pekerjaan Legal");
+    res.status(500).json({ error: err?.message || "Gagal mengunggah berkas." });
+  }
+});
+
+// ----- Link formulir eksternal (Bagikan Link Formulir) -----
+
+function legalFormLinkFor(db: any, tid: string): LegalFormLink {
+  if (!db.legalFormLinks) db.legalFormLinks = [];
+  let link = (db.legalFormLinks as LegalFormLink[]).find((l) => l.tenantId === tid);
+  if (!link) {
+    link = { tenantId: tid, token: randomBytes(20).toString("hex"), active: true, createdAt: new Date().toISOString() };
+    db.legalFormLinks.push(link);
+  }
+  return link;
+}
+
+app.get("/api/legal-form-link", requireAuth, async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const link = legalFormLinkFor(db, tenantOf(req));
+  saveDB(db);
+  const url = `${shareBaseUrl(req)}/?legalFormToken=${link.token}`;
+  const qrDataUrl = await QRCode.toDataURL(url, { width: 240, margin: 1 });
+  res.json({ token: link.token, url, qrDataUrl, active: link.active });
+});
+
+// Reset/nonaktifkan link lama — token baru diterbitkan, link lama langsung tidak berlaku.
+app.post("/api/legal-form-link/regenerate", requireAuth, requireRole("admin", "legal", "manager"), async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const tid = tenantOf(req);
+  if (!db.legalFormLinks) db.legalFormLinks = [];
+  let link = (db.legalFormLinks as LegalFormLink[]).find((l) => l.tenantId === tid);
+  const now = new Date().toISOString();
+  if (!link) { link = { tenantId: tid, token: "", active: true, createdAt: now }; db.legalFormLinks.push(link); }
+  link.token = randomBytes(20).toString("hex");
+  link.regeneratedAt = now;
+  link.active = true;
+  pushAudit(db, req, { action: "Generate Ulang Link Formulir Pekerjaan Legal", details: "Link lama langsung tidak berlaku." });
+  saveDB(db);
+  const url = `${shareBaseUrl(req)}/?legalFormToken=${link.token}`;
+  const qrDataUrl = await QRCode.toDataURL(url, { width: 240, margin: 1 });
+  res.json({ token: link.token, url, qrDataUrl, active: link.active });
+});
+
+// ----- PUBLIK (tanpa akun) — Formulir Eksternal Pekerjaan Legal -----
+// Sama pola dgn /api/external-review/:token: di-scope ketat oleh token,
+// rate-limited, dan hanya membuka data seperlunya (bukan seluruh tenant).
+
+function resolveLegalFormLink(db: any, token: string): LegalFormLink | null {
+  if (!token || !db.legalFormLinks) return null;
+  const link = (db.legalFormLinks as LegalFormLink[]).find((l) => l.token === token);
+  if (!link || !link.active) return null;
+  return link;
+}
+
+app.get("/api/legal-form/:token", apiLimiter, (req, res) => {
+  const db = loadDB();
+  const link = resolveLegalFormLink(db, req.params.token);
+  if (!link) return res.status(404).json({ error: "Link formulir tidak valid atau sudah tidak berlaku." });
+  const tenant = (db.tenants as any[]).find((t) => t.id === link.tenantId);
+  const jobs = legalJobTenantList(db, link.tenantId);
+  // Jenis Dokumen memakai SUMBER YANG SAMA dengan Kontrak Eksternal
+  // (Konfigurasi > Master Data > Jenis Dokumen) — supaya admin cukup kelola
+  // satu daftar, bukan dua daftar terpisah yang gampang tidak sinkron.
+  const md = withSettingsDefaults(rawSettingsFor(db, link.tenantId)).masterData;
+  const docTypeNames = (md?.docTypes || []).map((d: any) => (typeof d === "string" ? d : d.name)).filter(Boolean);
+  const uniq = (arr: (string | undefined)[]) => Array.from(new Set(arr.filter(Boolean))) as string[];
+  res.json({
+    tenantName: tenant?.name || "Perusahaan",
+    docTypeOptions: uniq(docTypeNames),
+    partnerSuggestions: uniq(jobs.map((j) => j.partnerName)),
+    picSuggestions: uniq([...jobs.map((j) => j.picName), "Marketing", "Account Executive", "Business Development", "Operasional"]),
+  });
+});
+
+app.post("/api/legal-form/:token/submit", apiLimiter, uploadLegalDoc.single("file"), async (req, res) => {
+  const db = loadDB();
+  const link = resolveLegalFormLink(db, req.params.token);
+  if (!link) return res.status(404).json({ error: "Link formulir tidak valid atau sudah tidak berlaku." });
+
+  const title = String(req.body?.title || "").trim();
+  const partnerName = String(req.body?.partnerName || "").trim();
+  const docType = String(req.body?.docType || "").trim();
+  const picName = String(req.body?.picName || "").trim();
+  const deadline = String(req.body?.deadline || "").trim();
+  const description = String(req.body?.description || "").trim();
+  const submitterName = String(req.body?.submitterName || "").trim();
+  const submitterEmail = String(req.body?.submitterEmail || "").trim();
+  const missing = [
+    !title && "Judul Pekerjaan", !partnerName && "Partner/Pihak", !docType && "Jenis Dokumen",
+    !picName && "PIC Pemberi Pekerjaan", !deadline && "Deadline",
+  ].filter(Boolean);
+  if (missing.length) return res.status(400).json({ error: `Field wajib belum diisi: ${missing.join(", ")}.` });
+
+  const now = new Date().toISOString();
+  const documents: LegalJobDocument[] = [];
+  if (req.file) {
+    try {
+      const key = uploadFileKey(req.file.originalname);
+      const stored = await storeFile(req.file.buffer, key, req.file.mimetype);
+      documents.push({
+        id: "ljd-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+        name: req.file.originalname, url: stored.url, key: stored.key, mimeType: req.file.mimetype,
+        size: req.file.size, uploadedAt: now, uploadedBy: "Eksternal (form)",
+      });
+    } catch (err) {
+      logger.error({ err }, "Gagal mengunggah lampiran formulir Pekerjaan Legal eksternal");
+      return res.status(500).json({ error: "Gagal mengunggah lampiran. Coba lagi atau kirim tanpa lampiran." });
+    }
+  }
+
+  const job: LegalJob = {
+    id: "lj-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+    tenantId: link.tenantId, title, partnerName, docType, picName, deadline,
+    description: description || undefined, documents, status: "menunggu_persetujuan",
+    source: "eksternal", submitterName: submitterName || undefined, submitterEmail: submitterEmail || undefined,
+    notes: [], timeline: [{ id: "ljt-0", label: "Request Masuk (via Formulir Eksternal)", actor: submitterName || "Eksternal", at: now }],
+    createdAt: now, updatedAt: now,
+  };
+  if (!db.legalJobs) db.legalJobs = [];
+  db.legalJobs.push(job);
+  pushNotif(db, link.tenantId, {
+    title: "Pekerjaan Legal Baru Menunggu Persetujuan",
+    message: `"${title}" dari ${partnerName} (via formulir eksternal) menunggu persetujuan Staff Legal.`,
+    type: "info",
+  });
+  saveDB(db);
+  res.json({ success: true, message: "Terima kasih, permintaan Anda sudah kami terima dan akan diproses oleh tim Legal." });
+});
+
+// ----- Dashboard Legal: agregasi ringkasan real-time -----
+
+app.get("/api/legal-dashboard", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const tid = tenantOf(req);
+  const jobs = legalJobTenantList(db, tid);
+  const contracts = (db.contracts as Contract[]).filter((c) => c.tenantId === tid);
+  const now = Date.now();
+
+  const statusCounts: Record<string, number> = {};
+  for (const j of jobs) statusCounts[j.status] = (statusCounts[j.status] || 0) + 1;
+
+  const dayDiff = (dateStr?: string) => (dateStr ? (new Date(dateStr).getTime() - now) / 86400000 : Infinity);
+  const monitoringKontrak = {
+    aktif: contracts.filter((c) => c.status === "Aktif").length,
+    akanBerakhir30: contracts.filter((c) => c.status === "Aktif" && dayDiff(c.endDate) >= 0 && dayDiff(c.endDate) <= 30).length,
+    akanBerakhir60: contracts.filter((c) => c.status === "Aktif" && dayDiff(c.endDate) > 30 && dayDiff(c.endDate) <= 60).length,
+    akanBerakhir90: contracts.filter((c) => c.status === "Aktif" && dayDiff(c.endDate) > 60 && dayDiff(c.endDate) <= 90).length,
+    expired: contracts.filter((c) => c.status === "Aktif" && dayDiff(c.endDate) < 0).length,
+  };
+
+  // Modul Surat-Menyurat belum dibangun di iterasi ini (di luar cakupan 2
+  // halaman yang diminta) — dikembalikan sbg "belum tersedia" apa adanya,
+  // BUKAN angka nol yang dipalsukan seolah-olah datanya nyata.
+  const suratMenyurat = { available: false };
+
+  const activeJobs = jobs.filter((j) => !["selesai", "ditolak", "arsip"].includes(j.status));
+  const needsFollowUp = activeJobs
+    .slice()
+    .sort((a, b) => dayDiff(a.deadline) - dayDiff(b.deadline))
+    .slice(0, 8)
+    .map((j) => ({ id: j.id, title: j.title, status: j.status, priority: j.priority, deadline: j.deadline, partnerName: j.partnerName }));
+
+  const deadlineThisWeek = activeJobs
+    .filter((j) => dayDiff(j.deadline) >= 0 && dayDiff(j.deadline) <= 7)
+    .sort((a, b) => dayDiff(a.deadline) - dayDiff(b.deadline))
+    .map((j) => ({ id: j.id, title: j.title, docType: j.docType, status: j.status, deadline: j.deadline }));
+
+  const recentActivity = jobs
+    .flatMap((j) => j.timeline.map((t) => ({ ...t, jobId: j.id, jobTitle: j.title })))
+    .sort((a, b) => (b.at || "").localeCompare(a.at || ""))
+    .slice(0, 12);
+
+  res.json({
+    statusCounts,
+    totalJobs: jobs.length,
+    monitoringKontrak,
+    suratMenyurat,
+    needsFollowUp,
+    deadlineThisWeek,
+    recentActivity,
+    chartByStatus: LEGAL_JOB_WORKFLOW_STATUSES.map((s) => ({ status: s, count: statusCounts[s] || 0 })),
+  });
 });
 
 // ===== WEB PUSH NOTIFICATION =====

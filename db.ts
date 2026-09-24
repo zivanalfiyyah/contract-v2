@@ -81,6 +81,12 @@ const COLLECTIONS: ColSpec[] = [
   // Anggaran per kategori/departemen/tahun — dibandingkan dengan total nilai
   // kontrak aktual di panel Anggaran vs Nilai Kontrak.
   { table: "budgets", key: "id", prop: "budgets" },
+  // Pekerjaan Legal (Dashboard Legal & Pekerjaan Legal) — satu entitas per
+  // pekerjaan, status mencakup seluruh siklus (menunggu_persetujuan..selesai
+  // /ditolak). Lihat catatan desain di src/types.ts.
+  { table: "legal_jobs", key: "id", prop: "legalJobs" },
+  // Link formulir eksternal, satu per tenant (PK = tenantId, bukan id).
+  { table: "legal_form_links", key: "tenantId", prop: "legalFormLinks" },
 ];
 
 // --- Schema bootstrap ---------------------------------------------------
@@ -109,6 +115,8 @@ async function bootstrapSchema(client: PoolClient) {
     CREATE TABLE IF NOT EXISTS internal_docs (id TEXT PRIMARY KEY, data JSONB NOT NULL, seq BIGSERIAL);
     CREATE TABLE IF NOT EXISTS number_counters (id TEXT PRIMARY KEY, data JSONB NOT NULL, seq BIGSERIAL);
     CREATE TABLE IF NOT EXISTS budgets (id TEXT PRIMARY KEY, data JSONB NOT NULL, seq BIGSERIAL);
+    CREATE TABLE IF NOT EXISTS legal_jobs (id TEXT PRIMARY KEY, data JSONB NOT NULL, seq BIGSERIAL);
+    CREATE TABLE IF NOT EXISTS legal_form_links ("tenantId" TEXT PRIMARY KEY, data JSONB NOT NULL, seq BIGSERIAL);
     CREATE TABLE IF NOT EXISTS categories (
       "tenantId" TEXT NOT NULL, name TEXT NOT NULL, sort_order INTEGER NOT NULL,
       PRIMARY KEY ("tenantId", name)
@@ -131,6 +139,8 @@ async function bootstrapSchema(client: PoolClient) {
     CREATE INDEX IF NOT EXISTS idx_subfolders_tenant_category ON sub_folders ((data->>'tenantId'), (data->>'category'));
     CREATE INDEX IF NOT EXISTS idx_internal_docs_tenant ON internal_docs ((data->>'tenantId'));
     CREATE INDEX IF NOT EXISTS idx_budgets_tenant ON budgets ((data->>'tenantId'));
+    CREATE INDEX IF NOT EXISTS idx_legal_jobs_tenant ON legal_jobs ((data->>'tenantId'));
+    CREATE INDEX IF NOT EXISTS idx_legal_jobs_status ON legal_jobs ((data->>'status'));
   `);
 }
 

@@ -216,3 +216,11 @@
     background-color: var(--scrollbar-thumb-hover);
   }
 }
+
+/* Transisi halus saat pindah tab di toolbar editor dokumen (ribbon). */
+@keyframes ribbon-fade {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ribbon-fade { animation: ribbon-fade 0.18s ease-out; }
+@media (prefers-reduced-motion: reduce) { .ribbon-fade { animation: none; } }

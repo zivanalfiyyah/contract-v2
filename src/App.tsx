@@ -92,6 +92,8 @@ import {
   Table2,
   Minus as MinusIcon,
   Rows3,
+  Columns2,
+  Rows2,
   Columns3,
   Palette,
   QrCode,
@@ -944,6 +946,22 @@ function useGuestNotice() {
   };
   useEffect(() => () => { if (timerRef.current) window.clearTimeout(timerRef.current); }, []);
   return { notice, notify, dismissNotice: () => setNotice(null) };
+}
+
+// Susunan dwibahasa (mode dokumen "ID+EN"): "side" = Indonesia | Inggris
+// berdampingan (kiri-kanan), "stacked" = Indonesia di atas, Inggris di bawah.
+// Satu komponen dipakai semua bagian dokumen (judul, narasi pembuka, pasal,
+// penutup) supaya pilihan susunan selalu konsisten se-dokumen.
+function BilingualPair({ stacked, id, en, className = "", cellClassName = "" }: {
+  stacked?: boolean; id: React.ReactNode; en: React.ReactNode; className?: string; cellClassName?: string;
+}) {
+  const cell = `${stacked ? "" : "flex-1"} min-w-0 ${cellClassName}`.trim();
+  return (
+    <div className={`${stacked ? "space-y-3" : "flex gap-3"} ${className}`.trim()}>
+      <div className={cell}>{id}</div>
+      <div className={cell}>{en}</div>
+    </div>
+  );
 }
 
 function GuestNotice({ notice, onDismiss }: { notice: { text: string; kind: "error" | "success" } | null; onDismiss: () => void }) {
@@ -1891,6 +1909,8 @@ function DocToolbar() {
   // menambah beban awal aplikasi & tidak berisiko ke fitur lain kalau
   // gagal dimuat (kegagalannya kekurung di dalam fungsi ini saja).
   const [pdfBusy, setPdfBusy] = useState(false);
+  // Tab aktif ala ribbon Word: tiap tab cuma menampilkan tool miliknya.
+  const [tab, setTab] = useState<"text" | "para" | "insert" | "table">("text");
   const insertPdfAsImages = async (file: File) => {
     setPdfBusy(true);
     try {
@@ -1935,7 +1955,7 @@ function DocToolbar() {
   };
   const Btn = ({ onClick, title, children }: { onClick: () => void; title: string; children: any }) => (
     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
-      className="min-w-[34px] h-[34px] px-2 text-sm font-bold bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 hover:border-slate-700 text-slate-200 cursor-pointer flex items-center justify-center transition-colors">
+      className="min-w-[30px] h-[30px] px-1.5 text-[13px] font-bold rounded-md hover:bg-indigo-500/10 text-slate-300 hover:text-indigo-400 cursor-pointer flex items-center justify-center transition-colors duration-150">
       {children}
     </button>
   );
@@ -2009,19 +2029,13 @@ function DocToolbar() {
     if (activeStructural.table) { activeStructural.table.remove(); activeStructural.table = null; activeStructural.cell = null; return; }
     if (activeStructural.img) { activeStructural.img.remove(); activeStructural.img = null; return; }
   };
-  // Judul tiap seksi — desain baru meniru pola "kartu bersekat" (label besar
-  // di atas, lalu isinya) supaya pemula bisa langsung tahu dari judulnya
-  // seksi mana yang mengatur apa, tanpa harus menghover satu-satu dulu.
-  const SectionTitle = ({ children }: { children: any }) => (
-    <p className="text-[11px] font-bold uppercase tracking-wide text-slate-400 mb-1.5">{children}</p>
-  );
   // Kartu tombol besar (ikon di atas, label di bawah) — dipakai khusus utk
   // seksi "Sisipkan Dokumen", meniru tampilan kartu grid yang diminta.
   const InsertCard = ({ onClick, title, icon, label }: { onClick: () => void; title: string; icon: any; label: string }) => (
     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
-      className="flex flex-col items-center justify-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 hover:bg-slate-800 hover:border-slate-700 py-3 px-2 text-slate-300 cursor-pointer transition-colors">
+      className="flex flex-col items-center justify-center gap-1 rounded-md hover:bg-indigo-500/10 py-1.5 px-2.5 min-w-[64px] text-slate-300 hover:text-indigo-400 cursor-pointer transition-colors duration-150">
       {icon}
-      <span className="text-[10.5px] font-medium leading-none text-center">{label}</span>
+      <span className="text-[10px] font-medium leading-none text-center whitespace-nowrap">{label}</span>
     </button>
   );
   // Sama seperti InsertCard, tapi utk aksi yg butuh <input type="file"> atau
@@ -2032,10 +2046,10 @@ function DocToolbar() {
     <label
       onMouseDown={(e) => e.preventDefault()}
       title={title}
-      className={`relative flex flex-col items-center justify-center gap-1.5 rounded-xl border border-slate-800 bg-slate-950 py-3 px-2 text-slate-300 transition-colors ${disabled ? "opacity-50 cursor-wait" : "hover:bg-slate-800 hover:border-slate-700 cursor-pointer"}`}
+      className={`relative flex flex-col items-center justify-center gap-1 rounded-md py-1.5 px-2.5 min-w-[64px] text-slate-300 transition-colors ${disabled ? "opacity-50 cursor-wait" : "hover:bg-indigo-500/10 hover:text-indigo-400 cursor-pointer"}`}
     >
       {icon}
-      <span className="text-[10.5px] font-medium leading-none text-center">{label}</span>
+      <span className="text-[10px] font-medium leading-none text-center whitespace-nowrap">{label}</span>
       {children}
     </label>
   );
@@ -2045,80 +2059,80 @@ function DocToolbar() {
   // dulu; dikembalikan jadi tombol langsung yang kelihatan semua sekaligus.
   const LabelBtn = ({ onClick, title, icon, label, danger }: { onClick: () => void; title: string; icon: any; label: string; danger?: boolean }) => (
     <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={onClick} title={title}
-      className={`h-[34px] px-2.5 text-xs font-medium bg-slate-950 border border-slate-800 rounded-lg hover:bg-slate-800 hover:border-slate-700 flex items-center gap-1.5 cursor-pointer transition-colors ${danger ? "text-rose-400" : "text-slate-300"}`}>
+      className={`h-[30px] px-2.5 text-xs font-medium rounded-md flex items-center gap-1.5 cursor-pointer transition-colors duration-150 ${danger ? "text-rose-400 hover:bg-rose-500/10" : "text-slate-300 hover:bg-indigo-500/10 hover:text-indigo-400"}`}>
       {icon}<span>{label}</span>
     </button>
   );
+  const TabBtn = ({ id, label, hint }: { id: "text" | "para" | "insert" | "table"; label: string; hint: string }) => (
+    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => setTab(id)} title={hint}
+      className={`relative px-3.5 py-1.5 mb-0.5 text-xs font-semibold rounded-md cursor-pointer whitespace-nowrap transition-all duration-200 ${
+        tab === id
+          ? "bg-indigo-500/15 text-indigo-400"
+          : "text-slate-400 hover:bg-indigo-500/10 hover:text-indigo-400"
+      }`}>
+      {label}
+      {/* Garis bawah: melebar dari tengah saat tab dipilih (teks tetap terlihat) */}
+      <span className={`absolute left-2 right-2 -bottom-0.5 h-0.5 rounded-full bg-indigo-500 origin-center transition-transform duration-200 ${tab === id ? "scale-x-100" : "scale-x-0"}`} />
+    </button>
+  );
   return (
-    <div className="p-3 border border-slate-800 rounded-2xl bg-slate-900 shadow-xl mb-3 space-y-3.5">
-      {/* Baris bantuan singkat — cuma sekali tampil di paling atas, supaya
-          pemula tahu tiap ikon punya keterangan kalau kursor diarahkan ke
-          situ, tanpa harus dijelaskan ulang di tiap tombol. */}
-      <p className="text-[10px] text-slate-500 flex items-center gap-1">
-        <HelpCircle className="w-3 h-3 shrink-0" /> Arahkan kursor ke tiap tombol untuk melihat fungsinya.
-      </p>
+    <div className="border border-slate-800 rounded-xl bg-slate-900 shadow-lg mb-3 overflow-hidden">
+      {/* Ribbon ringkas ala Microsoft Word: baris tab di atas, di bawahnya
+          HANYA tool milik tab yang aktif. Tombol tidak mencuri fokus dari
+          area teks (onMouseDown preventDefault), jadi seleksi tetap aman
+          saat pindah tab. Tooltip tiap tombol tetap ada lewat atribut title. */}
+      <div className="flex items-end gap-1 px-2 pt-1.5 border-b border-slate-800 overflow-x-auto">
+        <TabBtn id="text" label="Text" hint="Text Styling — gaya, font, tebal/miring/garis bawah" />
+        <TabBtn id="para" label="Paragraph" hint="Paragraph & Lists — perataan, bullet, nomor, kutipan" />
+        <TabBtn id="insert" label="Insert" hint="Document Insertion — gambar, link, tabel, PDF, garis, data kontrak" />
+        <TabBtn id="table" label="Table" hint="Table Tools — ubah baris/kolom/warna tabel" />
+      </div>
 
-      {/* Seksi 1: "Text Styling" — Undo/Redo, gaya paragraf + font (dropdown
-          diperbesar), lalu Bold/Italic/Underline/dst. */}
-      <div>
-        <SectionTitle>Text Styling</SectionTitle>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <Btn onClick={() => exec("undo")} title="Undo — batalkan perubahan terakhir"><RotateCcw className="w-4 h-4" /></Btn>
-          <Btn onClick={() => exec("redo")} title="Redo — ulangi perubahan yang dibatalkan"><RotateCw className="w-4 h-4" /></Btn>
-          <span className="w-px h-5 bg-slate-800 mx-1" />
-          <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("formatBlock", e.target.value); e.target.selectedIndex = 0; }}
-            title="Gaya teks" className="h-[34px] px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 cursor-pointer min-w-[110px]">
-            <option value="">Teks Normal</option>
-            <option value="h3">Judul</option>
-            <option value="blockquote">Kutipan</option>
-          </select>
-          <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("fontName", e.target.value); e.target.selectedIndex = 0; }}
-            title="Jenis huruf" className="h-[34px] px-2 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 cursor-pointer min-w-[90px]">
-            <option value="">Font</option>
-            {RICH_FONT_OPTIONS.map((f) => (
-              <option key={f} value={f} style={{ fontFamily: /\s/.test(f) ? `'${f}'` : f }}>{f}</option>
-            ))}
-          </select>
-          <span className="w-px h-5 bg-slate-800 mx-1" />
-          <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+      <div key={tab} className="px-2 py-1.5 min-h-[46px] flex flex-wrap items-center gap-1 ribbon-fade">
+        {tab === "text" && (
+          <>
+            <Btn onClick={() => exec("undo")} title="Undo — batalkan perubahan terakhir"><RotateCcw className="w-4 h-4" /></Btn>
+            <Btn onClick={() => exec("redo")} title="Redo — ulangi perubahan yang dibatalkan"><RotateCw className="w-4 h-4" /></Btn>
+            <span className="w-px h-5 bg-slate-700/70 mx-1" />
+            <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("formatBlock", e.target.value); e.target.selectedIndex = 0; }}
+              title="Gaya teks" className="h-[30px] px-2 text-xs bg-slate-800/60 hover:bg-indigo-500/10 border border-transparent rounded-md text-slate-200 cursor-pointer min-w-[110px]">
+              <option value="">Teks Normal</option>
+              <option value="h3">Judul</option>
+              <option value="blockquote">Kutipan</option>
+            </select>
+            <select onMouseDown={(e) => e.stopPropagation()} onChange={(e) => { exec("fontName", e.target.value); e.target.selectedIndex = 0; }}
+              title="Jenis huruf" className="h-[30px] px-2 text-xs bg-slate-800/60 hover:bg-indigo-500/10 border border-transparent rounded-md text-slate-200 cursor-pointer min-w-[90px]">
+              <option value="">Font</option>
+              {RICH_FONT_OPTIONS.map((f) => (
+                <option key={f} value={f} style={{ fontFamily: /\s/.test(f) ? `'${f}'` : f }}>{f}</option>
+              ))}
+            </select>
+            <span className="w-px h-5 bg-slate-700/70 mx-1" />
             <Btn onClick={() => exec("bold")} title="Tebal (Bold)"><b>B</b></Btn>
             <Btn onClick={() => exec("italic")} title="Miring (Italic)"><i>I</i></Btn>
             <Btn onClick={() => exec("underline")} title="Garis bawah (Underline)"><u>U</u></Btn>
             <Btn onClick={() => exec("strikeThrough")} title="Coret (Strikethrough)"><Strikethrough className="w-4 h-4" /></Btn>
-          </div>
-          <Btn onClick={() => exec("removeFormat")} title="Bersihkan semua format teks yang dipilih"><Eraser className="w-4 h-4" /></Btn>
-        </div>
-      </div>
+            <span className="w-px h-5 bg-slate-700/70 mx-1" />
+            <Btn onClick={() => exec("removeFormat")} title="Bersihkan semua format teks yang dipilih"><Eraser className="w-4 h-4" /></Btn>
+          </>
+        )}
 
-      {/* Seksi 2: "Paragraph & Lists" — perataan teks + daftar/bullet. */}
-      <div>
-        <SectionTitle>Paragraph &amp; Lists</SectionTitle>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <div className="flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+        {tab === "para" && (
+          <>
             <Btn onClick={() => exec("justifyLeft")} title="Rata kiri"><AlignLeft className="w-4 h-4" /></Btn>
             <Btn onClick={() => exec("justifyCenter")} title="Rata tengah"><AlignCenter className="w-4 h-4" /></Btn>
             <Btn onClick={() => exec("justifyRight")} title="Rata kanan"><AlignRight className="w-4 h-4" /></Btn>
             <Btn onClick={() => exec("justifyFull")} title="Rata kiri-kanan (rapi di kedua sisi)"><AlignJustify className="w-4 h-4" /></Btn>
-          </div>
-          <span className="w-px h-5 bg-slate-800 mx-1" />
-          <Btn onClick={() => exec("insertUnorderedList")} title="Daftar butir (bullet list)">
-            <List className="w-4 h-4" />
-          </Btn>
-          <span className="text-[10px] text-slate-500 -ml-1">Bullet</span>
-          <Btn onClick={() => exec("insertOrderedList")} title="Daftar bernomor">
-            <ListOrdered className="w-4 h-4" />
-          </Btn>
-          <span className="text-[10px] text-slate-500 -ml-1">Lists</span>
-          <Btn onClick={() => exec("formatBlock", "blockquote")} title="Kutipan"><Quote className="w-4 h-4" /></Btn>
-        </div>
-      </div>
+            <span className="w-px h-5 bg-slate-700/70 mx-1" />
+            <Btn onClick={() => exec("insertUnorderedList")} title="Daftar butir (bullet list)"><List className="w-4 h-4" /></Btn>
+            <Btn onClick={() => exec("insertOrderedList")} title="Daftar bernomor"><ListOrdered className="w-4 h-4" /></Btn>
+            <span className="w-px h-5 bg-slate-700/70 mx-1" />
+            <Btn onClick={() => exec("formatBlock", "blockquote")} title="Kutipan"><Quote className="w-4 h-4" /></Btn>
+          </>
+        )}
 
-      {/* Seksi 3: "Document Insertion" — SEMUA tombol tambah-sesuatu jadi
-          kartu grid besar dengan ikon + label, meniru tampilan kartu yang
-          diminta (Insert Image / Insert Link / Insert Table / dst). */}
-      <div>
-        <SectionTitle>Document Insertion</SectionTitle>
-        <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-1.5">
+        {tab === "insert" && (
+          <>
           <InsertCardWrap
             title="Sisipkan gambar (JPG/PNG) — klik gambarnya lagi setelah disisipkan utk memperbesar/menggeser"
             icon={<ImageIcon className="w-4 h-4" />}
@@ -2221,24 +2235,21 @@ function DocToolbar() {
               ))}
             </select>
           </InsertCardWrap>
-        </div>
-      </div>
+          </>
+        )}
 
-      {/* Seksi 4: Edit tabel — tombol LANGSUNG (bukan dropdown), supaya semua
-          aksi kelihatan sekaligus tanpa perlu klik buka dulu. Klik dulu DI
-          DALAM tabel yang mau diubah, baru pilih tombol aksinya di sini. */}
-      <div>
-        <SectionTitle>Table Tools</SectionTitle>
-        <p className="text-[10px] text-slate-500 -mt-1 mb-1.5">Klik dulu di dalam tabel yang mau diubah, lalu pilih aksi di bawah ini.</p>
-        <div className="flex flex-wrap items-center gap-1.5">
-          <LabelBtn onClick={addTableRow} title="Tambah baris baru di bagian bawah tabel" icon={<Rows3 className="w-3.5 h-3.5" />} label="+ Baris" />
+        {tab === "table" && (
+          <>
+            <LabelBtn onClick={addTableRow} title="Tambah baris baru di bagian bawah tabel" icon={<Rows3 className="w-3.5 h-3.5" />} label="+ Baris" />
           <LabelBtn onClick={addTableCol} title="Tambah kolom baru di tabel" icon={<Columns3 className="w-3.5 h-3.5" />} label="+ Kolom" />
           <LabelBtn onClick={removeTableRow} title="Hapus baris tempat sel yang terakhir Anda klik" icon={<Rows3 className="w-3.5 h-3.5" />} label="− Baris" />
           <LabelBtn onClick={removeTableCol} title="Hapus kolom tempat sel yang terakhir Anda klik" icon={<Columns3 className="w-3.5 h-3.5" />} label="− Kolom" />
           <LabelBtn onClick={colorTableHeader} title="Ubah warna baris header tabel" icon={<Palette className="w-3.5 h-3.5" />} label="Warna Header" />
-          <span className="w-px h-5 bg-slate-800 mx-1" />
+          <span className="w-px h-5 bg-slate-700/70 mx-1" />
           <LabelBtn onClick={deleteSelectedElement} title="Hapus tabel atau gambar yang terakhir Anda klik" icon={<Trash2 className="w-3.5 h-3.5" />} label="Hapus" danger />
-        </div>
+            <span className="hidden md:inline text-[10px] text-slate-500 ml-2">Klik dulu di dalam tabel yang mau diubah.</span>
+          </>
+        )}
       </div>
     </div>
   );
@@ -7007,6 +7018,19 @@ export default function App() {
     } finally {
       setIsOcrRunning(false);
     }
+  };
+
+  // Susunan dwibahasa (hanya berlaku saat mode dokumen "ID+EN"):
+  // "side" = berdampingan kiri-kanan (default lama), "stacked" = atas-bawah.
+  // Preferensi tampilan saja — tidak mengubah naskah, jadi ikut diizinkan
+  // server walau kontrak sudah terkunci (sama seperti documentLanguage).
+  const bilingualStacked = selectedContract?.bilingualLayout === "stacked";
+  const handleSetBilingualLayout = async (layout: "side" | "stacked") => {
+    if (!selectedContract) return;
+    if ((selectedContract.bilingualLayout || "side") === layout) return;
+    const updated = { ...selectedContract, bilingualLayout: layout };
+    setSelectedContract(updated);
+    await handleUpdateContractDraft(`Ubah susunan dwibahasa ke ${layout === "stacked" ? "atas-bawah" : "berdampingan"}`, updated);
   };
 
   // Ubah bahasa tampil dokumen. Kalau butuh teks Inggris tapi belum ada
@@ -17147,6 +17171,30 @@ export default function App() {
                       );
                     })}
                   </div>
+                  {/* Susunan dwibahasa — cuma relevan di mode ID+EN. */}
+                  {(selectedContract.documentLanguage || "id") === "bilingual" && (
+                    <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-xl p-0.5" title="Susunan dua bahasa pada dokumen.">
+                      {([
+                        { k: "side" as const, label: "Kiri-Kanan", tip: "Berdampingan — Indonesia di kiri, Inggris di kanan", Icon: Columns2 },
+                        { k: "stacked" as const, label: "Atas-Bawah", tip: "Berselang — Indonesia di atas, Inggris di bawah (lebar penuh)", Icon: Rows2 },
+                      ]).map(({ k, label, tip, Icon }) => {
+                        const active = (selectedContract.bilingualLayout || "side") === k;
+                        return (
+                          <button
+                            key={k}
+                            onClick={() => handleSetBilingualLayout(k)}
+                            title={tip}
+                            className={`px-2.5 py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer flex items-center gap-1 ${
+                              active ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"
+                            }`}
+                          >
+                            <Icon className="w-3.5 h-3.5" />
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
                   <button
                     onClick={handleExportPdf}
                     disabled={isExportingPdf || !isContractDownloadable(selectedContract)}
@@ -17530,10 +17578,7 @@ export default function App() {
                           if (docLang === "en" && hasHeaderEn) return enBlock;
                           if (docLang === "bilingual" && hasHeaderEn) {
                             return (
-                              <div className="flex gap-3 text-center">
-                                <div className="flex-1 min-w-0 space-y-1">{idBlock}</div>
-                                <div className="flex-1 min-w-0 space-y-1">{enBlock}</div>
-                              </div>
+                              <BilingualPair stacked={bilingualStacked} className="text-center" cellClassName="space-y-1" id={idBlock} en={enBlock} />
                             );
                           }
                           return idBlock;
@@ -17559,22 +17604,22 @@ export default function App() {
                           }
                           if (docLang === "bilingual" && hasHeaderEn) {
                             return (
-                              <div className="flex gap-3 text-center">
-                                <div className="flex-1 min-w-0 space-y-1">
+                              <BilingualPair stacked={bilingualStacked} className="text-center" cellClassName="space-y-1"
+                                id={<>
                                   <h4 className="font-bold text-slate-100 tracking-wide text-sm uppercase">
                                     {docTypeId}
                                   </h4>
                                   <p className="text-xs text-slate-400">{selectedContract.title}</p>
                                   <p className="text-xs tracking-wider">NOMOR: {selectedContract.contractNumber}</p>
-                                </div>
-                                <div className="flex-1 min-w-0 space-y-1">
+                                </>}
+                                en={<>
                                   <h4 className="font-bold text-slate-100 tracking-wide text-sm uppercase">
                                     {docTypeEn}
                                   </h4>
                                   <p className="text-xs text-slate-400">{titleEn}</p>
                                   <p className="text-xs tracking-wider">NUMBER: {selectedContract.contractNumber}</p>
-                                </div>
-                              </div>
+                                </>}
+                              />
                             );
                           }
                           return (
@@ -17660,10 +17705,7 @@ export default function App() {
                           if (docLang === "id") return idBlock;
                           if (docLang === "en") return enBlock;
                           return (
-                            <div className="flex gap-3">
-                              <div className="flex-1 min-w-0">{idBlock}</div>
-                              <div className="flex-1 min-w-0">{enBlock}</div>
-                            </div>
+                            <BilingualPair stacked={bilingualStacked} id={idBlock} en={enBlock} />
                           );
                         }
                         // preambleEn diisi server saat /translate (lihat composeContractPreambleText
@@ -17713,14 +17755,7 @@ export default function App() {
                         // dengan tampilan pasal di bawah, supaya narasi pembuka + identifikasi
                         // para pihak ikut berubah, bukan cuma pasalnya saja.
                         return (
-                          <div className="flex gap-3">
-                            <div className="flex-1 min-w-0">
-                              {idContent}
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              {enContent}
-                            </div>
-                          </div>
+                          <BilingualPair stacked={bilingualStacked} id={idContent} en={enContent} />
                         );
                       })()}
 
@@ -17788,10 +17823,7 @@ export default function App() {
                         const enContent = <>{renderPreambleBlock(String(selectedContract.addendumRecitalEn), {})}</>;
                         if (docLang === "en") return enContent;
                         return (
-                          <div className="flex gap-3">
-                            <div className="flex-1 min-w-0">{idContent}</div>
-                            <div className="flex-1 min-w-0">{enContent}</div>
-                          </div>
+                          <BilingualPair stacked={bilingualStacked} id={idContent} en={enContent} />
                         );
                       })() : (() => {
                         // Kalimat baku ini dulu hardcoded PENUH, sama persis di
@@ -17836,10 +17868,7 @@ export default function App() {
                           if (docLang === "en") return enBlock;
                           if (docLang === "bilingual") {
                             return (
-                              <div className="flex gap-3">
-                                <div className="flex-1 min-w-0">{idBlock}</div>
-                                <div className="flex-1 min-w-0">{enBlock}</div>
-                              </div>
+                              <BilingualPair stacked={bilingualStacked} id={idBlock} en={enBlock} />
                             );
                           }
                           return idBlock;
@@ -17847,14 +17876,11 @@ export default function App() {
                         if (docLang === "en") return <div>{renderPreambleBlock(closingEnValue, {})}</div>;
                         if (docLang === "bilingual") {
                           return (
-                            <div className="flex gap-3">
-                              <div className="flex-1 min-w-0">
-                                {renderPreambleBlock(closingIdValue, {})}
-                              </div>
-                              <div className="flex-1 min-w-0">
-                                {renderPreambleBlock(closingEnValue, {})}
-                              </div>
-                            </div>
+                            <BilingualPair
+                              stacked={bilingualStacked}
+                              id={renderPreambleBlock(closingIdValue, {})}
+                              en={renderPreambleBlock(closingEnValue, {})}
+                            />
                           );
                         }
                         return <div>{renderPreambleBlock(closingIdValue, {})}</div>;
@@ -17980,6 +18006,7 @@ export default function App() {
                           const enBody = clause.contentEn || clause.content;
                           const LONG_CLAUSE_CHARS = 420;
                           const twoColumn = docLang === "bilingual" && hasEn
+                            && !bilingualStacked // pilihan user: atas-bawah untuk SEMUA pasal
                             && String(clause.content || "").length <= LONG_CLAUSE_CHARS
                             && String(enBody || "").length <= LONG_CLAUSE_CHARS;
                           const numLabelId = selectedContractAddendumInfo ? null : `Pasal ${index + 1}`;
@@ -18027,10 +18054,7 @@ export default function App() {
                                 <div className="flex items-start justify-between gap-2">
                                   <div className="flex-1 min-w-0">
                                     {docLang === "bilingual" ? (
-                                      <div className="flex gap-3">
-                                        <div className="flex-1 min-w-0">{idBlock}</div>
-                                        <div className="flex-1 min-w-0">{enBlock}</div>
-                                      </div>
+                                      <BilingualPair stacked={bilingualStacked} id={idBlock} en={enBlock} />
                                     ) : docLang === "en" ? enBlock : idBlock}
                                   </div>
                                   <button
@@ -18105,20 +18129,21 @@ export default function App() {
                                 // (bukan di atas berselang bahasa) supaya heading +
                                 // isi selalu sepasang bahasa yang sama, konsisten
                                 // dengan tampilan narasi pembuka.
-                                <div className="flex gap-3">
-                                  <div className="flex-1 min-w-0">
+                                <BilingualPair
+                                  stacked={bilingualStacked}
+                                  id={<>
                                     {renderClauseHeading(numLabelId, clause.title)}
                                     <p className="text-slate-300 leading-relaxed select-text mt-1">
                                       {renderClauseContent(clause.content, selectedContract.variables)}
                                     </p>
-                                  </div>
-                                  <div className="flex-1 min-w-0">
+                                  </>}
+                                  en={<>
                                     {renderClauseHeading(numLabelEn, enTitle)}
                                     <p className="text-slate-300 leading-relaxed select-text mt-1">
                                       {renderClauseContent(enBody, selectedContract.variables)}
                                     </p>
-                                  </div>
-                                </div>
+                                  </>}
+                                />
                               ) : (
                                 // Pasal panjang → berselang, lebar penuh. Sama seperti
                                 // dua kolom: masing-masing blok bawa judulnya sendiri.
@@ -18365,10 +18390,7 @@ export default function App() {
                         const enContent = <>{renderPreambleBlock(String(selectedContract.closingParagraphEn), selectedContract.variables)}</>;
                         if (docLang === "en") return enContent;
                         return (
-                          <div className="flex gap-3">
-                            <div className="flex-1 min-w-0">{idContent}</div>
-                            <div className="flex-1 min-w-0">{enContent}</div>
-                          </div>
+                          <BilingualPair stacked={bilingualStacked} id={idContent} en={enContent} />
                         );
                       })()
                         );

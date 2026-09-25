@@ -286,6 +286,19 @@ export interface Contract {
   // bukan hasil susun ulang lewat template sistem). Kosong/undefined =
   // "smart" (kontrak lama sebelum field ini ada, perilaku lama tetap jalan).
   creationMode?: "smart" | "upload";
+  // Sumber dokumen kontrak — pembeda flow workspace:
+  //   "template" -> editor template existing (clauses + narasi sistem)
+  //   "upload"   -> Document Workspace: berkas asli user = dokumen utama,
+  //                 TIDAK dimasukkan ke struktur pasal template.
+  // Kosong pada data lama: diturunkan dari creationMode (lihat
+  // resolveDocumentSource), jadi kontrak lama tetap berperilaku sama.
+  documentSource?: DocumentSource;
+  // Berkas ASLI yang diunggah saat kontrak dibuat. Immutable — TIDAK PERNAH
+  // ditimpa (beda dari masterPdfUrl, yang ditimpa bukti TTD saat aktivasi).
+  originalDocument?: StoredDocumentRef;
+  // Versi dokumen yang sedang berlaku di workspace (0 = original).
+  currentDocument?: StoredDocumentRef;
+  currentDocumentVersion?: number;
   masterPdfUrl?: string; // Optional URL for uploaded master contract PDF
   numberSeq?: number; // Nomor urut yang dikonsumsi dari counter persisten (per jenis+tahun) — dipakai sbg baseline anti-duplikat
   docType?: string; // Jenis dokumen saat pendaftaran arsip (Perjanjian, MOU, Addendum, dll)
@@ -458,6 +471,23 @@ export interface ContractApprovalRound {
   resolvedAt: string;
 }
 
+export type DocumentSource = "template" | "upload";
+export type StoredDocumentFormat = "pdf" | "docx" | "doc" | "image" | "other";
+
+// Referensi berkas di storage (storage.ts) + metadata yang dibutuhkan untuk
+// preview/unduh tanpa menebak dari URL.
+export interface StoredDocumentRef {
+  key: string; // storage key (StoredFile.key) — dipakai fetchFile()
+  url: string;
+  fileName: string; // nama asli dari user
+  mimeType: string;
+  format: StoredDocumentFormat;
+  size: number;
+  sha256: string;
+  uploadedAt: string;
+  uploadedBy?: string;
+}
+
 export interface ContractVersion {
   id: string;
   tenantId?: string;
@@ -469,6 +499,18 @@ export interface ContractVersion {
   updatedAt: string;
   updatedBy: string;
   comment: string;
+  // --- Versi DOKUMEN (documentSource "upload") ---
+  // kind kosong/"content" = snapshot isi template (perilaku lama).
+  // kind "document" = satu berkas utuh; version 0 = original upload, lalu
+  // 1, 2, 3, ... tiap kali workspace menyimpan perubahan.
+  kind?: "content" | "document";
+  isOriginal?: boolean;
+  file?: StoredDocumentRef;
+  basedOnVersion?: number;
+  editMethod?: "original" | "docx-inline" | "pdf-overlay" | "pdf-text" | "revision-upload" | "converted";
+  // Berkas yang diunggah user bila `file` hasil konversi (mis. .doc -> .docx
+  // agar bisa diedit). Berkas asli ini tetap tersimpan & bisa diunduh.
+  sourceFile?: StoredDocumentRef;
 }
 
 export interface AuditTrail {

@@ -10,6 +10,7 @@ import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import { diffWords } from "diff";
 import DOMPurify from "dompurify";
+import UploadedDocumentWorkspace from "./UploadedDocumentWorkspace";
 import {
   FileText,
   Briefcase,
@@ -3606,7 +3607,6 @@ export default function App() {
   // Lihat file input "Berkas Dokumen/Template Kontrak" di wizard mode Upload
   // — true selagi /api/master-contracts/extract-text lagi baca & memecah
   // teks berkas jadi pasal-pasal.
-  const [isParsingUploadedFile, setIsParsingUploadedFile] = useState(false);
   // Mode Edit vs Mode Preview/Output pada panel dokumen live — bukan disimpan
   // ke server (murni sakelar tampilan lokal). Edit = token mentah {{Token}}
   // + semua bagian (naskah/pasal/lampiran) jadi contentEditable via DocToolbar
@@ -4179,6 +4179,13 @@ export default function App() {
     const raw = hay.slice(from, at + q.length + span).replace(/\s+/g, " ").trim();
     return `${from > 0 ? "…" : ""}${raw}…`;
   };
+
+  // Pembeda flow workspace berdasarkan sumber dokumen:
+  //   "upload"   -> UploadedDocumentWorkspace (berkas asli = dokumen utama)
+  //   "template" -> editor/preview template existing (tidak berubah)
+  // Data lama tanpa documentSource diturunkan dari creationMode.
+  const isUploadedDocument = (c: Contract | null) =>
+    !!c && (c.documentSource ? c.documentSource === "upload" : c.creationMode === "upload");
 
   // Kontrak hanya bisa diedit selagi Draft — begitu diaktifkan, terkunci.
   const isContractEditable = (c: Contract | null) =>
@@ -5866,6 +5873,7 @@ export default function App() {
     }
 
     let fileUrl = "";
+    let uploadedDocument: any = undefined;
     if (newContractForm.creationMode === "upload" && newContractForm.masterPdfFile) {
       const formData = new FormData();
       formData.append("file", newContractForm.masterPdfFile);
@@ -5874,10 +5882,15 @@ export default function App() {
           method: "POST",
           body: formData,
         });
-        const upData = await upRes.json();
-        if (upData.url) {
-          fileUrl = upData.url;
+        const upData = await upRes.json().catch(() => ({}));
+        // Dulu kegagalan upload (mis. .docx ditolak server) diam-diam
+        // menghasilkan kontrak TANPA berkas. Sekarang dihentikan di sini.
+        if (!upRes.ok || !upData.url || !upData.document) {
+          showToast(upData.error || "Gagal mengunggah dokumen", "warning");
+          return;
         }
+        fileUrl = upData.url;
+        uploadedDocument = upData.document;
       } catch (err) {
         showToast("Gagal mengunggah file master", "warning");
         return;
@@ -5908,9 +5921,14 @@ export default function App() {
       // Mode upload SEKARANG bisa punya clauses hasil auto-parse (lihat
       // extract-text & onChange input file) — kirim apa adanya, bukan
       // dikosongkan paksa lagi seperti dulu (waktu upload = viewer statis).
-      clauses: newContractForm.clauses,
+      // Mode upload: isi kontrak = berkasnya, bukan pasal (server juga
+      // memaksa clauses kosong utk documentSource "upload").
+      clauses: newContractForm.creationMode === "upload" ? [] : newContractForm.clauses,
       parties: newContractForm.parties,
       masterPdfUrl: fileUrl,
+      // Metadata berkas asli (key/nama) — server membaca ulang berkasnya dari
+      // storage & menyimpannya sbg originalDocument (versi 0, immutable).
+      uploadedDocument,
       // Mode unggah PDF: nomor bebas dari user (kosong = server auto-generate).
       // Mode smart: server selalu auto-generate (manualNumber tak dikirim).
       manualNumber: newContractForm.creationMode === "upload" ? (newContractForm.contractNumber.trim() || undefined) : undefined,
@@ -5981,56 +5999,8 @@ export default function App() {
         });
         fetchInitialData();
 
-        // Mode Upload: kalau ekstraksi teks otomatis (extract-text, lihat
-        // input file di atas) gagal total sehingga kontrak lahir tanpa
-        // pasal sama sekali — biasanya karena berkasnya hasil scan/foto,
-        // bukan PDF/docx dengan teks asli — coba OCR otomatis di
-        // background sekali di sini, supaya preview tidak kosong
-        // menunggu user sadar & klik tombol "OCR -> Teks" manual sendiri
-        // (lihat handleRunOcr). Aman dipanggil begini karena endpoint OCR
-        // HANYA mengisi clauses kalau memang masih kosong (tidak pernah
-        // menimpa apa pun & tidak butuh konfirmasi timpa), jadi tidak
-        // mengganggu jalur mode "smart"/upload yang sudah punya isi.
-        if (
-          newContractForm.creationMode === "upload" &&
-          data.contract?.id &&
-          data.contract?.masterPdfUrl &&
-          (!data.contract.clauses || data.contract.clauses.length === 0)
-        ) {
-          fetch(`/api/contracts/${data.contract.id}/ocr`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ userName: "Ahmad GA" }),
-          })
-            .then((r) => r.json())
-            .then((ocrData) => {
-              if (ocrData.success) {
-                fetchInitialData();
-                // Kalau halaman detail kontrak ini KEBETULAN sudah kebuka
-                // (misalnya user langsung klik ke kontrak yang baru dibuat
-                // sebelum panggilan OCR di atas selesai), fetchInitialData()
-                // di atas cuma me-refresh daftar kontrak — objek
-                // selectedContract yang sedang ditampilkan di preview TIDAK
-                // ikut ter-update, jadi klausul hasil OCR tidak nongol
-                // sampai user pindah halaman & buka ulang. Sinkronkan
-                // langsung di sini kalau ID-nya cocok.
-                setSelectedContract((prev: any) =>
-                  prev && prev.id === ocrData.contract?.id ? ocrData.contract : prev
-                );
-                showToast(
-                  ocrData.simulated
-                    ? "Ekstraksi teks otomatis gagal & OCR otomatis juga belum berhasil membaca isi berkas — jalankan ulang OCR manual di halaman detail kontrak."
-                    : "Ekstraksi teks otomatis gagal (kemungkinan berkas hasil scan) — OCR otomatis berhasil membaca isinya, sudah tampil di preview.",
-                  ocrData.simulated ? "warning" : "success",
-                );
-              }
-            })
-            .catch(() => {
-              // Diam saja: berkas tetap tersimpan, user masih bisa
-              // menjalankan OCR manual sendiri kapan saja dari halaman
-              // detail kontrak seperti sebelumnya.
-            });
-        }
+        // Mode Upload: TIDAK ada auto-OCR/ekstraksi ke pasal lagi — berkas
+        // asli ditampilkan langsung di Document Workspace (layout utuh).
       } else {
         showToast(data.error || "Gagal membuat kontrak", "warning");
       }
@@ -6925,6 +6895,12 @@ export default function App() {
       showToast("Dokumen belum bisa diunduh — selesaikan approval matriks terlebih dahulu.", "warning");
       return;
     }
+    // Dokumen Upload: yang diekspor adalah BERKAS dokumen versi aktif apa
+    // adanya (layout asli), bukan screenshot preview template.
+    if (isUploadedDocument(selectedContract)) {
+      window.location.href = `/api/contracts/${selectedContract.id}/document?version=current&download=1`;
+      return;
+    }
     try {
       showToast("Mengekspor dokumen ke PDF...", "success");
       const pdf = await generateContractPdf();
@@ -6948,7 +6924,9 @@ export default function App() {
       // file aslinya apa adanya. Begitu ada pasal (dari template ATAU hasil
       // OCR yang lalu diedit), selalu generate ulang dari preview supaya PDF
       // yang dikirim mencerminkan isi terbaru, bukan file upload yang basi.
-      if (!selectedContract.masterPdfUrl || selectedContract.clauses.length > 0) {
+      // Dokumen Upload: server membagikan berkas versi aktif (lihat
+      // export-share) — tidak pernah di-render ulang dari preview template.
+      if (!isUploadedDocument(selectedContract) && (!selectedContract.masterPdfUrl || selectedContract.clauses.length > 0)) {
         const pdf = await generateContractPdf();
         if (!pdf) return;
         formData.append(
@@ -17109,6 +17087,9 @@ export default function App() {
                     <ArrowLeftRight className="w-3.5 h-3.5" />
                     Bandingkan dgn Kontrak Sebelumnya
                   </button>
+                  {/* Toggle kop/logo/meterai/bahasa hanya berlaku utk preview
+                      TEMPLATE — dokumen upload tampil dgn kop & layout aslinya. */}
+                  {!isUploadedDocument(selectedContract) && (<>
                   <button
                     onClick={handleToggleLetterhead}
                     title="Kop surat opsional untuk kontrak kerjasama — dokumennya milik bersama dua pihak, bukan surat sepihak dari salah satu perusahaan. Mematikannya juga menghemat ruang halaman."
@@ -17195,6 +17176,7 @@ export default function App() {
                       })}
                     </div>
                   )}
+                  </>)}
                   <button
                     onClick={handleExportPdf}
                     disabled={isExportingPdf || !isContractDownloadable(selectedContract)}
@@ -17208,7 +17190,7 @@ export default function App() {
                     className="px-4 py-2 bg-rose-600/20 hover:bg-rose-600/40 text-rose-400 text-xs font-semibold rounded-xl border border-rose-600/30 transition flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <FileText className="w-3.5 h-3.5" />
-                    {isExportingPdf ? "Mengekspor..." : "Export to PDF"}{appSettings.contractWatermark ? " (Watermarked)" : ""}
+                    {isExportingPdf ? "Mengekspor..." : isUploadedDocument(selectedContract) ? "Download Dokumen" : "Export to PDF"}{appSettings.contractWatermark ? " (Watermarked)" : ""}
                   </button>
                   <button
                     onClick={handleExportSharePdf}
@@ -17219,7 +17201,7 @@ export default function App() {
                     <ExternalLink className="w-3.5 h-3.5" />
                     Kirim PDF (Email/WA)
                   </button>
-                  {selectedContract.masterPdfUrl && (
+                  {selectedContract.masterPdfUrl && !isUploadedDocument(selectedContract) && (
                     <button
                       onClick={handleRunOcr}
                       disabled={isOcrRunning}
@@ -17233,7 +17215,7 @@ export default function App() {
                       {isOcrRunning ? "Membaca..." : "OCR → Teks"}
                     </button>
                   )}
-                  {isContractEditable(selectedContract) && (
+                  {isContractEditable(selectedContract) && !isUploadedDocument(selectedContract) && (
                     <button
                       onClick={() =>
                         handleUpdateContractDraft("Memperbarui isi draf")
@@ -17302,6 +17284,20 @@ export default function App() {
                 {/* Left: preview dokumen digital SAJA. Editor Pasal Kontrak
                     Ini dipindah jadi kolom kanan (di bawah) atas permintaan
                     user, supaya preview & editor sebelahan. */}
+                {isUploadedDocument(selectedContract) ? (
+                  <UploadedDocumentWorkspace
+                    contract={selectedContract}
+                    canEdit={isContractEditable(selectedContract)}
+                    canDownload={isContractDownloadable(selectedContract)}
+                    onContractUpdated={(c) => {
+                      setSelectedContract(c);
+                      setDraftSavedSnapshot(JSON.stringify(c));
+                      fetchInitialData();
+                    }}
+                    showToast={showToast}
+                    askConfirm={askConfirm}
+                  />
+                ) : (
                 <div className="xl:col-span-12 bg-slate-950 rounded-2xl border border-slate-800 p-6 space-y-6 shadow-2xl flex flex-col justify-between">
                   <div>
                     {/* Setelah aktivasi via "Unggah Bukti TTD & Aktifkan", dokumen
@@ -18495,6 +18491,7 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+                )}
               </div>
 
               {/* Status & Siklus Kontrak + Riwayat Addendum — dipindah ke
@@ -21113,61 +21110,22 @@ export default function App() {
                         </label>
                         <input
                           type="file"
-                          accept=".pdf,.docx,.jpg,.jpeg,.png"
-                          onChange={async (e) => {
+                          accept=".pdf,.docx,.doc,.jpg,.jpeg,.png"
+                          onChange={(e) => {
+                            // Berkas upload = DOKUMEN KONTRAK UTAMA. Sengaja TIDAK
+                            // lagi diekstrak jadi teks/pasal (dulu lewat
+                            // /api/master-contracts/extract-text) — konversi itu yang
+                            // membuat kop, logo, tabel, footer, page break & area TTD
+                            // hilang jadi kumpulan paragraf. Berkas disimpan apa
+                            // adanya lalu dibuka di Document Workspace.
                             const file = e.target.files?.[0] || null;
                             setNewContractForm((prev) => ({
                               ...prev,
                               masterPdfFile: file,
                               clauses: [],
-                              // Auto-isi Judul dari nama file kalau masih kosong —
-                              // mode upload gak wajib isi ulang manual (lihat
-                              // validasi Tahap 2), tinggal diganti kalau mau.
+                              // Auto-isi Judul dari nama file kalau masih kosong.
                               title: prev.title.trim() ? prev.title : (file ? file.name.replace(/\.[^.]+$/, "") : prev.title),
                             }));
-                            if (!file) return;
-                            // PDF teks-asli / .docx: tarik teksnya SEKARANG JUGA
-                            // (sebelum submit) & taruh UTUH sebagai satu blok
-                            // yang bisa diedit — TIDAK dipecah jadi pasal-pasal
-                            // per PASAL/nomor, karena format dokumen upload
-                            // user bisa macam-macam & auto-split gampang salah
-                            // tebak (lihat komentar di extractedTextToSingleClause
-                            // server.ts). Preview & editornya tetap pakai LAYOUT
-                            // & MODE EDIT YANG SAMA seperti mode "Buat dari
-                            // Template" — cuma bukan cuma nampilin file PDF-nya
-                            // mentah-mentah. .jpg/.png (scan/foto) dilewati di
-                            // sini (tanpa OCR, endpoint akan selalu bilang tidak
-                            // didukung utk itu) — isi diisi manual belakangan.
-                            const isTextExtractable = /\.(pdf|docx)$/i.test(file.name);
-                            if (!isTextExtractable) return;
-                            setIsParsingUploadedFile(true);
-                            try {
-                              const fd = new FormData();
-                              fd.append("file", file);
-                              const r = await fetch("/api/master-contracts/extract-text", { method: "POST", body: fd });
-                              const data = await r.json();
-                              if (data.supported && Array.isArray(data.clauses) && data.clauses.length > 0) {
-                                setNewContractForm((prev) => ({
-                                  ...prev,
-                                  masterPdfFile: file,
-                                  customOpeningParagraph: data.preamble || prev.customOpeningParagraph,
-                                  closingStatement: data.closing || prev.closingStatement,
-                                  clauses: data.clauses.map((c: any, i: number) => ({
-                                    id: `up-cls-${Date.now()}-${i}`,
-                                    title: c.title,
-                                    content: c.content,
-                                    order: i + 1,
-                                  })),
-                                }));
-                                showToast("Isi berkas berhasil ditarik utuh — tampil & bisa diedit bebas di preview, tanpa dipecah-pecah.", "success");
-                              } else {
-                                showToast(data.reason || "Tidak bisa membaca teks dari berkas ini secara otomatis.", "warning");
-                              }
-                            } catch {
-                              showToast("Gagal membaca isi berkas — kontrak tetap bisa dibuat, pasal diisi manual di langkah berikutnya.", "warning");
-                            } finally {
-                              setIsParsingUploadedFile(false);
-                            }
                           }}
                           className="w-full text-sm text-slate-300 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 bg-slate-900 border border-slate-800 rounded-xl cursor-pointer"
                         />
@@ -21177,18 +21135,8 @@ export default function App() {
                             {newContractForm.masterPdfFile.name} siap diunggah
                           </p>
                         )}
-                        {isParsingUploadedFile && (
-                          <p className="text-[11px] text-indigo-400 flex items-center gap-1">
-                            <RefreshCw className="w-3 h-3 animate-spin" /> Membaca isi berkas &amp; memecahnya jadi pasal-pasal…
-                          </p>
-                        )}
-                        {!isParsingUploadedFile && newContractForm.clauses.length > 0 && (
-                          <p className="text-[11px] text-emerald-400">
-                            ✓ {newContractForm.clauses.length} pasal terdeteksi dari berkas ini — akan langsung bisa diedit (tambah pasal/lampiran/token) di editor, sama seperti mode Template.
-                          </p>
-                        )}
                         <p className="text-[11px] text-slate-500">
-                          PDF teks-asli atau .docx: isi pasalnya otomatis dibaca &amp; jadi bisa diedit penuh. Hasil scan/foto (JPG/PNG) atau .doc lama: tidak bisa dibaca otomatis (tanpa OCR) — berkasnya tetap tersimpan &amp; bisa dilihat, tapi pasal diisi manual. Isi tanggal mulai &amp; selesai pada tahap berikutnya agar kontrak ini otomatis masuk daftar reminder jatuh tempo.
+                          Berkas ini menjadi dokumen kontrak utama dan disimpan apa adanya (original tidak pernah ditimpa). Setelah kontrak dibuat, buka di Document Workspace: pratinjau dengan layout asli (kop, logo, tabel, footer, TTD), edit, lalu Save sebagai versi baru. PDF, Word (.docx/.doc), JPG, PNG — maks. 10 MB.
                         </p>
                       </div>
                     )}
@@ -21872,7 +21820,9 @@ export default function App() {
                         { label: "Pihak Kedua", value: `${f.party2Name || "— belum diisi —"}${f.party2Type ? ` (${f.party2Type})` : ""}`, warn: !f.party2Name },
                         { label: "Masa Berlaku", value: f.startDate && f.endDate ? `${f.startDate} s/d ${f.endDate} · ${durationLabel}` : "— belum lengkap —", warn: !f.startDate || !f.endDate },
                         { label: "Nilai Kontrak", value: f.contractValue > 0 ? `${f.currency} ${formatCurrencyDisplay(f.contractValue)}` : "—" },
-                        { label: "Jumlah Pasal", value: `${f.clauses.length} pasal`, warn: f.creationMode === "smart" && f.clauses.length === 0 },
+                        f.creationMode === "upload"
+                          ? { label: "Dokumen", value: f.masterPdfFile ? `${f.masterPdfFile.name} — dipakai apa adanya (layout asli)` : "— belum diunggah —", warn: !f.masterPdfFile }
+                          : { label: "Jumlah Pasal", value: `${f.clauses.length} pasal`, warn: f.creationMode === "smart" && f.clauses.length === 0 },
                         ...(f.creationMode === "upload" ? [{ label: "Status Awal", value: "Draft — dokumen unggahan Anda dipakai sbg isi kontrak, tetap perlu diaktifkan lewat proses biasa (BUKAN otomatis Aktif)" }] : []),
                       ];
                       return (

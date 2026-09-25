@@ -7,7 +7,7 @@ import {
   Clause, Variable, Template, Contract, ContractVersion, ContractStatus,
   ContractApprovalStep, AuditTrail, SystemNotification, EmployeeData, VendorData, User, UserRole,
   ClauseComment, PushSubscription as PushSub, SubFolder, ContractSharingFeeItem, ContractVendorSnapshot,
-  ContractPaymentTerm, ContractObligation, ContractVendorEvaluation, BudgetEntry,
+  ContractPaymentTerm, ContractObligation, StoredDocumentRef, ContractVendorEvaluation, BudgetEntry,
   LegalJob, LegalJobStatus, LegalJobPriority, LegalJobDocument, LegalJobNote,
   LegalJobTimelineEntry, LegalFormLink, LEGAL_JOB_WORKFLOW_STATUSES,
 } from "./src/types";
@@ -18,6 +18,12 @@ import { isEmailConfigured, sendEmail, testEmailConnection, emailTemplate } from
 import { isPushConfigured, sendPushToUser, sendPushToTenant } from "./push.js";
 import { storeFile, fetchFile, isStorageCloudBacked } from "./storage.js";
 import { sha256 } from "./dcs/pdf-io.js";
+import {
+  resolveDocumentSource, sniffFormat, extForFormat, cleanFileName, buildDocumentRef,
+  legacyDocumentRef, documentVersionsOf, readStoredDocument, contentDisposition,
+} from "./contract-documents.js";
+import { convertDocToDocx, isOfficeConverterAvailable } from "./office-convert.js";
+import { extractPdfLayout, applyPdfEdits } from "./pdf-text-edit.js";
 import { pool as dcsPool } from "./db.js";
 import { createDcsRouter, initDcs } from "./dcs/routes.js";
 import { runDcsReminderCheck, startDcsReminderScheduler } from "./dcs/reminders.js";
@@ -812,6 +818,28 @@ const uploadLegalDoc = multer({
   fileFilter: (req, file, cb) => {
     if (ALLOWED_LEGAL_JOB_MIME.has(file.mimetype)) cb(null, true);
     else cb(new Error("Tipe berkas tidak didukung. Hanya PDF, DOC, DOCX, XLS, XLSX, JPG, atau PNG."));
+  },
+});
+// Dokumen kontrak UTAMA hasil "Upload Dokumen" — dokumen kerja sama nyata
+// datang sebagai PDF atau Word (.docx/.doc), bukan cuma PDF/scan. Instance
+// terpisah (seperti uploadLampiran) supaya `upload` global tetap sempit.
+// Browser kadang mengirim .docx sbg application/octet-stream, jadi ekstensi
+// ikut diterima di sini; isi berkasnya tetap diverifikasi via magic bytes
+// (sniffFormat) di handler — nama/mime dari klien tidak dipercaya buta.
+const ALLOWED_CONTRACT_DOC_MIME = new Set([
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "image/jpeg",
+  "image/png",
+]);
+const uploadContractDoc = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: (req, file, cb) => {
+    const okExt = /\.(pdf|docx?|jpe?g|png)$/i.test(file.originalname || "");
+    if (ALLOWED_CONTRACT_DOC_MIME.has(file.mimetype) || (file.mimetype === "application/octet-stream" && okExt)) cb(null, true);
+    else cb(new Error("Tipe berkas tidak didukung. Hanya PDF, Word (.docx/.doc), JPG, atau PNG."));
   },
 });
 function uploadFileKey(originalname: string): string {
@@ -2028,10 +2056,20 @@ function buildVendorSnapshot(db: any, tid: string, vendorId: unknown): ContractV
   };
 }
 
-app.post("/api/master-contracts/upload", requireAuth, upload.single('file'), async (req, res) => {
+app.post("/api/master-contracts/upload", requireAuth, uploadContractDoc.single('file'), async (req: AuthedRequest, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-  const stored = await storeFile(req.file.buffer, uploadFileKey(req.file.originalname), req.file.mimetype);
-  res.json({ url: stored.url });
+  const fileName = cleanFileName(req.file.originalname);
+  const format = sniffFormat(req.file.buffer, fileName);
+  if (!format) {
+    return res.status(400).json({ error: "Isi berkas tidak dikenali sebagai PDF, Word, JPG, atau PNG yang valid." });
+  }
+  // Nama key mengikuti format hasil deteksi (bukan ekstensi dari klien).
+  const key = uploadFileKey("x" + extForFormat(format, fileName));
+  const ref = buildDocumentRef(req.file.buffer, await storeFile(req.file.buffer, key, req.file.mimetype), fileName, format, req.user?.name);
+  // `url` tetap dikembalikan di top-level: dipakai alur lama (Perpanjang,
+  // Daftarkan Dokumen Arsip). `document` = metadata lengkap utk alur Upload
+  // Dokumen (disimpan sbg originalDocument, lihat POST /api/contracts).
+  res.json({ url: ref.url, document: ref });
 });
 
 // Pecah teks mentah hasil ekstraksi PDF/DOCX jadi array clauses[] siap-edit
@@ -2395,12 +2433,37 @@ function buildContractCopies(copyCount: number, hasMaterai: boolean): any[] {
   });
 }
 
-app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "manager"), (req: AuthedRequest, res) => {
+app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "manager"), async (req: AuthedRequest, res) => {
+  // Upload Dokumen: berkas ASLI user = dokumen kontrak utama. Metadata berkas
+  // TIDAK dipercaya dari klien — dibaca ulang dari storage (ukuran, hash,
+  // format) berdasarkan key hasil /api/master-contracts/upload. Dilakukan
+  // SEBELUM loadDB() karena ada await (cache DB tetap koheren).
+  const isUploadSource = req.body.creationMode === "upload";
+  let originalDocument: StoredDocumentRef | undefined;
+  if (isUploadSource) {
+    const up = req.body.uploadedDocument || {};
+    const key = typeof up.key === "string" ? up.key : "";
+    const url = typeof up.url === "string" ? up.url : "";
+    if (!/^file-\d+-\d+\.(pdf|docx|doc|jpg|png)$/i.test(key) || !url.endsWith("/" + key)) {
+      return res.status(400).json({ error: "Berkas dokumen wajib diunggah untuk mode Upload Dokumen." });
+    }
+    let buf: Buffer;
+    try {
+      buf = await readStoredDocument({ key, url } as StoredDocumentRef, uploadDir);
+    } catch {
+      return res.status(400).json({ error: "Berkas yang diunggah tidak ditemukan di penyimpanan — unggah ulang." });
+    }
+    const fileName = cleanFileName(up.fileName, key);
+    const format = sniffFormat(buf, fileName);
+    if (!format) return res.status(400).json({ error: "Isi berkas tidak dikenali sebagai dokumen yang valid." });
+    originalDocument = buildDocumentRef(buf, { url, key }, fileName, format, req.user!.name);
+  }
+
   const db = loadDB();
   const tid = tenantOf(req);
   const company = companyNameFor(db, tid);
   const currentYear = new Date().getFullYear().toString();
-  const isUpload = !!req.body.masterPdfUrl;
+  const isUpload = !!req.body.masterPdfUrl || isUploadSource;
   // Dokumen UNGGAH PDF murni: nomor diisi FREE TEXT (nomor dari vendor/penerbit),
   // BUKAN auto-generate — dan TIDAK mengonsumsi counter (nomor kita tetap urut
   // untuk dokumen yg dibuat di sistem). Kalau manualNumber kosong, jatuh ke
@@ -2445,9 +2508,15 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
     reminderDaysBefore: req.body.reminderDaysBefore || 30,
     isAutoRenew: !!req.body.isAutoRenew,
     variables: req.body.variables || {},
-    clauses: req.body.clauses || [],
-    creationMode: req.body.creationMode === "upload" ? "upload" : "smart",
-    masterPdfUrl: req.body.masterPdfUrl || null,
+    // Upload Dokumen: isi kontrak ADALAH berkasnya — tidak diparsing ke
+    // struktur pasal template (itu yang dulu merusak kop/tabel/TTD).
+    clauses: isUploadSource ? [] : (req.body.clauses || []),
+    creationMode: isUploadSource ? "upload" : "smart",
+    documentSource: isUploadSource ? "upload" : "template",
+    originalDocument,
+    currentDocument: originalDocument,
+    currentDocumentVersion: originalDocument ? 0 : undefined,
+    masterPdfUrl: originalDocument ? originalDocument.url : (req.body.masterPdfUrl || null),
     docType: req.body.docType || undefined,
     notes: req.body.notes || undefined,
     subFolderId: req.body.subFolderId || undefined,
@@ -2473,7 +2542,62 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
     updatedAt: new Date().toISOString()
   };
 
+  // .doc (Word 97-2003) tidak bisa dirender/diedit di browser: konversi ke
+  // .docx sbg versi kerja (Versi 1). Original .doc tetap Versi 0 apa adanya.
+  let convertedDoc: StoredDocumentRef | undefined;
+  if (originalDocument?.format === "doc" && isOfficeConverterAvailable()) {
+    try {
+      const src = await readStoredDocument(originalDocument, uploadDir);
+      const out = await convertDocToDocx(src);
+      const name = originalDocument.fileName.replace(/\.doc$/i, "") + ".docx";
+      const key = `contractdoc-${newContract.id}-${Date.now()}-conv.docx`;
+      convertedDoc = buildDocumentRef(out, await storeFile(out, key, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"), name, "docx", req.user!.name);
+    } catch (err) {
+      logger.warn({ err }, "Konversi .doc -> .docx gagal saat membuat kontrak; berkas .doc tetap tersimpan");
+    }
+  }
   db.contracts.push(newContract);
+  if (originalDocument) {
+    // Version 0 = original. Tidak pernah diubah/dihapus oleh penyimpanan
+    // berikutnya; tiap Save workspace menambah versi 1, 2, 3, ...
+    db.versions.push({
+      id: "ver-" + Date.now() + "-orig",
+      tenantId: tid,
+      contractId: newContract.id,
+      version: 0,
+      title: newContract.title,
+      variables: {},
+      clauses: [],
+      updatedAt: originalDocument.uploadedAt,
+      updatedBy: req.user!.name,
+      comment: `Dokumen asli diunggah: ${originalDocument.fileName}`,
+      kind: "document",
+      isOriginal: true,
+      file: originalDocument,
+      editMethod: "original",
+    } as ContractVersion);
+    if (convertedDoc) {
+      db.versions.push({
+        id: "ver-" + Date.now() + "-conv",
+        tenantId: tid,
+        contractId: newContract.id,
+        version: 1,
+        title: newContract.title,
+        variables: {},
+        clauses: [],
+        updatedAt: convertedDoc.uploadedAt,
+        updatedBy: req.user!.name,
+        comment: "Konversi otomatis .doc → .docx agar bisa dipratinjau & diedit (original .doc tetap utuh)",
+        kind: "document",
+        file: convertedDoc,
+        sourceFile: originalDocument,
+        basedOnVersion: 0,
+        editMethod: "converted",
+      } as ContractVersion);
+      newContract.currentDocument = convertedDoc;
+      newContract.currentDocumentVersion = 1;
+    }
+  }
 
   // Tautkan ke Pekerjaan Legal (opsional) — dropdown "Pilih Judul Pekerjaan
   // Legal" di form ini. Begitu tertaut, status Pekerjaan Legal berhenti bisa
@@ -2567,8 +2691,13 @@ app.put("/api/contracts/:id", requireAuth, requireRole("admin", "staff", "legal"
   const evaluasi = normalizeVendorEvaluation(req.body.vendorEvaluation, req.user!.name);
   if (!evaluasi.ok) return res.status(400).json({ error: evaluasi.error });
 
-  const newVersionNum = (db.versions.filter((v: ContractVersion) => v.contractId === oldContract.id).length) + 1;
-  if (canEditContent) {
+  // Versi DOKUMEN (kind "document", kontrak Upload) punya penomoran sendiri
+  // (0 = original) — jangan ikut dihitung di nomor versi isi template.
+  const newVersionNum = (db.versions.filter((v: ContractVersion) => v.contractId === oldContract.id && v.kind !== "document").length) + 1;
+  // Kontrak Upload Dokumen: isinya adalah berkas (diversikan lewat
+  // POST /:id/document-versions), bukan clauses — snapshot clauses di sini
+  // tidak bermakna utk mereka, jadi dilewati.
+  if (canEditContent && resolveDocumentSource(oldContract) === "template") {
     db.versions.push({
       id: "ver-" + Date.now(),
       tenantId: tid,
@@ -3619,6 +3748,80 @@ function shareBaseUrl(req: express.Request): string {
 //   Archived          → merah "UNCONTROLLED COPY — DIARSIPKAN / ARCHIVED"
 //   Draft/lainnya     → abu   "DRAFT — NOT FOR USE"
 // Ini berlaku tanpa melihat masa berlaku (endDate) — status DB yang menentukan.
+// Stempel watermark kontrak (CONTROLLED/UNCONTROLLED sesuai status) ke PDF
+// in-memory. Dipakai /view-pdf dan unduhan dokumen workspace Upload.
+async function stampContractWatermark(cleanBuf: Buffer, contract: Contract, userName: string): Promise<Buffer> {
+  // Resolusi watermark berdasarkan status kontrak
+  interface WmSpec { banner: string; footer: string; r: number; g: number; b: number; bannerOpacity: number; footerOpacity: number; }
+  const accessedAt = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  const docRef = `${contract.contractNumber}`;
+
+  let spec: WmSpec;
+  if (contract.status === "Aktif") {
+    spec = {
+      banner: "CONTROLLED COPY",
+      footer: `CONTROLLED COPY · ${docRef} · Accessed by ${userName} on ${accessedAt}`,
+      r: 0.16, g: 0.32, b: 0.75,
+      bannerOpacity: 0.10, footerOpacity: 0.55,
+    };
+  } else if (contract.status === "TidakAktif") {
+    spec = {
+      banner: "UNCONTROLLED COPY — TIDAK AKTIF / KEDALUWARSA",
+      footer: `UNCONTROLLED / EXPIRED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
+      r: 0.80, g: 0.12, b: 0.12,
+      bannerOpacity: 0.14, footerOpacity: 0.65,
+    };
+  } else if (contract.status === "Terminated") {
+    spec = {
+      banner: "UNCONTROLLED COPY — TIDAK BERLAKU / TERMINATED",
+      footer: `UNCONTROLLED / TERMINATED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
+      r: 0.80, g: 0.12, b: 0.12,
+      bannerOpacity: 0.14, footerOpacity: 0.65,
+    };
+  } else if (contract.status === "Archived") {
+    spec = {
+      banner: "UNCONTROLLED COPY — DIARSIPKAN / ARCHIVED",
+      footer: `UNCONTROLLED / ARCHIVED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
+      r: 0.80, g: 0.12, b: 0.12,
+      bannerOpacity: 0.14, footerOpacity: 0.65,
+    };
+  } else {
+    // Draft atau status tak dikenal
+    spec = {
+      banner: `DRAFT — NOT FOR USE (${contract.status.toUpperCase()})`,
+      footer: `DRAFT · ${docRef} · Accessed by ${userName} on ${accessedAt}`,
+      r: 0.45, g: 0.45, b: 0.45,
+      bannerOpacity: 0.12, footerOpacity: 0.55,
+    };
+  }
+
+  // Stamp watermark in-memory via pdf-lib
+  const pdfDoc = await PDFDocument.load(cleanBuf);
+  const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const color = rgb(spec.r, spec.g, spec.b);
+  for (const page of pdfDoc.getPages()) {
+    const { width, height } = page.getSize();
+    // Diagonal tiled banner
+    const bannerSize = 42;
+    const stepX = Math.max(spec.banner.length * bannerSize * 0.35, 320);
+    const stepY = 190;
+    for (let y = -height; y < height * 2; y += stepY) {
+      for (let x = -width; x < width * 2; x += stepX) {
+        page.drawText(spec.banner, {
+          x, y, size: bannerSize, font, color,
+          opacity: spec.bannerOpacity, rotate: degrees(45),
+        });
+      }
+    }
+    // Footer provenance strip
+    page.drawText(spec.footer, {
+      x: 24, y: 14, size: 7.5, font, color,
+      opacity: spec.footerOpacity, maxWidth: width - 48,
+    });
+  }
+  return Buffer.from(await pdfDoc.save());
+}
+
 app.get("/api/contracts/:id/view-pdf", requireAuth, async (req: AuthedRequest, res) => {
   const db = loadDB();
   const contract = findOwnedContract(db, req, req.params.id);
@@ -3635,8 +3838,27 @@ app.get("/api/contracts/:id/view-pdf", requireAuth, async (req: AuthedRequest, r
     return res.status(403).json({ error: "Dokumen belum bisa diunduh — selesaikan approval matriks terlebih dahulu." });
   }
 
-  // Ambil URL berkas PDF (prioritas: masterPdfUrl, fallback: exportedPdfKey)
-  const fileUrl = contract.masterPdfUrl || contract.exportedPdfUrl;
+  // Kontrak Upload Dokumen yang belum diaktivasi: berkas yang berlaku adalah
+  // versi dokumen TERKINI di workspace (bukan masterPdfUrl = original).
+  // Berkas non-PDF (Word/gambar) disajikan apa adanya dgn mime aslinya —
+  // dulu .docx ikut disajikan sbg application/pdf dan jadi rusak.
+  if (resolveDocumentSource(contract) === "upload" && !contract.activationProofKey) {
+    const ref = contract.currentDocument || contract.originalDocument || legacyDocumentRef(contract);
+    if (ref && ref.format !== "pdf") {
+      try {
+        const buf = await readStoredDocument(ref, uploadDir);
+        res.setHeader("Content-Type", ref.mimeType);
+        res.setHeader("Content-Disposition", contentDisposition(req.query.download === "1" ? "attachment" : "inline", ref.fileName));
+        return res.send(buf);
+      } catch (err: any) {
+        return res.status(err?.status || 500).json({ error: err?.message || "Gagal membaca berkas." });
+      }
+    }
+  }
+  const uploadRef = resolveDocumentSource(contract) === "upload" && !contract.activationProofKey ? contract.currentDocument : undefined;
+  // Ambil URL berkas PDF (prioritas: versi dokumen terkini utk kontrak
+  // Upload, lalu masterPdfUrl, fallback: exportedPdfKey)
+  const fileUrl = uploadRef?.url || contract.masterPdfUrl || contract.exportedPdfUrl;
   if (!fileUrl) {
     return res.status(409).json({ error: "Kontrak ini belum memiliki berkas PDF yang diunggah." });
   }
@@ -3652,7 +3874,7 @@ app.get("/api/contracts/:id/view-pdf", requireAuth, async (req: AuthedRequest, r
       cleanBuf = fs.readFileSync(localPath);
     } else {
       // Cloud: gunakan exportedPdfKey jika ada, fallback basename dari URL
-      const storageKey = contract.exportedPdfKey
+      const storageKey = uploadRef?.key || contract.exportedPdfKey
         || (contract.masterPdfUrl ? path.basename(new URL(contract.masterPdfUrl).pathname) : null);
       if (!storageKey) return res.status(409).json({ error: "Tidak dapat menentukan storage key berkas PDF." });
       cleanBuf = await fetchFile(storageKey);
@@ -3677,76 +3899,8 @@ app.get("/api/contracts/:id/view-pdf", requireAuth, async (req: AuthedRequest, r
       return res.send(cleanBuf);
     }
 
-    // Resolusi watermark berdasarkan status kontrak
-    interface WmSpec { banner: string; footer: string; r: number; g: number; b: number; bannerOpacity: number; footerOpacity: number; }
     const userName = req.user!.name;
-    const accessedAt = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
-    const docRef = `${contract.contractNumber}`;
-
-    let spec: WmSpec;
-    if (contract.status === "Aktif") {
-      spec = {
-        banner: "CONTROLLED COPY",
-        footer: `CONTROLLED COPY · ${docRef} · Accessed by ${userName} on ${accessedAt}`,
-        r: 0.16, g: 0.32, b: 0.75,
-        bannerOpacity: 0.10, footerOpacity: 0.55,
-      };
-    } else if (contract.status === "TidakAktif") {
-      spec = {
-        banner: "UNCONTROLLED COPY — TIDAK AKTIF / KEDALUWARSA",
-        footer: `UNCONTROLLED / EXPIRED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
-        r: 0.80, g: 0.12, b: 0.12,
-        bannerOpacity: 0.14, footerOpacity: 0.65,
-      };
-    } else if (contract.status === "Terminated") {
-      spec = {
-        banner: "UNCONTROLLED COPY — TIDAK BERLAKU / TERMINATED",
-        footer: `UNCONTROLLED / TERMINATED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
-        r: 0.80, g: 0.12, b: 0.12,
-        bannerOpacity: 0.14, footerOpacity: 0.65,
-      };
-    } else if (contract.status === "Archived") {
-      spec = {
-        banner: "UNCONTROLLED COPY — DIARSIPKAN / ARCHIVED",
-        footer: `UNCONTROLLED / ARCHIVED · ${docRef} · Retrieved by ${userName} on ${accessedAt}`,
-        r: 0.80, g: 0.12, b: 0.12,
-        bannerOpacity: 0.14, footerOpacity: 0.65,
-      };
-    } else {
-      // Draft atau status tak dikenal
-      spec = {
-        banner: `DRAFT — NOT FOR USE (${contract.status.toUpperCase()})`,
-        footer: `DRAFT · ${docRef} · Accessed by ${userName} on ${accessedAt}`,
-        r: 0.45, g: 0.45, b: 0.45,
-        bannerOpacity: 0.12, footerOpacity: 0.55,
-      };
-    }
-
-    // Stamp watermark in-memory via pdf-lib
-    const pdfDoc = await PDFDocument.load(cleanBuf);
-    const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    const color = rgb(spec.r, spec.g, spec.b);
-    for (const page of pdfDoc.getPages()) {
-      const { width, height } = page.getSize();
-      // Diagonal tiled banner
-      const bannerSize = 42;
-      const stepX = Math.max(spec.banner.length * bannerSize * 0.35, 320);
-      const stepY = 190;
-      for (let y = -height; y < height * 2; y += stepY) {
-        for (let x = -width; x < width * 2; x += stepX) {
-          page.drawText(spec.banner, {
-            x, y, size: bannerSize, font, color,
-            opacity: spec.bannerOpacity, rotate: degrees(45),
-          });
-        }
-      }
-      // Footer provenance strip
-      page.drawText(spec.footer, {
-        x: 24, y: 14, size: 7.5, font, color,
-        opacity: spec.footerOpacity, maxWidth: width - 48,
-      });
-    }
-    const stamped = Buffer.from(await pdfDoc.save());
+    const stamped = await stampContractWatermark(cleanBuf, contract, userName);
 
     // Catat audit trail bahwa dokumen dilihat
     pushAudit(db, req, {
@@ -3787,6 +3941,10 @@ app.post("/api/contracts/:id/export-share", requireAuth, upload.single("file"), 
     fileUrl = stored.url;
     contract.exportedPdfUrl = fileUrl;
     contract.exportedPdfKey = stored.key; // untuk fetch ulang server-side (lampiran email)
+  } else if (resolveDocumentSource(contract) === "upload" && !contract.activationProofKey && contract.currentDocument) {
+    // Upload Dokumen: bagikan versi dokumen TERKINI dari workspace, bukan
+    // original (masterPdfUrl) yang mungkin sudah direvisi.
+    fileUrl = contract.currentDocument.url;
   } else if (contract.masterPdfUrl) {
     fileUrl = contract.masterPdfUrl;
   } else {
@@ -3984,6 +4142,341 @@ app.get("/api/contracts/:id/versions", requireAuth, (req: AuthedRequest, res) =>
   res.json(versions);
 });
 
+
+// 7b. DOCUMENT WORKSPACE (documentSource "upload")
+//
+// Berkas yang diunggah user adalah dokumen kontrak UTAMA. Endpoint di bawah
+// menyajikan berkas asli/versi apa adanya (layout 100% asli), dan menyimpan
+// hasil edit workspace sebagai VERSI BARU — original (versi 0) tidak pernah
+// ditimpa. Kontrak "template" tidak memakai endpoint ini sama sekali.
+const DOC_VIEW_STATUSES = ["Draft", "OnReview", "FullyApproved", "Aktif", "TidakAktif", "Archived", "Terminated"];
+const DOC_DOWNLOAD_STATUSES = ["FullyApproved", "Aktif", "TidakAktif", "Archived", "Terminated"];
+
+function uploadedDocumentVersions(db: any, contract: Contract): ContractVersion[] {
+  const list = documentVersionsOf(db.versions as ContractVersion[], contract.id);
+  if (list.length > 0) return list;
+  // Kontrak upload lama (sebelum versioning dokumen): original = masterPdfUrl.
+  const legacy = contract.originalDocument || legacyDocumentRef(contract);
+  if (!legacy) return [];
+  return [{
+    id: `legacy-${contract.id}`, tenantId: contract.tenantId, contractId: contract.id, version: 0,
+    title: contract.title, variables: {}, clauses: [], updatedAt: legacy.uploadedAt, updatedBy: "",
+    comment: "Dokumen asli (data lama)", kind: "document", isOriginal: true, file: legacy, editMethod: "original",
+  }];
+}
+
+function currentDocumentVersionNumber(contract: Contract, versions: ContractVersion[]): number {
+  if (typeof contract.currentDocumentVersion === "number") return contract.currentDocumentVersion;
+  return versions.length ? versions[versions.length - 1].version : 0;
+}
+
+app.get("/api/contracts/:id/document-versions", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  const versions = uploadedDocumentVersions(db, contract);
+  res.json({
+    documentSource: resolveDocumentSource(contract),
+    currentVersion: currentDocumentVersionNumber(contract, versions),
+    versions,
+    capabilities: { docConversion: isOfficeConverterAvailable(), pdfTextEdit: true },
+  });
+});
+
+// ?version=<n>|original|current (default current), ?download=1 utk unduh.
+app.get("/api/contracts/:id/document", requireAuth, async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  if (resolveDocumentSource(contract) !== "upload") {
+    return res.status(409).json({ error: "Kontrak ini dibuat dari template — tidak punya berkas dokumen upload." });
+  }
+  if (!DOC_VIEW_STATUSES.includes(contract.status)) {
+    return res.status(403).json({ error: "Dokumen belum bisa dibuka." });
+  }
+  const download = req.query.download === "1";
+  // Kebijakan yang sama dengan Export/Kirim PDF: sebelum approval matriks
+  // selesai, dokumen boleh DILIHAT di dalam sistem tapi tidak diunduh.
+  if (download && !DOC_DOWNLOAD_STATUSES.includes(contract.status)) {
+    return res.status(403).json({ error: "Dokumen belum bisa diunduh — selesaikan approval matriks terlebih dahulu." });
+  }
+  const versions = uploadedDocumentVersions(db, contract);
+  const q = String(req.query.version ?? "current");
+  const wanted = q === "original" ? 0 : q === "current" ? currentDocumentVersionNumber(contract, versions) : Number(q);
+  const ver = versions.find((v) => v.version === wanted);
+  if (!ver?.file) return res.status(404).json({ error: `Versi dokumen ${q} tidak ditemukan.` });
+  // ?source=1 : berkas yang diunggah user utk versi hasil konversi (.doc asli).
+  const fileRef = req.query.source === "1" && ver.sourceFile ? ver.sourceFile : ver.file;
+
+  try {
+    let buf = await readStoredDocument(fileRef, uploadDir);
+    // ?as=docx : pratinjau .doc lewat konversi (tidak membuat versi baru).
+    if (req.query.as === "docx" && fileRef.format === "doc") {
+      const out = await convertedDocxFor(buf);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("X-Converted-From", "doc");
+      return res.send(out);
+    }
+    const wmSettings = withSettingsDefaults(rawSettingsFor(db, tenantOf(req)));
+    if (download && fileRef.format === "pdf" && wmSettings.contractWatermark) {
+      buf = await stampContractWatermark(buf, contract, req.user!.name);
+    }
+    if (download) {
+      pushAudit(db, req, {
+        contractId: contract.id, contractNumber: contract.contractNumber,
+        action: "Download Document",
+        details: `${req.user!.name} mengunduh dokumen "${ver.file.fileName}" (versi ${ver.version}${ver.isOriginal ? " — original" : ""}).`,
+      });
+      saveDB(db);
+    }
+    const outName = ver.file.fileName;
+    res.setHeader("Content-Type", fileRef.mimeType);
+    res.setHeader("Content-Length", buf.length);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Document-Version", String(ver.version));
+    res.setHeader("Content-Disposition", contentDisposition(download ? "attachment" : "inline", fileRef === ver.file ? outName : fileRef.fileName));
+    res.send(buf);
+  } catch (err: any) {
+    logger.error({ err, contractId: contract.id }, "Gagal membaca berkas dokumen kontrak");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal membaca berkas dokumen." });
+  }
+});
+
+function pushDocumentVersion(
+  db: any, req: AuthedRequest, contract: Contract, file: StoredDocumentRef,
+  opts: { comment: string; basedOnVersion: number; editMethod: ContractVersion["editMethod"]; sourceFile?: StoredDocumentRef },
+): ContractVersion {
+  const versions = uploadedDocumentVersions(db, contract);
+  // Kontrak upload lama: materialisasi dulu versi 0 (original) supaya
+  // riwayat lengkap & original tetap bisa dibuka setelah versi baru ada.
+  if (versions.length === 1 && versions[0].id.startsWith("legacy-")) {
+    const orig = { ...versions[0], id: "ver-" + Date.now() + "-orig" };
+    db.versions.push(orig);
+    if (!contract.originalDocument) contract.originalDocument = orig.file;
+  }
+  const nextNum = versions.length ? Math.max(...versions.map((v) => v.version)) + 1 : 1;
+  const ver: ContractVersion = {
+    id: "ver-" + Date.now() + "-doc" + nextNum,
+    tenantId: contract.tenantId,
+    contractId: contract.id,
+    version: nextNum,
+    title: contract.title,
+    variables: {},
+    clauses: [],
+    updatedAt: new Date().toISOString(),
+    updatedBy: req.user!.name,
+    comment: opts.comment,
+    kind: "document",
+    file,
+    basedOnVersion: opts.basedOnVersion,
+    editMethod: opts.editMethod,
+    ...(opts.sourceFile ? { sourceFile: opts.sourceFile } : {}),
+  };
+  db.versions.push(ver);
+  contract.currentDocument = file;
+  contract.currentDocumentVersion = nextNum;
+  contract.documentSource = "upload";
+  contract.updatedAt = ver.updatedAt;
+  return ver;
+}
+
+// Simpan hasil edit workspace (atau revisi yang diunggah) sbg versi BARU.
+// Multipart: file, comment, baseVersion (versi yang sedang diedit — cegah
+// menimpa perubahan orang lain), editMethod.
+app.post("/api/contracts/:id/document-versions", requireAuth, requireRole("admin", "staff", "legal", "manager"),
+  uploadContractDoc.single("file"), async (req: AuthedRequest, res) => {
+  if (!req.file) return res.status(400).json({ error: "Berkas versi baru wajib dikirim." });
+  const fileName = cleanFileName(req.file.originalname);
+  const format = sniffFormat(req.file.buffer, fileName);
+  if (!format) return res.status(400).json({ error: "Isi berkas tidak dikenali sebagai PDF, Word, JPG, atau PNG yang valid." });
+  const key = `contractdoc-${String(req.params.id).replace(/[^\w-]/g, "")}-${Date.now()}-${Math.round(Math.random() * 1e9)}${extForFormat(format, fileName)}`;
+  // Simpan berkas dulu (await) sebelum loadDB(), sama seperti POST /api/contracts.
+  let stored;
+  {
+    const pre = loadDB();
+    const c = findOwnedContract(pre, req, req.params.id);
+    if (!c) return res.status(404).json({ error: "Contract not found" });
+    if (resolveDocumentSource(c) !== "upload") return res.status(409).json({ error: "Versi dokumen hanya untuk kontrak hasil Upload Dokumen." });
+    if (c.status !== "Draft") return res.status(400).json({ error: "Dokumen hanya bisa diubah selagi kontrak berstatus Draft." });
+    stored = await storeFile(req.file.buffer, key, req.file.mimetype);
+  }
+  const db = loadDB();
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  const versions = uploadedDocumentVersions(db, contract);
+  const current = currentDocumentVersionNumber(contract, versions);
+  const baseVersion = req.body.baseVersion !== undefined && req.body.baseVersion !== "" ? Number(req.body.baseVersion) : current;
+  if (baseVersion !== current) {
+    return res.status(409).json({ error: `Dokumen sudah diperbarui ke versi ${current} oleh pengguna lain. Muat ulang workspace sebelum menyimpan.`, currentVersion: current });
+  }
+  const editMethod = ["docx-inline", "pdf-overlay", "revision-upload"].includes(req.body.editMethod) ? req.body.editMethod : "revision-upload";
+  const comment = String(req.body.comment || "").trim().slice(0, 500);
+  let file = buildDocumentRef(req.file.buffer, stored, fileName, format, req.user!.name);
+  let sourceFile: StoredDocumentRef | undefined;
+  let method = editMethod;
+  // Revisi .doc: simpan .doc apa adanya sbg sourceFile, versi kerjanya .docx
+  // hasil konversi supaya langsung bisa dipratinjau & diedit.
+  if (format === "doc" && isOfficeConverterAvailable()) {
+    try {
+      const out = await convertedDocxFor(req.file.buffer);
+      const conv = await storeFile(out, key.replace(/\.doc$/i, "") + "-conv.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+      sourceFile = file;
+      file = buildDocumentRef(out, conv, fileName.replace(/\.doc$/i, "") + ".docx", "docx", req.user!.name);
+      method = "revision-upload";
+    } catch (err) {
+      logger.warn({ err }, "Konversi revisi .doc gagal — disimpan sbg .doc");
+    }
+  }
+  const ver = pushDocumentVersion(db, req, contract, file, {
+    sourceFile,
+    comment: comment || `Perubahan dokumen ke versi ${versions.length ? Math.max(...versions.map((v) => v.version)) + 1 : 1}`,
+    basedOnVersion: baseVersion,
+    editMethod: method,
+  });
+  pushAudit(db, req, {
+    contractId: contract.id, contractNumber: contract.contractNumber,
+    action: "Save Document Version",
+    details: `Menyimpan dokumen versi ${ver.version} (dari versi ${baseVersion}, metode ${editMethod}): "${file.fileName}" · SHA-256 ${file.sha256.slice(0, 16)}… — original tetap utuh.`,
+  });
+  saveDB(db);
+  res.json({ success: true, contract, version: ver });
+});
+
+// Cache hasil konversi .doc -> .docx utk pratinjau (per hash isi berkas).
+const convertedCache = new Map<string, Buffer>();
+async function convertedDocxFor(buf: Buffer): Promise<Buffer> {
+  const key = sha256(buf);
+  const hit = convertedCache.get(key);
+  if (hit) return hit;
+  const out = await convertDocToDocx(buf);
+  convertedCache.set(key, out);
+  if (convertedCache.size > 20) convertedCache.delete(convertedCache.keys().next().value!);
+  return out;
+}
+
+function assertEditableUploadContract(contract: Contract | undefined, res: any): contract is Contract {
+  if (!contract) { res.status(404).json({ error: "Contract not found" }); return false; }
+  if (resolveDocumentSource(contract) !== "upload") { res.status(409).json({ error: "Versi dokumen hanya untuk kontrak hasil Upload Dokumen." }); return false; }
+  if (contract.status !== "Draft") { res.status(400).json({ error: "Dokumen hanya bisa diubah selagi kontrak berstatus Draft." }); return false; }
+  return true;
+}
+
+// Konversi versi aktif .doc -> .docx sebagai versi BARU (agar bisa diedit).
+app.post("/api/contracts/:id/document-versions/convert", requireAuth, requireRole("admin", "staff", "legal", "manager"), async (req: AuthedRequest, res) => {
+  const pre = findOwnedContract(loadDB(), req, req.params.id);
+  if (!assertEditableUploadContract(pre, res)) return;
+  const preVersions = uploadedDocumentVersions(loadDB(), pre);
+  const cur = preVersions.find((v) => v.version === currentDocumentVersionNumber(pre, preVersions));
+  if (!cur?.file || cur.file.format !== "doc") return res.status(400).json({ error: "Versi aktif bukan berkas .doc." });
+  try {
+    const out = await convertedDocxFor(await readStoredDocument(cur.file, uploadDir));
+    const name = cur.file.fileName.replace(/\.doc$/i, "") + ".docx";
+    const stored = await storeFile(out, `contractdoc-${pre.id.replace(/[^\w-]/g, "")}-${Date.now()}-conv.docx`, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    const db = loadDB();
+    const contract = findOwnedContract(db, req, req.params.id)!;
+    const versions = uploadedDocumentVersions(db, contract);
+    const current = currentDocumentVersionNumber(contract, versions);
+    if (current !== cur.version) return res.status(409).json({ error: "Dokumen sudah berubah. Muat ulang workspace." });
+    const ver = pushDocumentVersion(db, req, contract, buildDocumentRef(out, stored, name, "docx", req.user!.name), {
+      comment: `Konversi .doc → .docx agar bisa diedit (dari ${cur.isOriginal ? "original" : `versi ${cur.version}`})`,
+      basedOnVersion: current, editMethod: "converted", sourceFile: cur.file,
+    });
+    pushAudit(db, req, { contractId: contract.id, contractNumber: contract.contractNumber, action: "Convert Document", details: `Konversi "${cur.file.fileName}" ke .docx sebagai versi ${ver.version}.` });
+    saveDB(db);
+    res.json({ success: true, contract, version: ver });
+  } catch (err: any) {
+    res.status(err?.status || 500).json({ error: err?.message || "Konversi gagal." });
+  }
+});
+
+// Tata letak teks PDF (baris-baris yang bisa diedit) utk versi tertentu.
+app.get("/api/contracts/:id/document/pdf-layout", requireAuth, async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  const versions = uploadedDocumentVersions(db, contract);
+  const q = String(req.query.version ?? "current");
+  const wanted = q === "current" ? currentDocumentVersionNumber(contract, versions) : Number(q);
+  const ver = versions.find((v) => v.version === wanted);
+  if (!ver?.file || ver.file.format !== "pdf") return res.status(400).json({ error: "Versi ini bukan PDF." });
+  try {
+    const layout = await extractPdfLayout(await readStoredDocument(ver.file, uploadDir));
+    res.json({ version: ver.version, ...layout });
+  } catch (err: any) {
+    logger.error({ err, contractId: contract.id }, "Gagal membaca tata letak teks PDF");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal membaca teks PDF." });
+  }
+});
+
+// Simpan edit TEKS ASLI PDF (+ teks baru & redaksi) sebagai versi baru.
+app.post("/api/contracts/:id/document-versions/pdf-edit", requireAuth, requireRole("admin", "staff", "legal", "manager"), async (req: AuthedRequest, res) => {
+  const pre = findOwnedContract(loadDB(), req, req.params.id);
+  if (!assertEditableUploadContract(pre, res)) return;
+  const preVersions = uploadedDocumentVersions(loadDB(), pre);
+  const current0 = currentDocumentVersionNumber(pre, preVersions);
+  const baseVersion = req.body.baseVersion !== undefined ? Number(req.body.baseVersion) : current0;
+  if (baseVersion !== current0) return res.status(409).json({ error: `Dokumen sudah diperbarui ke versi ${current0}. Muat ulang workspace sebelum menyimpan.`, currentVersion: current0 });
+  const base = preVersions.find((v) => v.version === current0);
+  if (!base?.file || base.file.format !== "pdf") return res.status(400).json({ error: "Versi aktif bukan PDF." });
+  const edits = Array.isArray(req.body.edits) ? req.body.edits.slice(0, 2000).map((e: any) => ({ lineId: String(e.lineId), oldText: String(e.oldText ?? ""), newText: String(e.newText ?? "").slice(0, 2000) })) : [];
+  const addTexts = Array.isArray(req.body.addTexts) ? req.body.addTexts.slice(0, 500).map((a: any) => ({ page: Number(a.page), x: Number(a.x), y: Number(a.y), text: String(a.text ?? "").slice(0, 4000), size: Number(a.size) })) : [];
+  const covers = Array.isArray(req.body.covers) ? req.body.covers.slice(0, 500).map((c: any) => ({ page: Number(c.page), x: Number(c.x), y: Number(c.y), w: Number(c.w), h: Number(c.h) })) : [];
+  if (!edits.length && !addTexts.some((a: any) => a.text.trim()) && !covers.length) return res.status(400).json({ error: "Tidak ada perubahan untuk disimpan." });
+  try {
+    const result = await applyPdfEdits(await readStoredDocument(base.file, uploadDir), { edits, addTexts, covers });
+    const originalName = (preVersions.find((v) => v.isOriginal)?.file?.fileName || base.file.fileName).replace(/\.pdf$/i, "").replace(/\s*\(v\d+\)$/, "");
+    const db = loadDB();
+    const contract = findOwnedContract(db, req, req.params.id)!;
+    const versions = uploadedDocumentVersions(db, contract);
+    const current = currentDocumentVersionNumber(contract, versions);
+    if (current !== current0) return res.status(409).json({ error: "Dokumen sudah diperbarui oleh pengguna lain. Muat ulang workspace." });
+    const nextNum = versions.length ? Math.max(...versions.map((v) => v.version)) + 1 : 1;
+    const stored = await storeFile(result.pdf, `contractdoc-${contract.id.replace(/[^\w-]/g, "")}-${Date.now()}-v${nextNum}.pdf`, "application/pdf");
+    const summary = [
+      result.changedLines ? `${result.changedLines} baris teks diubah` : "",
+      result.added ? `${result.added} teks baru` : "",
+      result.covered ? `${result.covered} area dihapus (redaksi)` : "",
+    ].filter(Boolean).join(", ");
+    const ver = pushDocumentVersion(db, req, contract, buildDocumentRef(result.pdf, stored, `${originalName} (v${nextNum}).pdf`, "pdf", req.user!.name), {
+      comment: String(req.body.comment || "").trim().slice(0, 500) || summary,
+      basedOnVersion: current, editMethod: "pdf-text",
+    });
+    pushAudit(db, req, { contractId: contract.id, contractNumber: contract.contractNumber, action: "Save Document Version", details: `Edit teks PDF → versi ${ver.version} (${summary}${result.fallbackLines ? `; ${result.fallbackLines} baris memakai font pengganti` : ""}). Original tetap utuh.` });
+    saveDB(db);
+    res.json({ success: true, contract, version: ver, fallbackLines: result.fallbackLines });
+  } catch (err: any) {
+    logger.error({ err, contractId: pre.id }, "Gagal menerapkan edit PDF");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal menyimpan edit PDF." });
+  }
+});
+
+// Kembalikan ke versi lama = buat versi BARU yang menunjuk berkas versi itu
+// (riwayat tidak pernah ditulis ulang/dihapus).
+app.post("/api/contracts/:id/document-versions/:version/restore", requireAuth, requireRole("admin", "staff", "legal", "manager"), (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  if (resolveDocumentSource(contract) !== "upload") return res.status(409).json({ error: "Versi dokumen hanya untuk kontrak hasil Upload Dokumen." });
+  if (contract.status !== "Draft") return res.status(400).json({ error: "Dokumen hanya bisa diubah selagi kontrak berstatus Draft." });
+  const versions = uploadedDocumentVersions(db, contract);
+  const target = versions.find((v) => v.version === Number(req.params.version));
+  if (!target?.file) return res.status(404).json({ error: "Versi tidak ditemukan." });
+  const current = currentDocumentVersionNumber(contract, versions);
+  if (target.version === current) return res.status(400).json({ error: "Versi ini sudah menjadi versi aktif." });
+  const ver = pushDocumentVersion(db, req, contract, target.file, {
+    comment: `Dikembalikan ke isi versi ${target.version}${target.isOriginal ? " (original)" : ""}`,
+    basedOnVersion: current,
+    editMethod: "revision-upload",
+  });
+  pushAudit(db, req, {
+    contractId: contract.id, contractNumber: contract.contractNumber,
+    action: "Restore Document Version",
+    details: `Mengembalikan dokumen ke isi versi ${target.version} sebagai versi baru ${ver.version}.`,
+  });
+  saveDB(db);
+  res.json({ success: true, contract, version: ver });
+});
 
 // 8. SMART RENEWAL ENGINE (klik perpanjang, AI atau sistem buat perpanjangan otomatis tahun berikutnya)
 app.post("/api/contracts/:id/renew", requireAuth, requireRole("admin", "staff", "legal", "manager"), (req: AuthedRequest, res) => {

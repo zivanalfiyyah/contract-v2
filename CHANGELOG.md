@@ -1,5 +1,72 @@
 # Changelog & Panduan Migrasi
 
+## [Unreleased #6] — Editor lengkap Document Workspace: edit teks asli PDF, editor Word, dukungan .doc
+
+### Ringkasan
+
+- **PDF: semua teks asli bisa diedit langsung.** Klik teks mana pun di halaman lalu ketik. Server (PDFium WebAssembly, `@embedpdf/pdfium`, MIT — `pdf-text-edit.ts`) mengubah objek teks di dalam PDF itu sendiri: font asli dipakai bila huruf barunya tersedia di font tertanam, kalau tidak dipakai font standar PDF yang paling mirip (serif/sans/mono, tebal/miring, ukuran & warna sama). Objek sesudahnya di baris yang sama digeser; baris rata-tengah tetap di tengah. Hasilnya teks PDF sungguhan (bisa dicari/disalin), bukan gambar/overlay.
+- **PDF "Hapus area" = redaksi sungguhan** (teks di area dihapus dari PDF), menggantikan "Tutup" lama yang hanya menutup tampilan. "Tambah teks" tetap ada.
+- **Editor Word (.docx) lengkap:** Enter = paragraf baru (gaya paragraf ikut), Shift+Enter = baris baru, Backspace/Delete di tepi paragraf = gabung paragraf, tebal/miring/garis bawah, perataan kiri/tengah/kanan/rata, tambah/hapus baris tabel. Semua ditulis ke XML berkas .docx asli (`src/docx-patch.ts`, urutan elemen sesuai skema OOXML), part lain (header, footer, gambar, style) disalin apa adanya.
+- **Word 97-2003 (.doc):** dikonversi ke .docx memakai LibreOffice di server (`office-convert.ts`). Saat kontrak dibuat dari .doc: Versi 0 = .doc asli, Versi 1 = .docx hasil konversi (aktif). Revisi .doc yang diunggah langsung dikonversi (berkas .doc-nya disimpan sbg `sourceFile` & tetap bisa diunduh). Versi .doc lama: dipratinjau via konversi; tombol "Edit Dokumen" membuat versi .docx lalu masuk mode edit.
+
+### Endpoint baru
+
+- `GET /api/contracts/:id/document/pdf-layout?version=` — baris-baris teks PDF (posisi, ukuran, gaya) untuk editor.
+- `POST /api/contracts/:id/document-versions/pdf-edit` — `{ baseVersion, comment, edits[{lineId, oldText, newText}], addTexts[], covers[] }` → versi baru.
+- `POST /api/contracts/:id/document-versions/convert` — konversi versi aktif .doc → .docx sebagai versi baru.
+- `GET /api/contracts/:id/document?as=docx` (pratinjau .doc) & `?source=1` (unduh berkas asli dari versi hasil konversi).
+- `GET /api/contracts/:id/document-versions` menambah `capabilities: { docConversion, pdfTextEdit }`.
+
+### Kebutuhan server
+
+- LibreOffice harus terpasang untuk .doc (`deploy/hostinger-vps-setup.sh` sudah memasangnya). Lokasi dicari dari `LIBREOFFICE_PATH`, PATH, lalu lokasi standar Windows/macOS/Linux. Tanpa LibreOffice, .doc tetap tersimpan & bisa diunduh, workspace menampilkan instruksi pemasangan.
+- Dependency baru: `@embedpdf/pdfium` (MIT).
+
+### Batasan yang tersisa
+
+- PDF tidak punya aliran paragraf: teks yang jauh lebih panjang tetap satu baris (tidak turun otomatis). Halaman berotasi & teks miring dikunci.
+- DOCX: header/footer (kop) belum bisa diedit dari workspace; paragraf berisi field/simbol khusus dikunci.
+
+## [Unreleased #5] — Upload Dokumen sebagai Dokumen Kontrak Utama + Document Workspace
+
+### Masalah
+
+Kontrak hasil **Upload Dokumen** kehilangan layout (kop/header, logo, tabel, footer, page break, area TTD) dan tampil sebagai kumpulan paragraf. Akar masalahnya:
+
+1. Wizard memanggil `/api/master-contracts/extract-text` saat file dipilih — PDF/DOCX diubah jadi teks polos lalu dipaksa ke struktur `preamble + clauses[] + closing` template.
+2. Workspace merender kontrak upload dengan preview **template** (kop sistem, narasi, `clauses.map`, TTD sistem); file aslinya tidak pernah ditampilkan.
+3. Auto-OCR setelah create mengisi `clauses` lagi bila ekstraksi gagal.
+4. Multer `upload` hanya menerima PDF/JPG/PNG sehingga `.docx` diam-diam gagal diunggah dan kontrak lahir tanpa berkas.
+5. Pointer file satu-satunya (`masterPdfUrl`) ditimpa bukti TTD saat aktivasi — original tidak terlindungi.
+
+### Perubahan
+
+- **`documentSource: "template" | "upload"`** di `Contract`. Data lama tanpa field ini diturunkan dari `creationMode`, jadi kontrak lama tetap berperilaku sama. `template` → editor template existing (tidak diubah); `upload` → `UploadedDocumentWorkspace`.
+- **Original immutable**: `originalDocument` (key, url, nama, mime, format, ukuran, SHA-256) + versi dokumen 0. `currentDocument`/`currentDocumentVersion` menunjuk versi aktif.
+- **Versioning**: `ContractVersion` (tabel `versions` yang sama) di-extend dengan `kind: "document"`, `isOriginal`, `file`, `basedOnVersion`, `editMethod`. Penomoran versi isi template tidak ikut menghitung versi dokumen.
+- **Document Workspace** (`src/UploadedDocumentWorkspace.tsx`): Preview, Edit, Save (versi baru), Cancel, Download, Unggah Revisi, riwayat versi, lihat versi lama, "Jadikan Versi Aktif".
+  - PDF: dirender pdf.js (build legacy) per halaman — identik dengan PDF asli. Edit = anotasi teks & penutup (whiteout) yang dibakar ke salinan via pdf-lib.
+  - DOCX: dirender docx-preview (header/logo, tabel, footer, page break). Edit teks in-place; `src/docx-patch.ts` menerapkan diff karakter langsung ke `<w:t>` di `word/document.xml` berkas asli, semua part lain disalin apa adanya — format run/paragraf tetap.
+  - DOC lama & gambar: pratinjau gambar / unduh; revisi via "Unggah Revisi".
+- Wizard Upload tidak lagi mengekstrak teks/pasal maupun menjalankan auto-OCR; gagal unggah kini menghentikan pembuatan kontrak.
+- `/view-pdf`, `export-share`, dan tombol Export untuk kontrak upload memakai berkas versi aktif (non-PDF disajikan dengan mime aslinya).
+- Toggle khusus preview template (Kop Surat, Logo, Meterai, bahasa ID/EN, OCR, "Simpan Draft Baru") disembunyikan untuk kontrak upload.
+
+### Endpoint
+
+- `POST /api/master-contracts/upload` — kini menerima PDF, DOCX, DOC, JPG, PNG (isi diverifikasi magic bytes); respons menambah `document` (metadata lengkap). `url` tetap ada untuk alur lama.
+- `POST /api/contracts` — `creationMode: "upload"` wajib menyertakan `uploadedDocument` (hasil endpoint di atas); server membaca ulang berkas dari storage untuk hash/ukuran/format. `clauses` diabaikan untuk upload.
+- `GET /api/contracts/:id/document-versions` — daftar versi dokumen + versi aktif.
+- `GET /api/contracts/:id/document?version=<n|original|current>&download=1` — berkas apa adanya. Unduh mengikuti kebijakan existing (hanya setelah FullyApproved) + watermark bila diaktifkan.
+- `POST /api/contracts/:id/document-versions` — multipart `file`, `comment`, `baseVersion` (409 bila versi aktif sudah berubah), `editMethod`. Hanya saat Draft.
+- `POST /api/contracts/:id/document-versions/:version/restore` — membuat versi baru yang menunjuk berkas versi lama.
+
+### Batasan tahap awal
+
+- DOCX: belum bisa menambah paragraf/baris tabel baru; header/footer diproteksi. Paragraf yang tidak bisa dipasangkan aman ke XML (mis. berisi simbol/field) dikunci. Perubahan struktur → "Unggah Revisi".
+- PDF: "Tutup" hanya menutup tampilan; teks asli di bawahnya tetap ada di berkas. Penghapusan isi permanen → "Unggah Revisi".
+- `.doc` (Word 97-2003) tidak dipratinjau di browser (tanpa konversi server).
+
 ## [Unreleased #4] — Fitur AI Gemini Baru: Bandingkan Dokumen, Buat Draft AI, Copilot Multi-Turn
 
 ### Ringkasan

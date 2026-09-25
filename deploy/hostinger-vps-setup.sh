@@ -27,6 +27,9 @@ APP_PORT=3000
 echo "== 1/6: System update & base packages =="
 apt-get update -y
 apt-get install -y curl git nginx
+# LibreOffice (headless, tanpa GUI) — konversi Word 97-2003 (.doc) ke .docx
+# agar dokumen .doc hasil Upload Dokumen bisa dipratinjau & diedit.
+apt-get install -y --no-install-recommends libreoffice-writer-nogui || apt-get install -y --no-install-recommends libreoffice-writer
 
 echo "== 2/6: Node.js 22 LTS =="
 if ! command -v node >/dev/null || [[ "$(node -v)" != v22* ]]; then

@@ -26,10 +26,11 @@ import {
   Download, Edit3, FileText, History, Loader2, RotateCcw, Save, Type, Upload, X,
   Square, Trash2, AlertTriangle, Lock, ZoomIn, ZoomOut, CheckCircle, Bold, Italic,
   Underline, AlignLeft, AlignCenter, AlignRight, AlignJustify, TableRowsSplit, Rows3, TextCursorInput,
+  AlignVerticalSpaceAround,
 } from "lucide-react";
 import type { Contract, ContractVersion, StoredDocumentRef } from "./types";
 import {
-  loadDocx, bindRenderedParagraphs, renderedChars, renderedAlign, applyPlan, serializeDocx,
+  loadDocx, bindRenderedParagraphs, renderedChars, renderedAlign, renderedLineSpacing, applyPlan, serializeDocx,
   addTableRowAfter, removeTableRow, type ParagraphBinding, type DocxEditPlan, type NewParagraph,
 } from "./docx-patch";
 
@@ -449,53 +450,133 @@ function ImageView({ data, mime }: { data: ArrayBuffer; mime: string }) {
 }
 
 // Tombol toolbar: onMouseDown preventDefault supaya seleksi di dokumen tidak hilang.
-function TBtn({ onClick, title, children, disabled }: { onClick: () => void; title: string; children: React.ReactNode; disabled?: boolean }) {
+function TBtn({ onClick, title, children, disabled, active }: { onClick: () => void; title: string; children: React.ReactNode; disabled?: boolean; active?: boolean }) {
   return (
-    <button type="button" title={title} aria-label={title} disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={onClick}
-      className="h-7 min-w-[28px] px-1.5 rounded-md text-slate-300 hover:bg-indigo-500/15 hover:text-indigo-300 flex items-center justify-center gap-1 text-[11px] font-semibold disabled:opacity-40 cursor-pointer">
+    <button type="button" title={title} aria-label={title} aria-pressed={active} disabled={disabled} onMouseDown={(e) => e.preventDefault()} onClick={onClick}
+      className={`h-7 min-w-[28px] px-1.5 rounded-md flex items-center justify-center gap-1 text-[11px] font-semibold disabled:opacity-40 cursor-pointer ${active ? "bg-indigo-500/25 text-indigo-300" : "text-slate-300 hover:bg-indigo-500/15 hover:text-indigo-300"}`}>
       {children}
     </button>
   );
 }
 
+// Daftar font & ukuran utk toolbar DOCX — sengaja dibatasi ke font yang lazim
+// dipakai di kontrak/dokumen kantor (semua tersedia di OS umum) supaya render
+// pratinjau (docx-preview) konsisten dgn apa yang dipilih.
+const FONT_OPTIONS = ["Times New Roman", "Calibri", "Arial", "Cambria", "Georgia", "Garamond", "Verdana", "Tahoma", "Courier New"];
+const FONT_SIZE_OPTIONS = [8, 9, 10, 10.5, 11, 12, 13, 14, 16, 18, 20, 24, 28, 32, 36, 40, 48];
+const LINE_SPACING_OPTIONS = [
+  { v: 1, label: "1.0" },
+  { v: 1.15, label: "1.15" },
+  { v: 1.5, label: "1.5" },
+  { v: 2, label: "2.0" },
+];
+
 // ---------------------------------------------------------------------------
 // DOCX editor
+//
+// Satu <div contentEditable> membungkus SELURUH isi dokumen (satu editing
+// host besar, bukan satu per paragraf) — cursor, seleksi, Enter/Backspace,
+// copy/paste ditangani NATIF oleh browser lintas paragraf, persis Word.
+// Paragraf yang tidak berhasil dipasangkan ke XML (kop/field kompleks) atau
+// yang ada di header/footer dikunci lewat contenteditable="false" bersarang
+// (carve-out) di dalam host yang tetap contenteditable="true" — pola yang
+// sama dipakai Word utk konten terproteksi.
+//
+// Identitas paragraf dilacak lewat WeakMap<Element, xmlIndex> yang dibuat
+// SEKALI saat bind, bukan lewat atribut data-pidx. Ini penting: saat browser
+// memecah <p> jadi dua (Enter di tengah paragraf), Chromium/Firefox biasanya
+// mengkloning atribut elemen aslinya ke elemen p baru — kalau identitas
+// dilacak lewat atribut, dua <p> bisa "mengaku" indeks XML yang sama. Dengan
+// WeakMap, hanya NODE ASLI yang dikenali; node hasil split/paste selalu
+// dianggap paragraf baru — cocok dgn perilaku Word (bagian yang dipecah jadi
+// paragraf baru, bagian asli tetap paragraf lama).
 // ---------------------------------------------------------------------------
 const HOST_SEL = "[data-docx-host]";
 
-function hostOfSelection(root: HTMLElement | null): HTMLElement | null {
+/** <p> terdekat (naik dari node seleksi) yang berada di dalam root editor. */
+function nearestParagraph(root: HTMLElement | null): HTMLElement | null {
   const sel = window.getSelection();
   const n = sel?.anchorNode;
   const el = n ? (n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement) : null;
-  const host = el?.closest(HOST_SEL) as HTMLElement | null;
-  return host && root?.contains(host) ? host : null;
+  const p = el?.closest("p") as HTMLElement | null;
+  return p && root?.contains(p) ? p : null;
 }
 
-function caretIsAt(host: HTMLElement, edge: "start" | "end"): boolean {
+/** true kalau seleksi saat ini berada di dalam root editor (bukan di toolbar/luar). */
+function selectionInRoot(root: HTMLElement | null): boolean {
   const sel = window.getSelection();
-  if (!sel || !sel.isCollapsed || !sel.anchorNode) return false;
-  const r = document.createRange();
-  if (edge === "start") { r.setStart(host, 0); r.setEnd(sel.anchorNode, sel.anchorOffset); }
-  else { r.setStart(sel.anchorNode, sel.anchorOffset); r.setEnd(host, host.childNodes.length); }
-  const frag = r.cloneContents();
-  // <br> penjaga di akhir paragraf tidak dihitung sbg isi.
-  const brs = frag.querySelectorAll("br").length;
-  return (frag.textContent || "").replace(/​/g, "") === "" && (edge === "end" ? brs <= 1 : brs === 0) && !frag.querySelector("img");
+  const n = sel?.anchorNode;
+  if (!n || !root) return false;
+  const el = n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement;
+  return !!el && root.contains(el);
 }
 
-function placeCaret(node: Node, offset: number) {
-  const sel = window.getSelection();
-  if (!sel) return;
-  const r = document.createRange();
-  r.setStart(node, offset);
-  r.collapse(true);
-  sel.removeAllRanges();
-  sel.addRange(r);
-}
-
-function stripTrailingGuard(t: { text: string; attrs: number[] }, original?: string) {
-  if (t.text.endsWith("\n") && !(original ?? "").endsWith("\n")) return { text: t.text.slice(0, -1), attrs: t.attrs.slice(0, -1) };
+function stripTrailingGuard<T extends { text: string; attrs: number[]; fonts: string[]; sizes: number[] }>(t: T, original?: string): T {
+  if (t.text.endsWith("\n") && !(original ?? "").endsWith("\n")) {
+    return { ...t, text: t.text.slice(0, -1), attrs: t.attrs.slice(0, -1), fonts: t.fonts.slice(0, -1), sizes: t.sizes.slice(0, -1) };
+  }
   return t;
+}
+
+// ---- Terapkan style karakter (font/ukuran) pada seleksi -------------------
+// Tidak memakai execCommand (skalanya cuma 1-7, tidak presisi ke pt) —
+// menulis <span style="..."> langsung ke Range, sama seperti tombol
+// align()/lineSpacing() di bawah yang juga menulis style langsung.
+
+function closestP(node: Node | null, root: HTMLElement): HTMLElement | null {
+  const el = node && (node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement);
+  const p = el?.closest("p");
+  return p && root.contains(p) ? (p as HTMLElement) : null;
+}
+
+/** Terapkan gaya CSS karakter ke seleksi aktif, dibatasi per-paragraf (run tak boleh lintas <w:p>). */
+function applyCharStyle(root: HTMLElement, prop: "fontFamily" | "fontSize", value: string) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount || !selectionInRoot(root)) return;
+  const range = sel.getRangeAt(0);
+
+  const wrap = (r: Range) => {
+    const span = document.createElement("span");
+    (span.style as any)[prop] = value;
+    if (r.collapsed) {
+      // Tidak ada seleksi: set "typing style" — karakter berikutnya yang
+      // diketik akan mewarisi style span ini (perilaku sama seperti Word
+      // saat Anda ganti font tanpa menyeleksi apa pun dulu).
+      span.appendChild(document.createTextNode("​"));
+      r.insertNode(span);
+      const r2 = document.createRange();
+      r2.setStart(span.firstChild!, 1);
+      r2.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+      return;
+    }
+    const frag = r.extractContents();
+    span.appendChild(frag);
+    r.insertNode(span);
+  };
+
+  const startP = closestP(range.startContainer, root);
+  const endP = closestP(range.endContainer, root);
+  if (!startP || !endP) return;
+  if (startP === endP || range.collapsed) {
+    wrap(range);
+    return;
+  }
+  // Seleksi melintasi >1 paragraf: terapkan per-paragraf (potongan di dalam
+  // masing-masing <p>) supaya <w:p> yang dihasilkan tetap valid per paragraf.
+  const paras = Array.from(root.querySelectorAll("p")).filter(
+    (p) => range.intersectsNode(p) && !p.closest("header") && !p.closest("footer") && p.getAttribute("data-docx-host") !== "u",
+  ) as HTMLElement[];
+  for (const p of paras) {
+    const sub = document.createRange();
+    sub.selectNodeContents(p);
+    if (p === startP) sub.setStart(range.startContainer, range.startOffset);
+    if (p === endP) sub.setEnd(range.endContainer, range.endOffset);
+    if (sub.collapsed) continue;
+    wrap(sub);
+  }
+  sel.removeAllRanges();
 }
 
 const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; editMode: boolean; onDirty: () => void }>(
@@ -538,118 +619,103 @@ const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; edi
       return () => { cancelled = true; };
     }, [working]);
 
-    // Pasang host editable pada paragraf yang terikat ke XML.
-    const attachHost = useCallback((el: HTMLElement, cleanups: (() => void)[]) => {
-      el.setAttribute("contenteditable", "true");
-      el.setAttribute("spellcheck", "false");
-      el.classList.add("docx-editable-p");
-      el.querySelectorAll(".docx-tab-stop, img, svg").forEach((n) => (n as HTMLElement).setAttribute("contenteditable", "false"));
-      const root = bodyRef.current!;
-      const hosts = () => Array.from(root.querySelectorAll(HOST_SEL)) as HTMLElement[];
-      const onKey = (ev: KeyboardEvent) => {
-        if (ev.key === "Enter" && ev.shiftKey) { ev.preventDefault(); document.execCommand("insertLineBreak"); return; }
-        if (ev.key === "Enter") {
-          // Paragraf baru: pecah paragraf di posisi kursor (format span ikut).
-          ev.preventDefault();
-          const sel = window.getSelection();
-          if (!sel || !sel.rangeCount) return;
-          const r = sel.getRangeAt(0);
-          if (!r.collapsed) r.deleteContents();
-          const tail = document.createRange();
-          tail.setStart(r.startContainer, r.startOffset);
-          tail.setEnd(el, el.childNodes.length);
-          const frag = tail.extractContents();
-          const np = document.createElement("p");
-          np.className = el.className;
-          const st = el.getAttribute("style");
-          if (st) np.setAttribute("style", st);
-          np.setAttribute("data-docx-host", "n");
-          np.appendChild(frag);
-          if (!np.textContent) np.innerHTML = "<br>";
-          if (!el.textContent && !el.querySelector("br")) el.innerHTML = "<br>";
-          el.parentNode!.insertBefore(np, el.nextSibling);
-          attachHost(np, cleanups);
-          np.focus();
-          placeCaret(np, 0);
-          onDirtyRef.current();
-          return;
-        }
-        if ((ev.key === "Backspace" && caretIsAt(el, "start")) || (ev.key === "Delete" && caretIsAt(el, "end"))) {
-          const list = hosts();
-          const i = list.indexOf(el);
-          const [into, from] = ev.key === "Backspace" ? [list[i - 1], el] : [el, list[i + 1]];
-          if (!into || !from || into.parentElement !== from.parentElement) return;
-          ev.preventDefault();
-          // Buang <br> penjaga di ujung paragraf tujuan sebelum digabung.
-          const last = into.lastChild;
-          if (last && last.nodeName === "BR") into.removeChild(last);
-          const joinAt = into.childNodes.length;
-          while (from.firstChild) into.appendChild(from.firstChild);
-          from.remove();
-          into.focus();
-          placeCaret(into, Math.min(joinAt, into.childNodes.length));
-          onDirtyRef.current();
-        }
-      };
+    // Identitas paragraf: elemen ASLI -> indeks XML (lihat catatan besar di
+    // atas). Dibuat ulang setiap kali binding dijalankan.
+    const indexMapRef = useRef<WeakMap<HTMLElement, number>>(new WeakMap());
+    const [fmt, setFmt] = useState({ bold: false, italic: false, underline: false, align: "left", font: "", sizePt: 11, lineSpacing: 1 });
+
+    // Pasang SATU editing host di root: cursor/seleksi/Enter/Backspace/paste
+    // lintas paragraf ditangani native oleh browser (bukan JS per elemen).
+    const attachRootEditing = useCallback((root: HTMLElement, cleanups: (() => void)[]) => {
+      root.setAttribute("contenteditable", "true");
+      root.setAttribute("spellcheck", "false");
+      try { document.execCommand("defaultParagraphSeparator", false, "p"); } catch { /* noop */ }
+      // Elemen non-teks / area terproteksi: tidak boleh ikut diketik langsung.
+      root.querySelectorAll("header, footer").forEach((n) => (n as HTMLElement).setAttribute("contenteditable", "false"));
+      root.querySelectorAll(".docx-tab-stop, img, svg").forEach((n) => (n as HTMLElement).setAttribute("contenteditable", "false"));
       const onPaste = (ev: ClipboardEvent) => {
         ev.preventDefault();
         const text = (ev.clipboardData?.getData("text/plain") || "").replace(/\r\n?/g, "\n");
         text.split("\n").forEach((line, i) => {
-          if (i > 0) document.execCommand("insertLineBreak");
+          if (i > 0) document.execCommand("insertParagraph"); // baris baru dari paste = paragraf baru, spt Word
           if (line) document.execCommand("insertText", false, line);
         });
+        onDirtyRef.current();
       };
       const onInput = () => onDirtyRef.current();
-      el.addEventListener("keydown", onKey);
-      el.addEventListener("paste", onPaste);
-      el.addEventListener("input", onInput);
+      root.addEventListener("paste", onPaste);
+      root.addEventListener("input", onInput);
       cleanups.push(() => {
-        el.removeEventListener("keydown", onKey);
-        el.removeEventListener("paste", onPaste);
-        el.removeEventListener("input", onInput);
-        el.removeAttribute("contenteditable");
-        el.classList.remove("docx-editable-p");
+        root.removeEventListener("paste", onPaste);
+        root.removeEventListener("input", onInput);
+        root.removeAttribute("contenteditable");
       });
     }, []);
 
     useEffect(() => {
       const root = bodyRef.current;
       if (!root || !rendered) return;
-      if (!editMode) { bindingsRef.current = []; setBindStats(null); return; }
+      if (!editMode) { bindingsRef.current = []; indexMapRef.current = new WeakMap(); setBindStats(null); return; }
       let cancelled = false;
       const cleanups: (() => void)[] = [];
+      const locked: HTMLElement[] = [];
       (async () => {
         const model = await loadDocx(working.slice(0));
         if (cancelled) return;
         const binds = bindRenderedParagraphs(root, model);
         bindingsRef.current = binds;
-        setBindStats({ bound: binds.length, total: model.paragraphs.length });
+        const map = new WeakMap<HTMLElement, number>();
+        const boundSet = new Set<HTMLElement>();
         for (const b of binds) {
+          map.set(b.el, b.index);
+          boundSet.add(b.el);
           b.el.setAttribute("data-docx-host", "b");
           b.el.setAttribute("data-pidx", String(b.index));
-          attachHost(b.el, cleanups);
+          b.el.classList.add("docx-editable-p");
+        }
+        indexMapRef.current = map;
+        setBindStats({ bound: binds.length, total: model.paragraphs.length });
+        attachRootEditing(root, cleanups);
+        // Paragraf yang TIDAK berhasil dipasangkan ke XML (field/simbol
+        // khusus, dsb) -> dikunci (nested contenteditable=false) supaya
+        // formatnya tidak ikut rusak, tapi tetap tampil apa adanya.
+        for (const p of Array.from(root.querySelectorAll("p")) as HTMLElement[]) {
+          if (p.closest("header") || p.closest("footer") || boundSet.has(p)) continue;
+          p.setAttribute("contenteditable", "false");
+          p.setAttribute("data-docx-host", "u");
+          locked.push(p);
         }
       })().catch((e) => console.error("Gagal menyiapkan edit DOCX", e));
-      return () => { cancelled = true; cleanups.forEach((f) => f()); };
-    }, [editMode, rendered, working, attachHost]);
+      return () => {
+        cancelled = true;
+        cleanups.forEach((f) => f());
+        locked.forEach((p) => { p.removeAttribute("contenteditable"); p.removeAttribute("data-docx-host"); });
+      };
+    }, [editMode, rendered, working, attachRootEditing]);
 
     // Rencana edit dari keadaan DOM saat ini (relatif terhadap berkas kerja).
+    // Paragraf dikenali lewat identitas elemen (indexMapRef), bukan atribut —
+    // node baru hasil split/Enter/paste TIDAK ada di map -> otomatis dianggap
+    // paragraf baru walau browser sempat mengkloning atributnya.
     const collectPlan = useCallback((): DocxEditPlan => {
       const root = bodyRef.current!;
       const byIndex = new Map<number, ParagraphBinding>(bindingsRef.current.map((b) => [b.index, b] as [number, ParagraphBinding]));
+      const idxMap = indexMapRef.current;
       const plan: DocxEditPlan = { edits: [], deleted: [], inserts: [] };
       const seen = new Set<number>();
       let lastBound = -1;
       let before: NewParagraph[] = [];
       let group: DocxEditPlan["inserts"][number] | null = null;
-      for (const el of Array.from(root.querySelectorAll(HOST_SEL)) as HTMLElement[]) {
-        if (el.getAttribute("data-docx-host") === "b") {
-          const idx = Number(el.getAttribute("data-pidx"));
+      for (const el of Array.from(root.querySelectorAll("p")) as HTMLElement[]) {
+        if (el.getAttribute("data-docx-host") === "u") continue; // terkunci, tidak ikut diagnosis
+        if (el.closest("header") || el.closest("footer")) continue;
+        const idx = idxMap.get(el);
+        if (idx !== undefined && !seen.has(idx)) {
           const b = byIndex.get(idx);
           if (!b) continue;
           seen.add(idx);
           if (before.length) {
-            plan.inserts.push({ afterIndex: -1, anchorIndex: idx, baseAttr: b.attrs[0] ?? 0, paragraphs: before });
+            plan.inserts.push({ afterIndex: -1, anchorIndex: idx, baseAttr: b.attrs[0] ?? 0, baseFont: b.fonts[0] ?? "", baseSize: b.sizes[0] ?? 22, paragraphs: before });
             before = [];
           }
           lastBound = idx;
@@ -657,17 +723,26 @@ const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; edi
           const now = stripTrailingGuard(renderedChars(el), b.original);
           const align = el.style.textAlign || "";
           const alignChanged = !!align && renderedAlign(el) !== b.align;
-          if (now.text !== b.original || now.attrs.some((a, k) => a !== b.attrs[k]) || alignChanged) {
-            plan.edits.push({ index: idx, oldText: b.original, newText: now.text, oldAttrs: b.attrs, newAttrs: now.attrs, oldAlign: b.align, newAlign: alignChanged ? renderedAlign(el) : b.align });
+          const lineSpacing = renderedLineSpacing(el);
+          const lineSpacingChanged = Math.abs(lineSpacing - b.lineSpacing) > 0.02;
+          const fontsChanged = now.fonts.length !== b.fonts.length || now.fonts.some((f, k) => f !== b.fonts[k]);
+          const sizesChanged = now.sizes.length !== b.sizes.length || now.sizes.some((s, k) => s !== b.sizes[k]);
+          if (now.text !== b.original || now.attrs.some((a, k) => a !== b.attrs[k]) || alignChanged || lineSpacingChanged || fontsChanged || sizesChanged) {
+            plan.edits.push({
+              index: idx, oldText: b.original, newText: now.text, oldAttrs: b.attrs, newAttrs: now.attrs,
+              oldAlign: b.align, newAlign: alignChanged ? renderedAlign(el) : b.align,
+              oldFonts: b.fonts, newFonts: now.fonts, oldSizes: b.sizes, newSizes: now.sizes,
+              oldLineSpacing: b.lineSpacing, newLineSpacing: lineSpacing,
+            });
           }
         } else {
           const c = stripTrailingGuard(renderedChars(el));
-          const np: NewParagraph = { text: c.text, attrs: c.attrs, align: el.style.textAlign ? renderedAlign(el) : undefined };
+          const np: NewParagraph = { text: c.text, attrs: c.attrs, fonts: c.fonts, sizes: c.sizes, align: el.style.textAlign ? renderedAlign(el) : undefined, lineSpacing: renderedLineSpacing(el) };
           if (lastBound === -1) before.push(np);
           else {
             if (!group) {
               const a = byIndex.get(lastBound)!;
-              group = { afterIndex: lastBound, anchorIndex: lastBound, baseAttr: a.attrs[a.attrs.length - 1] ?? 0, paragraphs: [] };
+              group = { afterIndex: lastBound, anchorIndex: lastBound, baseAttr: a.attrs[a.attrs.length - 1] ?? 0, baseFont: a.fonts[a.fonts.length - 1] ?? "", baseSize: a.sizes[a.sizes.length - 1] ?? 22, paragraphs: [] };
               plan.inserts.push(group);
             }
             group.paragraphs.push(np);
@@ -697,20 +772,68 @@ const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; edi
       },
     }), [buildWorking]);
 
+    // Baca format aktif di posisi kursor/seleksi -> toolbar "mengikuti"
+    // konteks dokumen (dropdown font/ukuran/perataan/spasi menampilkan nilai
+    // paragraf/karakter yang sedang aktif, gaya Word), bukan nilai statis.
+    const syncFmt = useCallback(() => {
+      const root = bodyRef.current;
+      if (!root || !selectionInRoot(root)) return;
+      const sel = window.getSelection();
+      const node = sel?.anchorNode;
+      const el = node ? (node.nodeType === Node.ELEMENT_NODE ? (node as Element) : node.parentElement) : null;
+      if (!el || !root.contains(el)) return;
+      const cs = getComputedStyle(el as Element);
+      const p = nearestParagraph(root);
+      let bold = false, italic = false, underline = false;
+      try { bold = document.queryCommandState("bold"); italic = document.queryCommandState("italic"); underline = document.queryCommandState("underline"); } catch { /* noop */ }
+      const fam = (cs.fontFamily || "").split(",")[0].trim().replace(/^["']|["']$/g, "");
+      const sizePt = Math.round((parseFloat(cs.fontSize) || 16) * 0.75 * 2) / 2;
+      setFmt({
+        bold, italic, underline,
+        align: p ? renderedAlign(p) : "left",
+        font: fam,
+        sizePt,
+        lineSpacing: p ? renderedLineSpacing(p) : 1,
+      });
+    }, []);
+
     const exec = (cmd: string) => {
-      if (!hostOfSelection(bodyRef.current)) return;
+      if (!selectionInRoot(bodyRef.current)) return;
       try { document.execCommand("styleWithCSS", false, "true"); } catch { /* noop */ }
       document.execCommand(cmd);
       onDirtyRef.current();
+      syncFmt();
     };
     const align = (v: string) => {
-      const h = hostOfSelection(bodyRef.current);
-      if (!h) return;
+      const h = nearestParagraph(bodyRef.current);
+      if (!h || h.getAttribute("data-docx-host") === "u") return;
       h.style.textAlign = v;
       onDirtyRef.current();
+      syncFmt();
+    };
+    const lineSpacing = (ratio: number) => {
+      const h = nearestParagraph(bodyRef.current);
+      if (!h || h.getAttribute("data-docx-host") === "u") return;
+      h.style.lineHeight = String(ratio);
+      onDirtyRef.current();
+      syncFmt();
+    };
+    const fontFamily = (name: string) => {
+      const root = bodyRef.current;
+      if (!root) return;
+      applyCharStyle(root, "fontFamily", /\s/.test(name) ? `"${name}"` : name);
+      onDirtyRef.current();
+      syncFmt();
+    };
+    const fontSize = (pt: number) => {
+      const root = bodyRef.current;
+      if (!root) return;
+      applyCharStyle(root, "fontSize", `${pt}pt`);
+      onDirtyRef.current();
+      syncFmt();
     };
     const rowOp = async (op: "add" | "remove") => {
-      const h = hostOfSelection(bodyRef.current);
+      const h = nearestParagraph(bodyRef.current);
       if (!h || h.getAttribute("data-docx-host") !== "b" || !h.closest("td")) return;
       setBusy(true);
       try {
@@ -728,24 +851,59 @@ const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; edi
         <style>{`
           .docx-workspace .docx-wrapper { background: transparent; padding: 24px 12px; }
           .docx-workspace .docx-wrapper > section.docx { box-shadow: 0 4px 18px rgba(0,0,0,.35); margin-bottom: 24px; }
-          .docx-workspace .docx-editable-p { outline: 1px dashed transparent; border-radius: 2px; cursor: text; }
-          .docx-workspace .docx-editable-p:hover { outline-color: rgba(99,102,241,.45); }
-          .docx-workspace .docx-editable-p:focus { outline: 2px solid rgba(99,102,241,.8); background: rgba(99,102,241,.05); }
+          .docx-workspace .docx-editable-p { border-radius: 2px; }
+          .docx-workspace [contenteditable="true"] { cursor: text; outline: none; }
+          .docx-workspace [data-docx-host="u"] { cursor: default; }
         `}</style>
         {editMode && (
-          <div className="sticky top-0 z-20 flex flex-wrap items-center gap-1 px-3 py-1.5 bg-slate-900/95 border-b border-slate-800" data-testid="docx-toolbar">
-            <TBtn title="Tebal (Ctrl+B)" onClick={() => exec("bold")}><Bold className="w-3.5 h-3.5" /></TBtn>
-            <TBtn title="Miring (Ctrl+I)" onClick={() => exec("italic")}><Italic className="w-3.5 h-3.5" /></TBtn>
-            <TBtn title="Garis bawah (Ctrl+U)" onClick={() => exec("underline")}><Underline className="w-3.5 h-3.5" /></TBtn>
+          <div
+            className="sticky top-0 z-20 flex flex-wrap items-center gap-1 px-3 py-1.5 bg-slate-900/95 border-b border-slate-800"
+            data-testid="docx-toolbar"
+            onMouseDown={(e) => { if ((e.target as HTMLElement).tagName !== "SELECT" && (e.target as HTMLElement).tagName !== "OPTION") e.preventDefault(); }}
+          >
+            <select
+              value={FONT_OPTIONS.includes(fmt.font) ? fmt.font : ""}
+              onChange={(e) => e.target.value && fontFamily(e.target.value)}
+              title={fmt.font ? `Jenis huruf: ${fmt.font}` : "Jenis huruf"}
+              className="h-7 px-1.5 text-[11px] bg-slate-950 border border-slate-800 rounded text-slate-200 cursor-pointer max-w-[130px]"
+            >
+              <option value="" disabled>{fmt.font || "Font"}</option>
+              {FONT_OPTIONS.map((f) => <option key={f} value={f} style={{ fontFamily: f }}>{f}</option>)}
+            </select>
+            <select
+              value={FONT_SIZE_OPTIONS.includes(fmt.sizePt) ? fmt.sizePt : ""}
+              onChange={(e) => e.target.value && fontSize(Number(e.target.value))}
+              title="Ukuran teks (pt)"
+              className="h-7 px-1 text-[11px] bg-slate-950 border border-slate-800 rounded text-slate-200 cursor-pointer w-16"
+            >
+              <option value="" disabled>{fmt.sizePt || ""}</option>
+              {FONT_SIZE_OPTIONS.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
             <span className="w-px h-5 bg-slate-700 mx-1" />
-            <TBtn title="Rata kiri" onClick={() => align("left")}><AlignLeft className="w-3.5 h-3.5" /></TBtn>
-            <TBtn title="Rata tengah" onClick={() => align("center")}><AlignCenter className="w-3.5 h-3.5" /></TBtn>
-            <TBtn title="Rata kanan" onClick={() => align("right")}><AlignRight className="w-3.5 h-3.5" /></TBtn>
-            <TBtn title="Rata kiri-kanan" onClick={() => align("justify")}><AlignJustify className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Tebal (Ctrl+B)" active={fmt.bold} onClick={() => exec("bold")}><Bold className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Miring (Ctrl+I)" active={fmt.italic} onClick={() => exec("italic")}><Italic className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Garis bawah (Ctrl+U)" active={fmt.underline} onClick={() => exec("underline")}><Underline className="w-3.5 h-3.5" /></TBtn>
+            <span className="w-px h-5 bg-slate-700 mx-1" />
+            <TBtn title="Rata kiri" active={fmt.align === "left"} onClick={() => align("left")}><AlignLeft className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Rata tengah" active={fmt.align === "center"} onClick={() => align("center")}><AlignCenter className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Rata kanan" active={fmt.align === "right"} onClick={() => align("right")}><AlignRight className="w-3.5 h-3.5" /></TBtn>
+            <TBtn title="Rata kiri-kanan" active={fmt.align === "justify"} onClick={() => align("justify")}><AlignJustify className="w-3.5 h-3.5" /></TBtn>
+            <span className="w-px h-5 bg-slate-700 mx-1" />
+            <span title="Spasi baris" className="flex items-center gap-1 text-slate-400">
+              <AlignVerticalSpaceAround className="w-3.5 h-3.5" />
+              <select
+                value={LINE_SPACING_OPTIONS.some((o) => Math.abs(o.v - fmt.lineSpacing) < 0.02) ? fmt.lineSpacing : 1}
+                onChange={(e) => lineSpacing(Number(e.target.value))}
+                title="Spasi baris"
+                className="h-7 px-1 text-[11px] bg-slate-950 border border-slate-800 rounded text-slate-200 cursor-pointer"
+              >
+                {LINE_SPACING_OPTIONS.map((o) => <option key={o.v} value={o.v}>{o.label}</option>)}
+              </select>
+            </span>
             <span className="w-px h-5 bg-slate-700 mx-1" />
             <TBtn title="Tambah baris tabel di bawah baris ini" disabled={busy} onClick={() => rowOp("add")}><Rows3 className="w-3.5 h-3.5" /> Baris</TBtn>
             <TBtn title="Hapus baris tabel ini" disabled={busy} onClick={() => rowOp("remove")}><TableRowsSplit className="w-3.5 h-3.5" /> Hapus baris</TBtn>
-            <span className="text-[10px] text-slate-500 ml-2">Enter = paragraf baru · Shift+Enter = baris baru · Backspace di awal paragraf = gabung</span>
+            <span className="text-[10px] text-slate-500 ml-2">Ketik bebas seperti Word — klik di mana pun, Enter = paragraf baru, format baru mengikuti konteks.</span>
           </div>
         )}
         {bindStats && bindStats.bound < bindStats.total && (
@@ -755,7 +913,12 @@ const DocxDocumentView = React.forwardRef<EditorHandle, { data: ArrayBuffer; edi
         )}
         {renderError && <p className="p-4 text-xs text-rose-300">{renderError}</p>}
         <div ref={styleRef} />
-        <div ref={bodyRef} />
+        <div
+          ref={bodyRef}
+          onKeyUp={editMode ? syncFmt : undefined}
+          onMouseUp={editMode ? syncFmt : undefined}
+          onFocus={editMode ? syncFmt : undefined}
+        />
       </div>
     );
   },

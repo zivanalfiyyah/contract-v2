@@ -135,30 +135,68 @@ function styleAttrs(el: Element | null, host: Element): number {
   return a;
 }
 
+/** Nama keluarga font pertama dari computed style (tanpa kutip/fallback list). */
+function firstFontFamily(cs: CSSStyleDeclaration): string {
+  return (cs.fontFamily || "").split(",")[0].trim().replace(/^["']|["']$/g, "") || "Calibri";
+}
+
+/** px -> half-point OOXML (1px = 0.75pt = 1.5 half-point), dibulatkan. */
+function pxToHalfPt(px: string): number {
+  const n = parseFloat(px);
+  return Math.max(2, Math.round((isNaN(n) ? 16 : n) * 1.5));
+}
+
+/** Font-family & ukuran (half-point) aktif pada sebuah node, dari computed style. */
+function styleFontInfo(el: Element | null, host: Element): { font: string; sizeHp: number } {
+  const cs = getComputedStyle((el as HTMLElement) || (host as HTMLElement));
+  return { font: firstFontFamily(cs), sizeHp: pxToHalfPt(cs.fontSize) };
+}
+
+/** Rasio line-height thd font-size ("normal"/tanpa unit eksplisit -> dianggap 1). */
+export function renderedLineSpacing(el: HTMLElement): number {
+  const cs = getComputedStyle(el);
+  const lh = cs.lineHeight;
+  if (!lh || lh === "normal") return 1;
+  const px = parseFloat(lh);
+  const fs = parseFloat(cs.fontSize) || 16;
+  if (isNaN(px) || !fs) return 1;
+  const ratio = px / fs;
+  return ratio > 0.5 && ratio < 4 ? ratio : 1;
+}
+
 /**
  * Teks + atribut per karakter sebuah <p> hasil render.
  * <br> -> "\n", tab-stop docx-preview -> "\t", nbsp -> spasi.
  */
-export function renderedChars(el: Element): { text: string; attrs: number[] } {
+export function renderedChars(el: Element): { text: string; attrs: number[]; fonts: string[]; sizes: number[] } {
   let text = "";
   const attrs: number[] = [];
-  const push = (s: string, a: number) => {
+  const fonts: string[] = [];
+  const sizes: number[] = [];
+  const push = (s: string, a: number, fi: { font: string; sizeHp: number }) => {
     for (const ch of s) {
       if (ch === "\u200b" || ch === "\ufeff") continue;
       text += ch === "\u00a0" ? " " : ch;
       attrs.push(a);
+      fonts.push(fi.font);
+      sizes.push(fi.sizeHp);
     }
   };
   const walk = (n: Node) => {
-    if (n.nodeType === Node.TEXT_NODE) { push((n as Text).data, styleAttrs(n.parentElement, el)); return; }
+    if (n.nodeType === Node.TEXT_NODE) { push((n as Text).data, styleAttrs(n.parentElement, el), styleFontInfo(n.parentElement, el)); return; }
     if (n.nodeType !== Node.ELEMENT_NODE) return;
     const e = n as HTMLElement;
-    if (e.tagName === "BR") { push("\n", attrs.length ? attrs[attrs.length - 1] : styleAttrs(e.parentElement, el)); return; }
-    if (e.classList.contains("docx-tab-stop")) { push("\t", styleAttrs(e, el)); return; }
+    if (e.tagName === "BR") {
+      const a = attrs.length ? attrs[attrs.length - 1] : styleAttrs(e.parentElement, el);
+      const fi = fonts.length ? { font: fonts[fonts.length - 1], sizeHp: sizes[sizes.length - 1] } : styleFontInfo(e.parentElement, el);
+      push("\n", a, fi);
+      return;
+    }
+    if (e.classList.contains("docx-tab-stop")) { push("\t", styleAttrs(e, el), styleFontInfo(e, el)); return; }
     e.childNodes.forEach(walk);
   };
   el.childNodes.forEach(walk);
-  return { text, attrs };
+  return { text, attrs, fonts, sizes };
 }
 
 /** Teks sebuah <p> hasil render (lihat renderedChars). */
@@ -171,7 +209,10 @@ export function renderedAlign(el: HTMLElement): string {
   return a === "start" ? "left" : a === "end" ? "right" : a;
 }
 
-export interface ParagraphBinding { el: HTMLElement; index: number; original: string; attrs: number[]; align: string }
+export interface ParagraphBinding {
+  el: HTMLElement; index: number; original: string; attrs: number[]; align: string;
+  fonts: string[]; sizes: number[]; lineSpacing: number;
+}
 
 /**
  * Pasangkan <p> hasil render (di luar header/footer) dengan <w:p> di XML,
@@ -194,7 +235,10 @@ export function bindRenderedParagraphs(container: HTMLElement, model: DocxModel)
       if (xmlKeys[k] === key) { found = k; break; }
     }
     if (found === -1) continue;
-    bindings.push({ el, index: found, original: rc.text, attrs: rc.attrs, align: renderedAlign(el) });
+    bindings.push({
+      el, index: found, original: rc.text, attrs: rc.attrs, align: renderedAlign(el),
+      fonts: rc.fonts, sizes: rc.sizes, lineSpacing: renderedLineSpacing(el),
+    });
     j = found + 1;
   }
   return bindings;
@@ -455,6 +499,61 @@ export function setParagraphAlign(xml: XMLDocument, p: Element, align: string) {
   setOrderedChild(xml, ensurePPr(xml, p), "jc", PPR_ORDER, v);
 }
 
+/** Set line-spacing (rasio thd 1 baris) di pPr, mis. 1 = single, 1.5, 2 = double. */
+export function setParagraphLineSpacing(xml: XMLDocument, p: Element, ratio: number) {
+  const pPr = ensurePPr(xml, p);
+  let el = childW(pPr, "spacing");
+  if (!el) {
+    el = xml.createElementNS(W_NS, "w:spacing");
+    const idx = PPR_ORDER.indexOf("spacing");
+    const before = Array.from(pPr.children).find((c) => c.namespaceURI === W_NS && PPR_ORDER.indexOf(c.localName) > idx);
+    pPr.insertBefore(el, before || null);
+  }
+  el.setAttributeNS(W_NS, "w:line", String(Math.round(ratio * 240)));
+  el.setAttributeNS(W_NS, "w:lineRule", "auto");
+}
+
+/** Set rFonts (ascii/hAnsi/cs) pada sebuah <w:rPr>. */
+function setRFonts(xml: XMLDocument, rPr: Element, name: string) {
+  let el = childW(rPr, "rFonts");
+  if (!el) {
+    el = xml.createElementNS(W_NS, "w:rFonts");
+    const idx = RPR_ORDER.indexOf("rFonts");
+    const before = Array.from(rPr.children).find((c) => c.namespaceURI === W_NS && RPR_ORDER.indexOf(c.localName) > idx);
+    rPr.insertBefore(el, before || null);
+  }
+  for (const attr of ["ascii", "hAnsi", "cs"]) el.setAttributeNS(W_NS, `w:${attr}`, name);
+}
+
+/** Set font-family eksplisit pada rentang [s, e) paragraf. */
+export function setRangeFont(xml: XMLDocument, p: Element, s: number, e: number, font: string) {
+  if (e <= s) return;
+  splitRunAt(xml, p, s);
+  splitRunAt(xml, p, e);
+  const runs = new Set<Element>();
+  for (const seg of segmentsOf(p)) {
+    if (seg.start >= s && seg.start + seg.len <= e) { const r = runOf(seg.el); if (r) runs.add(r); }
+  }
+  for (const r of runs) setRFonts(xml, ensureRPr(xml, r), font);
+}
+
+/** Set ukuran font eksplisit (half-point) pada rentang [s, e) paragraf. */
+export function setRangeSize(xml: XMLDocument, p: Element, s: number, e: number, sizeHp: number) {
+  if (e <= s) return;
+  splitRunAt(xml, p, s);
+  splitRunAt(xml, p, e);
+  const runs = new Set<Element>();
+  for (const seg of segmentsOf(p)) {
+    if (seg.start >= s && seg.start + seg.len <= e) { const r = runOf(seg.el); if (r) runs.add(r); }
+  }
+  const v = String(Math.round(sizeHp));
+  for (const r of runs) {
+    const rPr = ensureRPr(xml, r);
+    setOrderedChild(xml, rPr, "sz", RPR_ORDER, v);
+    setOrderedChild(xml, rPr, "szCs", RPR_ORDER, v);
+  }
+}
+
 /**
  * Terapkan format karakter: bandingkan atribut lama vs baru, dengan
  * penyelarasan teks lama->baru lewat diff. Hanya karakter yang atributnya
@@ -488,6 +587,64 @@ function applyAttrChanges(xml: XMLDocument, p: Element, oldText: string, newText
   }
 }
 
+/**
+ * Terapkan perubahan font-family: sama seperti applyAttrChanges, tapi
+ * membandingkan string (bukan bitmask). Hanya rentang yang nilainya BERUBAH
+ * dari baseline lama yang diberi rFonts eksplisit.
+ */
+function applyFontChanges(xml: XMLDocument, p: Element, oldText: string, newText: string, oldFonts: string[], newFonts: string[]) {
+  const want: (string | null)[] = new Array(newText.length).fill(null);
+  let io = 0, inew = 0;
+  for (const part of diffChars(oldText, newText)) {
+    const n = part.value.length;
+    if (part.removed) { io += n; continue; }
+    if (part.added) {
+      const inherit = io > 0 ? oldFonts[io - 1] : oldFonts[0];
+      for (let k = 0; k < n; k++) if ((newFonts[inew + k] ?? inherit) !== inherit) want[inew + k] = newFonts[inew + k];
+      inew += n;
+      continue;
+    }
+    for (let k = 0; k < n; k++) if (newFonts[inew + k] !== oldFonts[io + k]) want[inew + k] = newFonts[inew + k];
+    io += n; inew += n;
+  }
+  let k = 0;
+  while (k < want.length) {
+    if (want[k] === null) { k++; continue; }
+    const v = want[k]!;
+    let e = k + 1;
+    while (e < want.length && want[e] === v) e++;
+    setRangeFont(xml, p, k, e, v);
+    k = e;
+  }
+}
+
+/** Terapkan perubahan ukuran font (half-point), pola sama dgn applyFontChanges. */
+function applySizeChanges(xml: XMLDocument, p: Element, oldText: string, newText: string, oldSizes: number[], newSizes: number[]) {
+  const want: (number | null)[] = new Array(newText.length).fill(null);
+  let io = 0, inew = 0;
+  for (const part of diffChars(oldText, newText)) {
+    const n = part.value.length;
+    if (part.removed) { io += n; continue; }
+    if (part.added) {
+      const inherit = io > 0 ? oldSizes[io - 1] : oldSizes[0];
+      for (let k = 0; k < n; k++) if ((newSizes[inew + k] ?? inherit) !== inherit) want[inew + k] = newSizes[inew + k];
+      inew += n;
+      continue;
+    }
+    for (let k = 0; k < n; k++) if (newSizes[inew + k] !== oldSizes[io + k]) want[inew + k] = newSizes[inew + k];
+    io += n; inew += n;
+  }
+  let k = 0;
+  while (k < want.length) {
+    if (want[k] === null) { k++; continue; }
+    const v = want[k]!;
+    let e = k + 1;
+    while (e < want.length && want[e] === v) e++;
+    setRangeSize(xml, p, k, e, v);
+    k = e;
+  }
+}
+
 function paragraphIsRemovable(p: Element): boolean {
   if (p.getElementsByTagNameNS(W_NS, "sectPr").length) return false;
   for (const tag of ["drawing", "pict", "object", "fldChar", "fldSimple"]) if (p.getElementsByTagNameNS(W_NS, tag).length) return false;
@@ -500,7 +657,10 @@ function paragraphIsRemovable(p: Element): boolean {
 }
 
 /** Paragraf baru berdasarkan paragraf acuan (gaya paragraf & format run). */
-function makeParagraph(xml: XMLDocument, anchor: Element, text: string, attrs: number[], baseAttr: number, align?: string): Element {
+function makeParagraph(
+  xml: XMLDocument, anchor: Element, text: string, attrs: number[], baseAttr: number,
+  align?: string, fonts?: string[], baseFont?: string, sizes?: number[], baseSize?: number, lineSpacing?: number,
+): Element {
   const p = xml.createElementNS(W_NS, "w:p");
   const aPPr = childW(anchor, "pPr");
   if (aPPr) {
@@ -519,6 +679,7 @@ function makeParagraph(xml: XMLDocument, anchor: Element, text: string, attrs: n
   if (!text) { const t = xml.createElementNS(W_NS, "w:t"); setText(t, ""); r.appendChild(t); }
   p.appendChild(r);
   if (align) setParagraphAlign(xml, p, align);
+  if (lineSpacing && Math.abs(lineSpacing - 1) > 0.02) setParagraphLineSpacing(xml, p, lineSpacing);
   // Karakter yang formatnya beda dari format dasar diberi format eksplisit.
   let k = 0;
   while (k < attrs.length) {
@@ -529,16 +690,41 @@ function makeParagraph(xml: XMLDocument, anchor: Element, text: string, attrs: n
     setRangeFormat(xml, p, k, e, v, ATTR_B | ATTR_I | ATTR_U);
     k = e;
   }
+  if (fonts && baseFont !== undefined) {
+    let k2 = 0;
+    while (k2 < fonts.length) {
+      if (fonts[k2] === baseFont) { k2++; continue; }
+      const v = fonts[k2];
+      let e = k2 + 1;
+      while (e < fonts.length && fonts[e] === v) e++;
+      setRangeFont(xml, p, k2, e, v);
+      k2 = e;
+    }
+  }
+  if (sizes && baseSize !== undefined) {
+    let k3 = 0;
+    while (k3 < sizes.length) {
+      if (sizes[k3] === baseSize) { k3++; continue; }
+      const v = sizes[k3];
+      let e = k3 + 1;
+      while (e < sizes.length && sizes[e] === v) e++;
+      setRangeSize(xml, p, k3, e, v);
+      k3 = e;
+    }
+  }
   return p;
 }
 
-export interface EditedParagraph { index: number; oldText: string; newText: string; oldAttrs: number[]; newAttrs: number[]; oldAlign: string; newAlign: string }
-export interface NewParagraph { text: string; attrs: number[]; align?: string }
+export interface EditedParagraph {
+  index: number; oldText: string; newText: string; oldAttrs: number[]; newAttrs: number[]; oldAlign: string; newAlign: string;
+  oldFonts: string[]; newFonts: string[]; oldSizes: number[]; newSizes: number[]; oldLineSpacing: number; newLineSpacing: number;
+}
+export interface NewParagraph { text: string; attrs: number[]; align?: string; fonts: string[]; sizes: number[]; lineSpacing?: number }
 export interface DocxEditPlan {
   edits: EditedParagraph[];
   deleted: number[];
   /** Paragraf baru; afterIndex -1 = sebelum paragraf terikat pertama. */
-  inserts: { afterIndex: number; anchorIndex: number; baseAttr: number; paragraphs: NewParagraph[] }[];
+  inserts: { afterIndex: number; anchorIndex: number; baseAttr: number; baseFont: string; baseSize: number; paragraphs: NewParagraph[] }[];
 }
 
 /** Terapkan rencana edit ke model (in-place). Elemen w:p lama tetap sama. */
@@ -549,17 +735,23 @@ export function applyPlan(model: DocxModel, plan: DocxEditPlan) {
     if (!p) continue;
     applyParagraphEdit(xml, p, e.oldText, e.newText);
     applyAttrChanges(xml, p, e.oldText, e.newText, e.oldAttrs, e.newAttrs);
+    applyFontChanges(xml, p, e.oldText, e.newText, e.oldFonts, e.newFonts);
+    applySizeChanges(xml, p, e.oldText, e.newText, e.oldSizes, e.newSizes);
     if (e.newAlign && e.newAlign !== e.oldAlign) setParagraphAlign(xml, p, e.newAlign);
+    if (e.newLineSpacing && Math.abs(e.newLineSpacing - e.oldLineSpacing) > 0.02) setParagraphLineSpacing(xml, p, e.newLineSpacing);
   }
   for (const ins of plan.inserts) {
     const anchor = paragraphs[ins.anchorIndex];
     if (!anchor) continue;
     if (ins.afterIndex === -1) {
-      for (const np of ins.paragraphs) anchor.parentNode!.insertBefore(makeParagraph(xml, anchor, np.text, np.attrs, ins.baseAttr, np.align), anchor);
+      for (const np of ins.paragraphs) {
+        const el = makeParagraph(xml, anchor, np.text, np.attrs, ins.baseAttr, np.align, np.fonts, ins.baseFont, np.sizes, ins.baseSize, np.lineSpacing);
+        anchor.parentNode!.insertBefore(el, anchor);
+      }
     } else {
       let cursor: Element = paragraphs[ins.afterIndex];
       for (const np of ins.paragraphs) {
-        const el = makeParagraph(xml, anchor, np.text, np.attrs, ins.baseAttr, np.align);
+        const el = makeParagraph(xml, anchor, np.text, np.attrs, ins.baseAttr, np.align, np.fonts, ins.baseFont, np.sizes, ins.baseSize, np.lineSpacing);
         cursor.parentNode!.insertBefore(el, cursor.nextSibling);
         cursor = el;
       }

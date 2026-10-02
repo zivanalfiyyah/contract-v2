@@ -1,5 +1,40 @@
 # Changelog & Panduan Migrasi
 
+## [Unreleased #8] — "Edit seperti Word" untuk kontrak hasil Upload PDF
+
+### Ringkasan
+
+- **Tombol baru "Edit seperti Word"** di Document Workspace saat versi aktif berupa PDF (kontrak Draft). PDF diubah menjadi dokumen Word (.docx) sebagai **versi baru**, lalu langsung terbuka di editor Word yang sudah ada: teks otomatis turun baris saat mentok di margin kanan, Enter = paragraf baru, isi di bawahnya ikut bergeser.
+- **PDF asli tidak pernah diubah** — tetap di riwayat versi & tercatat sebagai `sourceFile` versi hasil konversi.
+- Konversi dilakukan di server **tanpa Python / layanan luar** (`pdf-to-docx.ts`): baris teks dibaca PDFium (yang sudah dipakai editor PDF), digabung jadi paragraf, lalu disusun jadi .docx dengan JSZip (sudah ada di dependensi). Yang dipertahankan: perataan (kiri/tengah/kanan/rata kiri-kanan), indentasi & daftar bernomor, jarak antarparagraf & jarak baris, tebal/miring/warna/ukuran huruf, kotak catatan berwarna, garis pemisah, tabel bergaris, gambar/logo, serta teks berulang di atas/bawah halaman (jadi header/footer, nomor halaman otomatis).
+- Editor PDF per baris ("Edit Dokumen") **tetap ada** untuk koreksi kecil tanpa mengubah tata letak.
+
+### Endpoint baru
+
+- `POST /api/contracts/:id/document-versions/pdf-to-docx` — ubah versi aktif (PDF) ke Word sebagai versi baru (`editMethod: "pdf-to-docx"`). `GET .../document-versions` menambah `capabilities.pdfToWord`.
+
+### Batasan
+
+- PDF hasil scan (isinya gambar) ditolak dengan pesan jelas — tidak bisa jadi Word yang bisa diedit.
+- Tabel tanpa garis tegak menjadi baris ber-tab; tata letak dua kolom/objek bertumpuk bisa bergeser. Periksa hasil konversi sebelum dipakai.
+- Tidak perlu migrasi data & tidak ada dependency baru.
+
+## [Unreleased #7] — Segmen Platform Kerjasama (Asmat / Tiketux) di nomor dokumen kontrak
+
+### Ringkasan
+
+- **Dropdown baru "Kerjasama Platform" (opsional)** di Wizard Kontrak, Langkah 1 — tampil untuk semua kategori, semua jenis dokumen, dan kedua metode (Buat dari Template & Upload Dokumen).
+- **Token nomor baru `{Platform}`.** Format default sekarang `{Sequence:3}/{DocTypeCode}/{Platform}/{Codes}/{MonthRoman}/{Year}` → mis. `144/PKS/TIKETUX/IX/2026`. Platform tidak dipilih = segmen hilang otomatis → `144/PKS/IX/2026` (sama seperti sebelumnya).
+- **Nomor urut tetap satu urutan** per jenis dokumen per tahun untuk semua platform (Asmat & Tiketux tidak punya urutan terpisah).
+- **Daftar platform milik tiap perusahaan, dikelola di Konfigurasi > Kelola Perusahaan** (form Tambah/Edit Perusahaan, field `tenant.platforms`). Wizard hanya menampilkan platform perusahaan yang sedang login; perusahaan tanpa platform tidak melihat dropdown ini. Perusahaan bawaan (`t-01`) otomatis berisi Asmat & Tiketux, perusahaan lain mulai kosong.
+- Endpoint baru `GET /api/tenant-platforms`; `POST/PUT /api/tenants` menerima `platforms: string[]`. Nama ditulis lengkap huruf besar di nomor; spasi diganti `-` (mis. "Bus Online" → `BUS-ONLINE`).
+- Kontrak menyimpan field baru `platform`. Perpanjangan & Addendum mewarisi platform kontrak sumber/induknya.
+
+### Migrasi
+
+- Tidak perlu migrasi data. Nomor kontrak yang sudah terbit tidak diubah.
+- Tenant yang masih memakai format default lama (`{Sequence:3}/{DocTypeCode}/{Codes}/{MonthRoman}/{Year}`) dan format Addendum bawaan lama (`ADD-{Sequence:3}/{Year}`) otomatis di-upgrade ke versi ber-`{Platform}`. Format yang sudah dikustom tenant tidak diubah di Konfigurasi, tetapi saat nomor diterbitkan segmen `{Platform}` otomatis disisipkan setelah kode jenis (`{DocTypeCode}`/`{Prefix}`) bila mask belum memuatnya — jadi platform tetap muncul di semua jenis dokumen.
+
 ## [Unreleased #6] — Editor lengkap Document Workspace: edit teks asli PDF, editor Word, dukungan .doc
 
 ### Ringkasan

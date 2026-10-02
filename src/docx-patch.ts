@@ -344,6 +344,26 @@ function insertAt(xml: XMLDocument, p: Element, pos: number, text: string) {
 }
 
 /**
+ * Ganti rentang [start, end) paragraf dengan `text` sebagai SATU penggantian:
+ * teks baru menempati run yang memuat karakter PERTAMA yang diganti, jadi
+ * mewarisi formatnya (tebal/miring/font) — beda dengan diff per karakter yang
+ * bisa memecah kata pengganti ke run tetangga. Dipakai "terima usulan markup".
+ */
+export function replaceTextRange(xml: XMLDocument, p: Element, start: number, end: number, text: string) {
+  const segs = segmentsOf(p);
+  const first = segs.find((s) => s.kind === "t" && start >= s.start && start < s.start + s.len);
+  if (!first || end <= start || /[\n\t]/.test(text)) {
+    deleteRange(p, start, end);
+    insertAt(xml, p, start, text);
+    return;
+  }
+  const firstEnd = Math.min(end, first.start + first.len);
+  const txt = first.el.textContent || "";
+  deleteRange(p, firstEnd, end); // bagian yang menjulur ke segmen lain
+  setText(first.el, txt.slice(0, start - first.start) + text + txt.slice(firstEnd - first.start));
+}
+
+/**
  * Terapkan teks baru ke satu <w:p>. Perubahan dihitung dengan diff karakter
  * sehingga teks yang tidak berubah (dan run/format-nya) tetap persis sama.
  */

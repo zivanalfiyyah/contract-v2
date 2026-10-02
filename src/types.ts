@@ -3,6 +3,10 @@ export interface Tenant {
   name: string;
   branch: string;
   active?: boolean;
+  // Platform kerja sama milik perusahaan (mis. Asmat, Tiketux) — pilihan
+  // dropdown "Kerjasama Platform" di wizard kontrak & token {Platform} di
+  // nomor. Diatur di Konfigurasi > Kelola Perusahaan.
+  platforms?: string[];
   createdAt?: string;
 }
 
@@ -198,9 +202,22 @@ export interface ContractAttachmentSection {
   tableRows?: string[][];
 }
 
+export interface ReleaseAnnouncement {
+  id: string;
+  createdAt: string;
+  byId: string;
+  byName: string;
+  userIds: string[];
+  names: string[];
+  note?: string;
+}
+
 export interface Contract {
   id: string;
   tenantId: string;
+  // Pengumuman rilis kontrak (setelah Aktif): tim Legal/Admin memilih penerima
+  // PER NAMA user (bukan role/departemen) + keterangan bebas. Terbaru di depan.
+  releaseAnnouncements?: ReleaseAnnouncement[];
   templateId: string;
   contractNumber: string;
   title: string;
@@ -302,6 +319,7 @@ export interface Contract {
   masterPdfUrl?: string; // Optional URL for uploaded master contract PDF
   numberSeq?: number; // Nomor urut yang dikonsumsi dari counter persisten (per jenis+tahun) — dipakai sbg baseline anti-duplikat
   docType?: string; // Jenis dokumen saat pendaftaran arsip (Perjanjian, MOU, Addendum, dll)
+  platform?: string; // Platform kerja sama (Asmat, Tiketux, dst — masterData.platforms); mengisi token {Platform} di nomor. Kosong = tidak terkait platform
   notes?: string; // Catatan bebas dari form pendaftaran dokumen
   exportedPdfUrl?: string; // Hasil export PDF yang di-host server untuk dibagikan via email/WA
   exportedPdfKey?: string; // Kunci storage berkas export di atas — dipakai fetch ulang server-side (mis. lampiran email)
@@ -507,7 +525,7 @@ export interface ContractVersion {
   isOriginal?: boolean;
   file?: StoredDocumentRef;
   basedOnVersion?: number;
-  editMethod?: "original" | "docx-inline" | "pdf-overlay" | "pdf-text" | "revision-upload" | "converted";
+  editMethod?: "original" | "docx-inline" | "pdf-overlay" | "pdf-text" | "revision-upload" | "converted" | "pdf-to-docx";
   // Berkas yang diunggah user bila `file` hasil konversi (mis. .doc -> .docx
   // agar bisa diedit). Berkas asli ini tetap tersimpan & bisa diunduh.
   sourceFile?: StoredDocumentRef;
@@ -706,7 +724,15 @@ export interface ClauseComment {
   // Kosong = komentar tingkat-klausul (bukan pada rentang tertentu).
   anchor?: { start: number; end: number; quote: string };
   // "strike" = usulan coret (kalimat minta dihapus/direvisi pembuat); default "comment".
-  kind?: "comment" | "strike";
+  // "replace" = usulan GANTI teks (coret teks lama + teks pengganti, spt Track Changes Word).
+  kind?: "comment" | "strike" | "replace";
+  // Markup pada dokumen upload (.docx): teks pengganti untuk kind "replace".
+  replacement?: string;
+  // Markup pada dokumen upload (.docx): indeks paragraf XML tempat anchor berada.
+  docAnchor?: { paraIndex: number };
+  // Status usulan (strike/replace pada dokumen upload). "accepted" = sudah
+  // diterapkan ke dokumen sebagai versi baru; "rejected" = ditolak, dokumen utuh.
+  status?: "pending" | "accepted" | "rejected";
   // Komentator EKSTERNAL (pihak kedua tanpa akun) via token link. Saat true,
   // userId = "external", userName = externalName yang diisi tamu.
   external?: boolean;

@@ -22,8 +22,9 @@ import {
   resolveDocumentSource, sniffFormat, extForFormat, cleanFileName, buildDocumentRef,
   legacyDocumentRef, documentVersionsOf, readStoredDocument, contentDisposition,
 } from "./contract-documents.js";
-import { convertDocToDocx, isOfficeConverterAvailable } from "./office-convert.js";
+import { convertDocToDocx, convertDocxToPdf, isOfficeConverterAvailable } from "./office-convert.js";
 import { extractPdfLayout, applyPdfEdits } from "./pdf-text-edit.js";
+import { convertPdfToDocx } from "./pdf-to-docx.js";
 import { pool as dcsPool } from "./db.js";
 import { createDcsRouter, initDcs } from "./dcs/routes.js";
 import { runDcsReminderCheck, startDcsReminderScheduler } from "./dcs/reminders.js";
@@ -207,6 +208,15 @@ function findLegalJob(db: any, tid: string, id: string): LegalJob | undefined {
   if (!db.legalJobs) db.legalJobs = [];
   return (db.legalJobs as LegalJob[]).find((j) => j.id === id && j.tenantId === tid);
 }
+// Pilihan baku "PIC Pemberi Pekerjaan". "Lainnya" boleh diikuti nama divisi
+// ("Lainnya – Procurement") untuk requester dari divisi di luar daftar.
+const LEGAL_PIC_OPTIONS = ["Marketing", "Business Partnership", "Account Executive", "Operasional", "Finance", "Management", "HR/GA", "IT/System", "Lainnya"];
+function normalizeLegalPic(raw: unknown): string | null {
+  const v = String(raw || "").trim();
+  if (LEGAL_PIC_OPTIONS.includes(v)) return v;
+  const m = v.match(/^Lainnya\s*[–-]\s*(.{1,80})$/);
+  return m ? `Lainnya – ${m[1].trim()}` : null;
+}
 function pushLegalTimeline(job: LegalJob, entry: Omit<LegalJobTimelineEntry, "id" | "at">, at?: string) {
   job.timeline.push({ id: "ljt-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6), at: at || new Date().toISOString(), ...entry });
 }
@@ -304,6 +314,18 @@ function pushNotif(db: any, tid: string, notif: any) {
     id: "not-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
     tenantId: tid, createdAt: new Date().toISOString(), read: false, ...notif,
   });
+}
+
+// Penerima pengumuman rilis kontrak dipilih PER NAMA (user id), bukan per
+// role/departemen. Hanya user aktif di tenant kontrak yang dianggap sah — id
+// asing/nonaktif dibuang diam-diam supaya payload manipulasi tidak bisa
+// menembus batas tenant.
+function sanitizeReleaseRecipients(db: any, tid: string, raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const valid = new Set(
+    (db.users as User[]).filter((u) => u.active && u.tenantId === tid).map((u) => u.id),
+  );
+  return Array.from(new Set(raw.map(String))).filter((id) => valid.has(id));
 }
 
 // ===== AUTHENTICATION =====
@@ -714,7 +736,16 @@ app.delete("/api/users/:id", requireAuth, requireRole("admin"), (req: AuthedRequ
 // ===== TENANT MANAGEMENT (super_admin only) =====
 app.get("/api/tenants", requireAuth, requireRole("super_admin"), (req: AuthedRequest, res) => {
   const db = loadDB();
-  res.json(db.tenants);
+  // Sertakan platform efektif (termasuk fallback perusahaan bawaan) supaya
+  // form Edit Perusahaan menampilkan isi yang sama dengan yang dipakai wizard.
+  res.json((db.tenants as any[]).map((t) => ({ ...t, platforms: platformsForTenant(db, t.id) })));
+});
+
+// Platform kerja sama milik perusahaan pengguna yang sedang login — dipakai
+// dropdown "Kerjasama Platform" di wizard kontrak (semua peran boleh baca).
+app.get("/api/tenant-platforms", requireAuth, (req: AuthedRequest, res) => {
+  const db = loadDB();
+  res.json({ platforms: platformsForTenant(db, tenantOf(req)) });
 });
 
 app.post("/api/tenants", requireAuth, requireRole("super_admin"), (req: AuthedRequest, res) => {
@@ -728,7 +759,7 @@ app.post("/api/tenants", requireAuth, requireRole("super_admin"), (req: AuthedRe
     return res.status(400).json({ error: "Email admin sudah terpakai" });
   }
   const tid = "t-" + Date.now();
-  db.tenants.push({ id: tid, name, branch: branch || "", active: true, createdAt: new Date().toISOString() });
+  db.tenants.push({ id: tid, name, branch: branch || "", active: true, platforms: normalizePlatformList(req.body.platforms), createdAt: new Date().toISOString() });
   const adminUser: User = {
     id: "usr-" + Date.now(), tenantId: tid, name: adminName || "Admin " + name,
     email: adminEmail, passwordHash: hashPassword(adminPassword), role: "admin", active: true,
@@ -750,6 +781,7 @@ app.put("/api/tenants/:id", requireAuth, requireRole("super_admin"), (req: Authe
   if (req.body.name) tenant.name = req.body.name;
   if (req.body.branch !== undefined) tenant.branch = req.body.branch;
   if (typeof req.body.active === "boolean") tenant.active = req.body.active;
+  if (Array.isArray(req.body.platforms)) tenant.platforms = normalizePlatformList(req.body.platforms);
   pushAudit(db, req, { action: "Update Tenant", details: `Memperbarui perusahaan "${tenant.name}"` });
   saveDB(db);
   res.json({ success: true, tenant });
@@ -850,6 +882,12 @@ function uploadFileKey(originalname: string): string {
 // Serve locally-stored uploads statically (no-op for files actually persisted
 // to cloud storage — those are fetched straight from the bucket/CDN URL).
 app.use('/uploads', express.static(uploadDir));
+// Berkas yang TIDAK ada di disk (mis. disk platform bersifat sementara) jangan
+// jatuh ke fallback SPA (app.get("*all") -> index.html), karena itu membuat
+// link berkas malah membuka aplikasi (halaman default Monitoring Kontrak).
+app.use('/uploads', (_req, res) => {
+  res.status(404).json({ error: "Berkas tidak ditemukan di server." });
+});
 
 // ai, isGeminiConfigured, parseAiJson, aiErrorResponse now live in
 // ai-client.ts (extracted so dcs/routes.ts can use the same Gemini client
@@ -1013,8 +1051,63 @@ const initialVendors: VendorData[] = [
 //  - LEGACY_DEFAULT_MASK: default LAMA — diperlakukan sebagai "belum dikustom",
 //    jadi otomatis di-upgrade ke default baru (lihat withSettingsDefaults).
 //    Mask yang benar-benar dikustom tenant TIDAK diubah.
-const REFERENCE_DEFAULT_MASK = "{Sequence:3}/{DocTypeCode}/{Codes}/{MonthRoman}/{Year}";
+//  - PREVIOUS_REFERENCE_MASK: default sebelum segmen {Platform} ditambahkan —
+//    juga dianggap "belum dikustom" dan di-upgrade otomatis.
+const REFERENCE_DEFAULT_MASK = "{Sequence:3}/{DocTypeCode}/{Platform}/{Codes}/{MonthRoman}/{Year}";
+const PREVIOUS_REFERENCE_MASK = "{Sequence:3}/{DocTypeCode}/{Codes}/{MonthRoman}/{Year}";
 const LEGACY_DEFAULT_MASK = "{Prefix}-{Year}-{Sequence:4}";
+// Format bawaan jenis Addendum — versi lama (tanpa {Platform}) di-upgrade
+// otomatis, sama seperti default mask di atas.
+const ADDENDUM_DEFAULT_MASK = "ADD-{Sequence:3}/{Platform}/{Year}";
+const PREVIOUS_ADDENDUM_MASK = "ADD-{Sequence:3}/{Year}";
+
+// Platform kerja sama (Asmat, Tiketux, dst) → segmen {Platform} pada nomor.
+// Ditulis lengkap huruf besar; spasi & "/" diganti "-" supaya tidak memecah
+// pemisah segmen nomor. Kosong = kontrak tidak terkait platform → segmen
+// dibuang otomatis oleh renderMask.
+function platformCode(name: string | undefined): string {
+  return String(name || "").trim().toUpperCase().replace(/[\s\/]+/g, "-").replace(/[^A-Z0-9\-]/g, "");
+}
+
+// Daftar platform dari request (Kelola Perusahaan) → array nama unik, rapi.
+function normalizePlatformList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const v of raw) {
+    const name = String(v ?? "").trim().slice(0, 50);
+    if (name && platformCode(name) && !out.some((x) => x.toLowerCase() === name.toLowerCase())) out.push(name);
+  }
+  return out.slice(0, 30);
+}
+
+// Platform kerja sama milik sebuah perusahaan (tenant.platforms). Perusahaan
+// bawaan (DEFAULT_TENANT_ID) yang tersimpan sebelum field ini ada otomatis
+// dapat Asmat & Tiketux; perusahaan lain mulai kosong sampai diisi di
+// Konfigurasi > Kelola Perusahaan.
+function platformsForTenant(db: any, tid: string): string[] {
+  const tenant = ((db.tenants || []) as any[]).find((t) => t.id === tid);
+  if (tenant && Array.isArray(tenant.platforms)) return normalizePlatformList(tenant.platforms);
+  return tid === DEFAULT_TENANT_ID ? ["Asmat", "Tiketux"] : [];
+}
+
+// Platform berlaku untuk SEMUA jenis dokumen, termasuk yang format nomornya
+// sudah dikustom tenant tanpa token {Platform}. Kalau mask belum memuatnya,
+// sisipkan segmen {Platform} tepat setelah kode jenis ({DocTypeCode} /
+// {Prefix}); kalau tak ada, sebelum bulan/tahun; paling akhir di ujung.
+// Token kosong (platform tidak dipilih) tetap dibuang renderMask, jadi mask
+// tanpa platform menghasilkan nomor yang sama persis seperti sebelumnya.
+function ensurePlatformToken(mask: string): string {
+  if (/\{Platform\}/.test(mask)) return mask;
+  for (const anchor of ["{DocTypeCode}", "{Prefix}"]) {
+    const i = mask.indexOf(anchor);
+    if (i >= 0) return mask.slice(0, i + anchor.length) + "/{Platform}" + mask.slice(i + anchor.length);
+  }
+  for (const anchor of ["{MonthRoman}", "{Month}", "{Year}"]) {
+    const i = mask.indexOf(anchor);
+    if (i >= 0) return mask.slice(0, i) + "{Platform}/" + mask.slice(i);
+  }
+  return mask + "/{Platform}";
+}
 
 function createDefaultDB() {
   return {
@@ -1236,7 +1329,7 @@ function defaultSettings() {
         { id: "dt-sewa-menyewa", name: "Sewa Menyewa", code: "SWM", extraCodes: [] as { label: string; value: string }[], categories: [] as string[], defaultTemplateId: "", numberMask: "" },
         // numberMask sengaja terisi (beda dari jenis dokumen lain di sini) —
         // addendum lazimnya punya seri nomor sendiri di praktik hukum Indonesia.
-        { id: "dt-addendum", name: "Addendum / Amandemen", code: "ADD", extraCodes: [] as { label: string; value: string }[], categories: [] as string[], defaultTemplateId: "", numberMask: "ADD-{Sequence:3}/{Year}" },
+        { id: "dt-addendum", name: "Addendum / Amandemen", code: "ADD", extraCodes: [] as { label: string; value: string }[], categories: [] as string[], defaultTemplateId: "", numberMask: ADDENDUM_DEFAULT_MASK },
         { id: "dt-legalitas", name: "Legalitas / Izin Perusahaan", code: "LGL", extraCodes: [] as { label: string; value: string }[], categories: ["Legalitas Perusahaan"], defaultTemplateId: "", numberMask: "" },
         { id: "dt-lainnya", name: "Lainnya", code: "LL", extraCodes: [] as { label: string; value: string }[], categories: [] as string[], defaultTemplateId: "", numberMask: "" },
       ],
@@ -1364,6 +1457,9 @@ function withSettingsDefaults(settings: any) {
   // feature (contract lifecycle is now Draft → Aktif without signing).
   const savedMasterData = { ...(settings?.masterData || {}) };
   delete savedMasterData.internalDocKinds;
+  // platforms: dipindah dari masterData ke data perusahaan (tenant.platforms,
+  // Kelola Perusahaan) — bersihkan sisa lama bila pernah tersimpan.
+  delete savedMasterData.platforms;
   // docTypes adalah array, jadi merge dangkal di bawah akan MENGGANTI array
   // default sepenuhnya kalau tenant sudah punya list sendiri — backfill field
   // baru (id/defaultTemplateId/numberMask) di sini supaya tenant lama tetap
@@ -1374,7 +1470,7 @@ function withSettingsDefaults(settings: any) {
       name: d.name,
       categories: Array.isArray(d.categories) ? d.categories : [],
       defaultTemplateId: d.defaultTemplateId || "",
-      numberMask: d.numberMask || "",
+      numberMask: d.numberMask === PREVIOUS_ADDENDUM_MASK ? ADDENDUM_DEFAULT_MASK : (d.numberMask || ""),
       // Modul tujuan jenis kontrak: "external" | "employee" | "both".
       // Data lama tanpa field ini = "both" (muncul di kontrak eksternal & karyawan).
       appliesTo: d.appliesTo === "external" || d.appliesTo === "employee" ? d.appliesTo : "both",
@@ -1395,7 +1491,11 @@ function withSettingsDefaults(settings: any) {
   }
   // Upgrade default: mask LAMA (atau kosong) dianggap belum dikustom → pakai
   // default baru gaya referensi. Mask yang benar-benar dikustom tak diubah.
-  if (!savedMasterData.defaultNumberMask || savedMasterData.defaultNumberMask === LEGACY_DEFAULT_MASK) {
+  if (
+    !savedMasterData.defaultNumberMask ||
+    savedMasterData.defaultNumberMask === LEGACY_DEFAULT_MASK ||
+    savedMasterData.defaultNumberMask === PREVIOUS_REFERENCE_MASK
+  ) {
     savedMasterData.defaultNumberMask = REFERENCE_DEFAULT_MASK;
   }
   const merged: any = {
@@ -1769,11 +1869,12 @@ app.get("/api/contracts", requireAuth, (req: AuthedRequest, res) => {
 app.get("/api/contracts/generate-number", requireAuth, (req: AuthedRequest, res) => {
   const category = (req.query.category as string) || "General";
   const docType = (req.query.docType as string) || undefined;
+  const platform = (req.query.platform as string) || undefined;
   const db = loadDB();
   const tid = tenantOf(req);
   const currentYear = new Date().getFullYear().toString();
   // Pratinjau: JANGAN konsumsi nomor (consume:false) — cuma tampilkan calon nomor.
-  const { number } = generateContractNumber(db, tid, category, docType, currentYear, { consume: false });
+  const { number } = generateContractNumber(db, tid, category, docType, currentYear, { consume: false, platform });
   res.json({ contractNumber: number });
 });
 
@@ -1799,7 +1900,7 @@ app.get("/api/contracts/:id", requireAuth, (req: AuthedRequest, res) => {
 // DCS_MASK_TOKENS) — sebelumnya hanya ada di sisi DCS tanpa alasan bisnis,
 // murni kesenjangan implementasi antara dua mesin yang sebenarnya berbagi
 // renderMask() yang sama (numbering-utils.ts).
-const CONTRACT_MASK_TOKENS = ["Prefix", "Category", "DocType", "DocTypeCode", "Codes", "MonthRoman", "Year", "Month", "Day"];
+const CONTRACT_MASK_TOKENS = ["Prefix", "Category", "DocType", "DocTypeCode", "Platform", "Codes", "MonthRoman", "Year", "Month", "Day"];
 
 const CONTRACT_CODE_SEP = "/"; // pemisah antar kode tambahan (extraCodes) di {Codes}
 
@@ -1850,9 +1951,11 @@ function captureTemplateSnapshot(db: any, tid: string, templateId: string | unde
 // Auto agreement number, format token dinamis (lihat numbering-utils.ts).
 // Penomoran berpatokan tunggal pada Jenis Dokumen (docType) jika dipilih.
 // Nomor urut memakai COUNTER PERSISTEN per (tenant|jenis|tahun) di db.numberCounters.
+// `platform` (opsional) hanya mengisi segmen {Platform} — TIDAK memecah urutan:
+// Asmat & Tiketux berbagi satu nomor urut per jenis dokumen per tahun.
 function generateContractNumber(
   db: any, tid: string, category: string, docType: string | undefined, year: string,
-  opts?: { consume?: boolean },
+  opts?: { consume?: boolean; platform?: string },
 ): { number: string; seq: number } {
   const consume = opts?.consume !== false;
   const md = withSettingsDefaults(rawSettingsFor(db, tid)).masterData;
@@ -1868,7 +1971,8 @@ function generateContractNumber(
   const dtCode = explicitCode || (docType ? suggestDocTypeCode(docType) : "");
   const prefix = dtCode || md.defaultNumberPrefix || "GA-AGR";
   let mask = dtObj?.numberMask || md.defaultNumberMask || REFERENCE_DEFAULT_MASK;
-  if (mask === LEGACY_DEFAULT_MASK) mask = REFERENCE_DEFAULT_MASK;
+  if (mask === LEGACY_DEFAULT_MASK || mask === PREVIOUS_REFERENCE_MASK) mask = REFERENCE_DEFAULT_MASK;
+  mask = ensurePlatformToken(mask);
 
   if (!Array.isArray(db.numberCounters)) db.numberCounters = [];
   const key = contractScopeKey(tid, category, docType, year);
@@ -1895,7 +1999,7 @@ function generateContractNumber(
   const now = new Date();
   const number = renderMask(mask, {
     Prefix: prefix, Category: category, DocType: docType || "",
-    DocTypeCode: dtCode || prefix, Codes: codes,
+    DocTypeCode: dtCode || prefix, Platform: platformCode(opts?.platform), Codes: codes,
     Year: Number(year), Month: now.getMonth() + 1, Day: now.getDate(),
   }, seq);
   return { number, seq };
@@ -2469,12 +2573,19 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
   // untuk dokumen yg dibuat di sistem). Kalau manualNumber kosong, jatuh ke
   // penomoran otomatis seperti biasa.
   const manualNumber = typeof req.body.manualNumber === "string" ? req.body.manualNumber.trim() : "";
+  // Platform kerja sama (opsional) — wajib salah satu dari master data bila diisi.
+  const platform = typeof req.body.platform === "string" ? req.body.platform.trim() : "";
+  if (platform) {
+    if (!platformsForTenant(db, tid).includes(platform)) {
+      return res.status(400).json({ error: `Platform "${platform}" tidak terdaftar untuk perusahaan ini (Konfigurasi > Kelola Perusahaan).` });
+    }
+  }
   let contractNumber: string, numberSeq: number | undefined;
   if (manualNumber) {
     contractNumber = manualNumber.slice(0, 80);
     numberSeq = undefined;
   } else {
-    const gen = generateContractNumber(db, tid, req.body.category, req.body.docType, currentYear);
+    const gen = generateContractNumber(db, tid, req.body.category, req.body.docType, currentYear, { platform });
     contractNumber = gen.number;
     numberSeq = gen.seq;
   }
@@ -2518,6 +2629,7 @@ app.post("/api/contracts", requireAuth, requireRole("admin", "staff", "legal", "
     currentDocumentVersion: originalDocument ? 0 : undefined,
     masterPdfUrl: originalDocument ? originalDocument.url : (req.body.masterPdfUrl || null),
     docType: req.body.docType || undefined,
+    platform: platform || undefined,
     notes: req.body.notes || undefined,
     subFolderId: req.body.subFolderId || undefined,
     copies: buildContractCopies(Number(req.body.copyCount) || 1, !!req.body.hasMaterai),
@@ -2919,7 +3031,7 @@ app.post("/api/contracts/bulk-import/commit", requireAuth, requireRole("admin", 
     // jejaknya. Kalau kosong, baru sistem yang menerbitkan nomor.
     const nomorAsli = String(r.documentNumber || "").trim();
     const tahun = String(r.startDate).slice(0, 4);
-    const gen = nomorAsli ? null : generateContractNumber(db, tid, r.category || "", r.docType || undefined, tahun);
+    const gen = nomorAsli ? null : generateContractNumber(db, tid, r.category || "", r.docType || undefined, tahun, { platform: r.platform || undefined });
     const now = new Date().toISOString();
     const kontrak: any = {
       id: "ctr-" + Date.now() + "-" + i,
@@ -2929,6 +3041,7 @@ app.post("/api/contracts/bulk-import/commit", requireAuth, requireRole("admin", 
       title: judul,
       category: r.category || "",
       docType: r.docType || "",
+      platform: r.platform || undefined,
       templateId: "",
       party1Name: r.party1Name || "", party2Name: r.party2Name || "", party2Type: r.party2Type || "",
       startDate: r.startDate, endDate: r.endDate,
@@ -3596,6 +3709,44 @@ app.post("/api/contracts/:id/activate", requireAuth, requireRole("admin", "staff
   res.json({ success: true, contract });
 });
 
+// Pengumuman rilis: setelah kontrak AKTIF 100%, tim Legal/Admin mengumumkan
+// "kontrak ini sudah rilis" ke orang-orang yang dipilih PER NAMA, lengkap
+// dengan keterangan bebas. Bisa dikirim berkali-kali (mis. menyusul orang
+// lain); tiap pengumuman dicatat di contract.releaseAnnouncements + Audit Trail.
+app.post("/api/contracts/:id/announce-release", requireAuth, requireRole("admin", "legal"), (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const tid = tenantOf(req);
+  const contract = findOwnedContract(db, req, req.params.id);
+  if (!contract) return res.status(404).json({ error: "Contract not found" });
+  if (contract.status !== "Aktif") {
+    return res.status(400).json({ error: "Pengumuman rilis hanya bisa dikirim setelah kontrak berstatus Aktif." });
+  }
+  const ids = sanitizeReleaseRecipients(db, tid, req.body.userIds);
+  if (ids.length === 0) return res.status(400).json({ error: "Pilih minimal satu penerima." });
+  const note = String(req.body.note || "").trim().slice(0, 1000);
+  const names = (db.users as User[]).filter((u) => ids.includes(u.id)).map((u) => u.name);
+  pushNotif(db, tid, {
+    title: "Kontrak Telah Rilis",
+    message: `Kontrak "${contract.title}" (${contract.contractNumber}) kini AKTIF dan resmi berlaku. Diumumkan oleh ${req.user!.name}.${note ? ` Keterangan: ${note}` : ""}`,
+    type: "success", contractId: contract.id, targetUserIds: ids,
+  });
+  const entry = {
+    id: "rel-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+    createdAt: new Date().toISOString(),
+    byId: req.user!.id, byName: req.user!.name,
+    userIds: ids, names, note: note || undefined,
+  };
+  contract.releaseAnnouncements = [entry, ...(contract.releaseAnnouncements || [])];
+  contract.updatedAt = new Date().toISOString();
+  pushAudit(db, req, {
+    contractId: contract.id, contractNumber: contract.contractNumber,
+    action: "Announce Release",
+    details: `Mengumumkan rilis kontrak "${contract.title}" ke: ${names.join(", ")}${note ? ` — Keterangan: ${note}` : ""}`,
+  });
+  saveDB(db);
+  res.json({ success: true, contract });
+});
+
 // Hitung urutan addendum ("Addendum Kesebelas") + referensi addendum terakhir
 // on-the-fly dari data existing — tidak disimpan, supaya tidak basi kalau ada
 // addendum yang dihapus. Dipakai frontend untuk preview nomor urut sebelum submit.
@@ -3667,7 +3818,7 @@ app.post("/api/contracts/:id/addendum", requireAuth, requireRole("admin", "staff
 
   const ADDENDUM_DOC_TYPE = "Addendum / Amandemen";
   const currentYear = new Date().getFullYear().toString();
-  const { number: contractNumber, seq: numberSeq } = generateContractNumber(db, tid, parent.category, ADDENDUM_DOC_TYPE, currentYear);
+  const { number: contractNumber, seq: numberSeq } = generateContractNumber(db, tid, parent.category, ADDENDUM_DOC_TYPE, currentYear, { platform: parent.platform });
 
   const newAddendum: Contract = {
     id: "ctr-" + Date.now(),
@@ -3678,6 +3829,8 @@ app.post("/api/contracts/:id/addendum", requireAuth, requireRole("admin", "staff
     numberSeq,
     title: req.body.title || `Addendum ${parent.title}`,
     category: parent.category,
+    // Addendum ikut platform kerja sama kontrak induknya.
+    platform: parent.platform,
     party1Name: parent.party1Name,
     party2Name: parent.party2Name,
     party2Type: parent.party2Type,
@@ -4170,6 +4323,28 @@ function currentDocumentVersionNumber(contract: Contract, versions: ContractVers
   return versions.length ? versions[versions.length - 1].version : 0;
 }
 
+// Berkas versi AKTIF utk Mode Tinjau / review eksternal. Kontrak upload
+// menyimpan clauses: [] (isinya BERKAS), jadi review menampilkan berkas asli
+// apa adanya (baca-saja) — bukan narasi/pasal template, bukan teks hasil ekstrak.
+// .doc lama ditampilkan lewat konversi ke .docx (bila LibreOffice tersedia).
+type ReviewViewFormat = "pdf" | "docx" | "image" | "unsupported";
+function currentUploadedFileForReview(db: any, contract: Contract): {
+  ref: StoredDocumentRef; version: number; viewFormat: ReviewViewFormat; asDocx: boolean;
+} | null {
+  const versions = uploadedDocumentVersions(db, contract);
+  const cur = currentDocumentVersionNumber(contract, versions);
+  const ver = versions.find((v) => v.version === cur) || versions[versions.length - 1];
+  if (!ver?.file) return null;
+  const f = String(ver.file.format);
+  let viewFormat: ReviewViewFormat = "unsupported";
+  let asDocx = false;
+  if (f === "pdf") viewFormat = "pdf";
+  else if (f === "docx") viewFormat = "docx";
+  else if (f === "image") viewFormat = "image";
+  else if (f === "doc" && isOfficeConverterAvailable()) { viewFormat = "docx"; asDocx = true; }
+  return { ref: ver.file, version: ver.version, viewFormat, asDocx };
+}
+
 app.get("/api/contracts/:id/document-versions", requireAuth, (req: AuthedRequest, res) => {
   const db = loadDB();
   const contract = findOwnedContract(db, req, req.params.id);
@@ -4179,7 +4354,11 @@ app.get("/api/contracts/:id/document-versions", requireAuth, (req: AuthedRequest
     documentSource: resolveDocumentSource(contract),
     currentVersion: currentDocumentVersionNumber(contract, versions),
     versions,
-    capabilities: { docConversion: isOfficeConverterAvailable(), pdfTextEdit: true },
+    // officeToPdf: unduh .docx sbg PDF SELALU bisa (fallback mammoth+pdf-lib
+    // kalau LibreOffice belum ada). officeToPdfExact: true = hasilnya persis
+    // tata letak asli (LibreOffice), false = teks polos (fallback, tanpa
+    // tabel/gambar/format) — dipakai utk pesan info di pop-up unduhan.
+    capabilities: { docConversion: isOfficeConverterAvailable(), pdfTextEdit: true, pdfToWord: true, officeToPdf: true, officeToPdfExact: isOfficeConverterAvailable() },
   });
 });
 
@@ -4217,6 +4396,35 @@ app.get("/api/contracts/:id/document", requireAuth, async (req: AuthedRequest, r
       res.setHeader("Cache-Control", "private, no-store");
       res.setHeader("X-Converted-From", "doc");
       return res.send(out);
+    }
+    // ?format=pdf (bersama download=1) : unduh versi .docx yang sedang aktif
+    // sebagai PDF hasil konversi LibreOffice. TIDAK membuat versi baru & TIDAK
+    // mengubah berkas .docx yang tersimpan — murni format unduhan yang dipilih
+    // pengguna di pop-up "Download". Hanya berlaku utk sumber .docx; format
+    // lain (pdf/doc/image) mengabaikan parameter ini dan lanjut ke unduhan
+    // biasa di bawah, supaya perilaku lama tidak berubah.
+    if (download && req.query.format === "pdf" && fileRef.format === "docx") {
+      let pdfBuf: Buffer;
+      try {
+        pdfBuf = await convertedPdfFor(buf);
+      } catch (convErr: any) {
+        logger.error({ err: convErr, contractId: contract.id }, "Gagal mengonversi dokumen ke PDF");
+        return res.status(convErr?.status || 500).json({ error: convErr?.message || "Gagal mengonversi dokumen ke PDF." });
+      }
+      pushAudit(db, req, {
+        contractId: contract.id, contractNumber: contract.contractNumber,
+        action: "Download Document",
+        details: `${req.user!.name} mengunduh dokumen "${ver.file.fileName}" (versi ${ver.version}${ver.isOriginal ? " — original" : ""}) sebagai PDF (dikonversi dari Word).`,
+      });
+      saveDB(db);
+      const pdfName = ver.file.fileName.replace(/\.docx$/i, "") + ".pdf";
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Length", pdfBuf.length);
+      res.setHeader("Cache-Control", "private, no-store");
+      res.setHeader("X-Document-Version", String(ver.version));
+      res.setHeader("X-Converted-To", "pdf");
+      res.setHeader("Content-Disposition", contentDisposition("attachment", pdfName));
+      return res.send(pdfBuf);
     }
     const wmSettings = withSettingsDefaults(rawSettingsFor(db, tenantOf(req)));
     if (download && fileRef.format === "pdf" && wmSettings.contractWatermark) {
@@ -4355,6 +4563,85 @@ async function convertedDocxFor(buf: Buffer): Promise<Buffer> {
   return out;
 }
 
+// Karakter di luar Latin-1 tidak didukung StandardFonts pdf-lib (WinAnsi) dan
+// akan membuat drawText() melempar error — ganti dgn padanan ASCII/tanda "?"
+// supaya fallback di bawah tidak pernah gagal karena karakter aneh.
+function sanitizeForStandardFont(s: string): string {
+  return s
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[–—]/g, "-")
+    .replace(/…/g, "...")
+    .replace(/\t/g, "    ")
+    .replace(/[^\x00-\xFF]/g, "?");
+}
+
+// Fallback konversi .docx -> PDF TANPA LibreOffice (100% npm, sudah jadi
+// dependency proyek ini: mammoth + pdf-lib — tidak ada instalasi tambahan
+// apa pun di server/komputer). Isi teks lengkap diambil apa adanya, tapi tata
+// letak disederhanakan jadi teks polos berjajar (tanpa tabel, gambar, atau
+// format asli seperti bold/rata tengah). Dipakai otomatis saat LibreOffice
+// belum terpasang, supaya tombol "Download" -> PDF tetap selalu berfungsi.
+async function plainTextDocxToPdf(buf: Buffer): Promise<Buffer> {
+  const { value: rawText } = await mammoth.extractRawText({ buffer: buf });
+  const pdfDoc = await PDFDocument.create();
+  const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontSize = 11;
+  const lineHeight = fontSize * 1.45;
+  const pageWidth = 595.28; // A4 dalam point
+  const pageHeight = 841.89;
+  const margin = 56;
+  const maxWidth = pageWidth - margin * 2;
+
+  const lines: string[] = [];
+  for (const rawPara of rawText.split(/\r?\n/)) {
+    const para = sanitizeForStandardFont(rawPara);
+    if (!para.trim()) { lines.push(""); continue; }
+    let cur = "";
+    for (const word of para.split(/\s+/).filter(Boolean)) {
+      const test = cur ? `${cur} ${word}` : word;
+      if (cur && font.widthOfTextAtSize(test, fontSize) > maxWidth) {
+        lines.push(cur);
+        cur = word;
+      } else {
+        cur = test;
+      }
+    }
+    lines.push(cur);
+  }
+
+  let page = pdfDoc.addPage([pageWidth, pageHeight]);
+  let y = pageHeight - margin;
+  for (const line of lines) {
+    if (y < margin) {
+      page = pdfDoc.addPage([pageWidth, pageHeight]);
+      y = pageHeight - margin;
+    }
+    if (line) page.drawText(line, { x: margin, y, size: fontSize, font, color: rgb(0.12, 0.12, 0.12) });
+    y -= lineHeight;
+  }
+  return Buffer.from(await pdfDoc.save());
+}
+
+// Cache hasil konversi .docx -> PDF utk unduhan format PDF (per hash isi berkas).
+// Terpisah dari convertedCache (yang isinya .docx) supaya tidak tertukar.
+const convertedPdfCache = new Map<string, Buffer>();
+async function convertedPdfFor(buf: Buffer): Promise<Buffer> {
+  const key = sha256(buf);
+  const hit = convertedPdfCache.get(key);
+  if (hit) return hit;
+  // LibreOffice (bila terpasang) menghasilkan PDF yg identik dgn tata letak
+  // asli. Kalau belum terpasang, fallback mammoth+pdf-lib di atas dipakai
+  // otomatis supaya tombol PDF tetap selalu berfungsi — 100% gratis & open
+  // source, tanpa instalasi tambahan.
+  const out = isOfficeConverterAvailable()
+    ? await convertDocxToPdf(buf)
+    : await plainTextDocxToPdf(buf);
+  convertedPdfCache.set(key, out);
+  if (convertedPdfCache.size > 20) convertedPdfCache.delete(convertedPdfCache.keys().next().value!);
+  return out;
+}
+
 function assertEditableUploadContract(contract: Contract | undefined, res: any): contract is Contract {
   if (!contract) { res.status(404).json({ error: "Contract not found" }); return false; }
   if (resolveDocumentSource(contract) !== "upload") { res.status(409).json({ error: "Versi dokumen hanya untuk kontrak hasil Upload Dokumen." }); return false; }
@@ -4387,6 +4674,41 @@ app.post("/api/contracts/:id/document-versions/convert", requireAuth, requireRol
     res.json({ success: true, contract, version: ver });
   } catch (err: any) {
     res.status(err?.status || 500).json({ error: err?.message || "Konversi gagal." });
+  }
+});
+
+// "Edit seperti Word": ubah versi aktif PDF -> .docx sebagai versi BARU
+// (pdf-to-docx.ts, tanpa Python/layanan luar). PDF-nya tetap tersimpan utuh
+// di versi sebelumnya & jadi sourceFile versi baru ini.
+app.post("/api/contracts/:id/document-versions/pdf-to-docx", requireAuth, requireRole("admin", "staff", "legal", "manager"), async (req: AuthedRequest, res) => {
+  const pre = findOwnedContract(loadDB(), req, req.params.id);
+  if (!assertEditableUploadContract(pre, res)) return;
+  const preVersions = uploadedDocumentVersions(loadDB(), pre);
+  const cur = preVersions.find((v) => v.version === currentDocumentVersionNumber(pre, preVersions));
+  if (!cur?.file || cur.file.format !== "pdf") return res.status(400).json({ error: "Versi aktif bukan berkas PDF." });
+  try {
+    const { docx, stats } = await convertPdfToDocx(await readStoredDocument(cur.file, uploadDir));
+    const baseName = (preVersions.find((v) => v.isOriginal)?.file?.fileName || cur.file.fileName).replace(/\.pdf$/i, "").replace(/\s*\(v\d+\)$/, "");
+    const db = loadDB();
+    const contract = findOwnedContract(db, req, req.params.id)!;
+    const versions = uploadedDocumentVersions(db, contract);
+    const current = currentDocumentVersionNumber(contract, versions);
+    if (current !== cur.version) return res.status(409).json({ error: "Dokumen sudah berubah. Muat ulang workspace." });
+    const nextNum = versions.length ? Math.max(...versions.map((v) => v.version)) + 1 : 1;
+    const stored = await storeFile(docx, `contractdoc-${contract.id.replace(/[^\w-]/g, "")}-${Date.now()}-pdf2docx.docx`, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+    const ver = pushDocumentVersion(db, req, contract, buildDocumentRef(docx, stored, `${baseName} (v${nextNum}).docx`, "docx", req.user!.name), {
+      comment: `Diubah dari PDF ke Word agar bisa diedit seperti Word (dari ${cur.isOriginal ? "original" : `versi ${cur.version}`})`,
+      basedOnVersion: current, editMethod: "pdf-to-docx", sourceFile: cur.file,
+    });
+    pushAudit(db, req, {
+      contractId: contract.id, contractNumber: contract.contractNumber, action: "Convert Document",
+      details: `Konversi PDF "${cur.file.fileName}" ke Word sebagai versi ${ver.version} (${stats.paragraphs} paragraf, ${stats.tables} tabel, ${stats.images} gambar). PDF asli tetap utuh.`,
+    });
+    saveDB(db);
+    res.json({ success: true, contract, version: ver, stats });
+  } catch (err: any) {
+    if (!err?.status) logger.error({ err, contractId: pre.id }, "Gagal mengubah PDF ke Word");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal mengubah PDF ke Word." });
   }
 });
 
@@ -4515,7 +4837,7 @@ app.post("/api/contracts/:id/renew", requireAuth, requireRole("admin", "staff", 
     const endObj = new Date(startObj);
     endObj.setFullYear(endObj.getFullYear() + 1); // Perpanjang otomatis 1 tahun
 
-    const { number: newContractNumber, seq: newNumberSeq } = generateContractNumber(db, tid, sourceContract.category, sourceContract.docType, currentYear);
+    const { number: newContractNumber, seq: newNumberSeq } = generateContractNumber(db, tid, sourceContract.category, sourceContract.docType, currentYear, { platform: sourceContract.platform });
     const newStartDate = req.body.startDate || startObj.toISOString().split("T")[0];
     const newEndDate = req.body.endDate || endObj.toISOString().split("T")[0];
 
@@ -4598,7 +4920,9 @@ app.post("/api/notifications/read-all", requireAuth, (req: AuthedRequest, res) =
   const db = loadDB();
   const tid = tenantOf(req);
   (db.notifications as SystemNotification[]).forEach((n) => {
-    if (n.tenantId === tid) n.read = true;
+    // Hanya notifikasi yang memang terlihat oleh user ini — notifikasi yang
+    // ditargetkan ke orang lain (mis. rilis kontrak) tidak ikut ter-"read".
+    if (n.tenantId === tid && (!n.targetUserIds?.length || n.targetUserIds.includes(req.user!.id))) n.read = true;
   });
   saveDB(db);
   res.json({ success: true });
@@ -5613,6 +5937,27 @@ app.get("/api/contracts/:id/comments", requireAuth, (req: AuthedRequest, res) =>
   res.json(comments);
 });
 
+// Markup dokumen upload (Track Changes ala Word): kind comment|strike|replace,
+// teks pengganti, dan indeks paragraf XML. Dipakai POST internal & eksternal.
+function parseMarkupFields(body: any): { kind: "comment" | "strike" | "replace"; replacement?: string; docAnchor?: { paraIndex: number }; status?: "pending"; error?: string } {
+  const rawKind = body?.kind;
+  const kind: "comment" | "strike" | "replace" = rawKind === "replace" ? "replace" : rawKind === "strike" ? "strike" : "comment";
+  const pi = body?.docAnchor?.paraIndex;
+  const docAnchor = Number.isInteger(pi) && pi >= 0 ? { paraIndex: pi as number } : undefined;
+  // Markup pada PASAL kontrak template (bukan berkas upload): tanpa docAnchor,
+  // tetapi wajib membawa kutipan sorotan. Komentar coret lama (tanpa flag ini)
+  // tetap berupa sorotan biasa tanpa status, jadi data lama tidak berubah.
+  const clauseMarkup = !docAnchor && body?.clauseMarkup === true && String(body?.anchor?.quote ?? "").trim().length > 0;
+  if (kind === "replace") {
+    const replacement = String(body?.replacement ?? "").slice(0, 2000);
+    if (!replacement.trim()) return { kind, error: "Teks pengganti wajib diisi untuk usulan ganti." };
+    if (!docAnchor && !clauseMarkup) return { kind, error: "Usulan ganti hanya untuk teks yang dipilih pada dokumen." };
+    return { kind, replacement, ...(docAnchor ? { docAnchor } : {}), status: "pending" };
+  }
+  if (kind === "strike" && clauseMarkup) return { kind, status: "pending" };
+  return { kind, ...(docAnchor ? { docAnchor, ...(kind === "strike" ? { status: "pending" as const } : {}) } : {}) };
+}
+
 // POST /api/contracts/:id/comments — tambah komentar baru
 app.post("/api/contracts/:id/comments", requireAuth, async (req: AuthedRequest, res) => {
   const db = loadDB();
@@ -5620,8 +5965,10 @@ app.post("/api/contracts/:id/comments", requireAuth, async (req: AuthedRequest, 
   const contract = (db.contracts as Contract[]).find((c) => c.id === req.params.id && c.tenantId === tid);
   if (!contract) return res.status(404).json({ error: "Kontrak tidak ditemukan" });
 
-  const { clauseId, clauseTitle, text, parentId, mentions, anchor, kind } = req.body;
+  const { clauseId, clauseTitle, text, parentId, mentions, anchor } = req.body;
   if (!clauseId || !text?.trim()) return res.status(400).json({ error: "clauseId dan text wajib diisi" });
+  const markup = parseMarkupFields(req.body);
+  if (markup.error) return res.status(400).json({ error: markup.error });
 
   const u = req.user!;
   const comment: ClauseComment = {
@@ -5640,7 +5987,10 @@ app.post("/api/contracts/:id/comments", requireAuth, async (req: AuthedRequest, 
     parentId: parentId || undefined,
     ...(anchor && typeof anchor.start === "number" && typeof anchor.end === "number"
       ? { anchor: { start: anchor.start, end: anchor.end, quote: String(anchor.quote || "").slice(0, 500) } } : {}),
-    kind: kind === "strike" ? "strike" : "comment",
+    kind: markup.kind,
+    ...(markup.replacement !== undefined ? { replacement: markup.replacement } : {}),
+    ...(markup.docAnchor ? { docAnchor: markup.docAnchor } : {}),
+    ...(markup.status ? { status: markup.status } : {}),
   };
 
   if (!db.clauseComments) db.clauseComments = [];
@@ -5695,7 +6045,7 @@ app.put("/api/contracts/:id/comments/:cid", requireAuth, (req: AuthedRequest, re
   );
   if (!comment) return res.status(404).json({ error: "Komentar tidak ditemukan" });
 
-  const isOwnerOrPrivileged = comment.userId === req.user!.id || ["admin", "legal"].includes(req.user!.role);
+  const isOwnerOrPrivileged = comment.userId === req.user!.id || ["admin", "legal", "super_admin"].includes(req.user!.role);
 
   // Editing the actual comment text stays owner/admin/legal-only, but
   // resolving a thread is a collaborative action (Google-Docs style: anyone
@@ -5707,6 +6057,15 @@ app.put("/api/contracts/:id/comments/:cid", requireAuth, (req: AuthedRequest, re
   }
   if (typeof req.body.resolved === "boolean") {
     comment.resolved = req.body.resolved;
+  }
+  // Status usulan markup dokumen upload: terima/tolak mengubah dokumen (versi
+  // baru), jadi dibatasi ke peran yang boleh mengubah dokumen kontrak.
+  if (req.body.status !== undefined) {
+    if (!["pending", "accepted", "rejected"].includes(req.body.status)) return res.status(400).json({ error: "Status tidak valid." });
+    if (!["admin", "staff", "legal", "manager", "super_admin"].includes(req.user!.role)) return res.status(403).json({ error: "Anda tidak berwenang menerima/menolak usulan." });
+    if (comment.kind !== "strike" && comment.kind !== "replace") return res.status(400).json({ error: "Hanya usulan coret/ganti yang punya status." });
+    comment.status = req.body.status;
+    comment.resolved = req.body.status !== "pending";
   }
   // Ubah sorotan/highlight komentar (mis. penulis salah menyorot kalimat
   // saat pertama membuat) — sama seperti edit teks, hanya pemilik/admin/legal.
@@ -5735,7 +6094,7 @@ app.delete("/api/contracts/:id/comments/:cid", requireAuth, (req: AuthedRequest,
   );
   if (idx === -1) return res.status(404).json({ error: "Komentar tidak ditemukan" });
   const comment = db.clauseComments[idx];
-  if (comment.userId !== req.user!.id && !["admin", "legal"].includes(req.user!.role)) {
+  if (comment.userId !== req.user!.id && !["admin", "legal", "super_admin"].includes(req.user!.role)) {
     return res.status(403).json({ error: "Tidak dapat menghapus komentar orang lain" });
   }
   db.clauseComments.splice(idx, 1);
@@ -5760,7 +6119,14 @@ app.post("/api/contracts/:id/external-review/enable", requireAuth, (req: AuthedR
   if (contract.status === "Aktif" || contract.status === "Archived" || contract.status === "Terminated") {
     return res.status(409).json({ error: "Review eksternal hanya untuk kontrak yang masih dalam penyusunan/review (sebelum aktif)." });
   }
-  contract.externalReviewToken = randomBytes(24).toString("hex");
+  // Link yang masih berlaku dipakai ulang (jangan diputar tiap klik) supaya link
+  // yang sudah dikirim ke pihak eksternal tidak mati. Putar token = disable dulu.
+  const tokenStillValid = !!contract.externalReviewToken
+    && !(contract.externalReviewExpiresAt && new Date(contract.externalReviewExpiresAt) < new Date());
+  if (!tokenStillValid) {
+    contract.externalReviewToken = randomBytes(24).toString("hex");
+    contract.externalReviewLocked = false;
+  }
   const days = Number(req.body?.expiresInDays);
   contract.externalReviewExpiresAt = Number.isFinite(days) && days > 0
     ? new Date(Date.now() + days * 86400000).toISOString() : null;
@@ -6202,12 +6568,23 @@ app.get("/api/external-review/:token", apiLimiter, (req, res) => {
   // PALING AWAL — supaya pihak eksternal juga bisa menyorot & mengomentarinya
   // lewat mekanisme yang SAMA dengan klausul biasa (tak perlu UI terpisah).
   const preambleClause = { id: "__preamble__", title: "Narasi Pembuka & Para Pihak", order: -1, content: composeContractPreambleText(db, contract) };
+  // Kontrak upload: yang direview adalah BERKAS aslinya (lihat endpoint
+  // /document di bawah), jadi tidak ada narasi/pasal template di sini.
+  const isUpload = resolveDocumentSource(contract) === "upload";
+  const uploadedFile = isUpload ? currentUploadedFileForReview(loadDB(), contract) : null;
   // Hanya paparkan yang perlu untuk review — bukan seluruh objek kontrak.
   res.json({
     contract: {
       title: contract.title, contractNumber: contract.contractNumber,
       party1Name: contract.party1Name, party2Name: contract.party2Name,
-      clauses: [preambleClause, ...(contract.clauses || []).slice().sort((a, b) => a.order - b.order)],
+      documentSource: isUpload ? "upload" : "template",
+      documentFormat: uploadedFile?.viewFormat,
+      // Markup per-teks hanya utk .docx ASLI (bukan .doc hasil konversi): usulan yg diterima harus bisa ditulis ke berkasnya.
+      documentMarkup: uploadedFile ? uploadedFile.ref.format === "docx" : false,
+      documentName: uploadedFile?.ref.fileName,
+      documentVersion: uploadedFile?.version,
+      documentMime: uploadedFile ? (uploadedFile.asDocx ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document" : uploadedFile.ref.mimeType) : undefined,
+      clauses: isUpload ? [] : [preambleClause, ...(contract.clauses || []).slice().sort((a, b) => a.order - b.order)],
     },
     comments,
     alreadyApproved: (contract.externalApprovals || []).length > 0,
@@ -6223,10 +6600,12 @@ app.post("/api/external-review/:token/comments", apiLimiter, (req, res) => {
   if (contract.externalReviewLocked) {
     return res.status(403).json({ error: "Review ini sudah terkunci sejak Anda menyetujui (Setuju/OK). Hubungi pemilik dokumen untuk membuka akses kembali." });
   }
-  const { clauseId, clauseTitle, text, anchor, kind, name } = req.body || {};
+  const { clauseId, clauseTitle, text, anchor, name } = req.body || {};
   if (!clauseId || !text?.trim() || !String(name || "").trim()) {
     return res.status(400).json({ error: "Nama, klausul, dan komentar wajib diisi." });
   }
+  const markup = parseMarkupFields(req.body);
+  if (markup.error) return res.status(400).json({ error: markup.error });
   const db = loadDB();
   const comment: ClauseComment = {
     id: "cmt-ext-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
@@ -6237,7 +6616,10 @@ app.post("/api/external-review/:token/comments", apiLimiter, (req, res) => {
     external: true, externalName: String(name).trim().slice(0, 80),
     ...(anchor && typeof anchor.start === "number" && typeof anchor.end === "number"
       ? { anchor: { start: anchor.start, end: anchor.end, quote: String(anchor.quote || "").slice(0, 500) } } : {}),
-    kind: kind === "strike" ? "strike" : "comment",
+    kind: markup.kind,
+    ...(markup.replacement !== undefined ? { replacement: markup.replacement } : {}),
+    ...(markup.docAnchor ? { docAnchor: markup.docAnchor } : {}),
+    ...(markup.status ? { status: markup.status } : {}),
   };
   if (!db.clauseComments) db.clauseComments = [];
   db.clauseComments.unshift(comment);
@@ -6248,6 +6630,38 @@ app.post("/api/external-review/:token/comments", apiLimiter, (req, res) => {
   });
   saveDB(db);
   res.json({ success: true, comment });
+});
+
+// PUBLIK (tanpa auth, dijaga token) — berkas kontrak upload untuk direview tamu.
+// Hanya melayani versi AKTIF, inline & baca-saja (tanpa unduhan).
+app.get("/api/external-review/:token/document", apiLimiter, async (req, res) => {
+  const contract = resolveExternalReview(req.params.token);
+  if (!contract) return res.status(404).json({ error: "Link review tidak valid atau sudah kadaluarsa." });
+  if (resolveDocumentSource(contract) !== "upload") {
+    return res.status(409).json({ error: "Kontrak ini dibuat dari template — tidak punya berkas dokumen upload." });
+  }
+  const db = loadDB();
+  const info = currentUploadedFileForReview(db, contract);
+  if (!info) return res.status(404).json({ error: "Berkas dokumen belum tersedia." });
+  if (info.viewFormat === "unsupported") {
+    return res.status(415).json({ error: "Format berkas ini belum bisa dipratinjau di halaman review." });
+  }
+  try {
+    let buf = await readStoredDocument(info.ref, uploadDir);
+    let mime = info.ref.mimeType || "application/octet-stream";
+    if (info.asDocx) {
+      buf = await convertedDocxFor(buf);
+      mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    }
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Length", buf.length);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Disposition", contentDisposition("inline", info.ref.fileName));
+    res.send(buf);
+  } catch (err: any) {
+    logger.error({ err, contractId: contract.id }, "Gagal menyajikan berkas untuk review eksternal");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal membuka berkas dokumen." });
+  }
 });
 
 // PUBLIK — tamu eksternal klik "OK / Setuju" (klausul sudah sesuai). Sekali
@@ -6437,6 +6851,64 @@ app.get("/api/legal-jobs/:id", requireAuth, (req: AuthedRequest, res) => {
   res.json(withLinkedContract(db, job));
 });
 
+// Staff Legal menginput pekerjaan langsung (PIC pemberi tidak sempat/mau mengisi
+// formulir). Karena yang menginput sudah Legal, tahap "Menunggu Persetujuan"
+// dilewati: pekerjaan langsung masuk alur kerja utama (Draft) dengan prioritas
+// yang ditentukan penginput, sumbernya "internal".
+app.post("/api/legal-jobs", requireAuth, requireRole("admin", "legal", "manager", "staff"), uploadLegalDoc.single("file"), async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const tid = tenantOf(req);
+  const b = req.body || {};
+  const title = String(b.title || "").trim();
+  const partnerName = String(b.partnerName || "").trim();
+  const docType = String(b.docType || "").trim();
+  const picName = normalizeLegalPic(b.picName);
+  const deadline = String(b.deadline || "").trim();
+  const priority = String(b.priority || "") as LegalJobPriority;
+  const missing = [
+    !title && "Judul Pekerjaan", !partnerName && "Partner/Pihak", !docType && "Jenis Dokumen",
+    !picName && "PIC Pemberi Pekerjaan (pilih dari daftar; jika Lainnya, isi nama divisinya)", !deadline && "Deadline",
+    !["Tinggi", "Sedang", "Rendah"].includes(priority) && "Prioritas",
+  ].filter(Boolean);
+  if (missing.length) return res.status(400).json({ error: `Field wajib belum diisi: ${missing.join(", ")}.` });
+
+  const now = new Date().toISOString();
+  const documents: LegalJobDocument[] = [];
+  if (req.file) {
+    try {
+      const key = uploadFileKey(req.file.originalname);
+      const stored = await storeFile(req.file.buffer, key, req.file.mimetype);
+      documents.push({
+        id: "ljd-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+        name: req.file.originalname, url: stored.url, key: stored.key, mimeType: req.file.mimetype,
+        size: req.file.size, uploadedAt: now, uploadedBy: req.user!.name,
+      });
+    } catch (err) {
+      logger.error({ err }, "Gagal mengunggah lampiran Pekerjaan Legal (input Staff Legal)");
+      return res.status(500).json({ error: "Gagal mengunggah lampiran. Coba lagi atau simpan tanpa lampiran." });
+    }
+  }
+  const requester = String(b.submitterName || "").trim();
+  const job: LegalJob = {
+    id: "lj-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+    tenantId: tid, title, partnerName, docType, picName: picName!, deadline,
+    description: String(b.description || "").trim() || undefined, documents,
+    status: "draft", priority, source: "internal",
+    submitterName: requester || undefined,
+    approvedByName: req.user!.name, approvedAt: now,
+    notes: [], timeline: [
+      { id: "ljt-0", label: "Diinput langsung oleh Staff Legal", actor: req.user!.name, at: now, detail: requester ? `Atas permintaan ${requester} (${picName}).` : `PIC pemberi pekerjaan: ${picName}.` },
+      { id: "ljt-1", label: `Masuk alur kerja utama — Prioritas ${priority}`, actor: req.user!.name, at: now, detail: "Tahap persetujuan dilewati karena diinput Staff Legal." },
+    ],
+    createdAt: now, updatedAt: now,
+  };
+  if (!db.legalJobs) db.legalJobs = [];
+  db.legalJobs.push(job);
+  pushAudit(db, req, { action: "Input Pekerjaan Legal", details: `Menginput langsung "${title}" (${partnerName}), PIC ${picName}, prioritas ${priority}.` });
+  saveDB(db);
+  res.json(withLinkedContract(db, job));
+});
+
 // Setujui pekerjaan masuk → tentukan prioritas → pindah ke alur kerja utama (status: draft).
 app.patch("/api/legal-jobs/:id/approve", requireAuth, requireRole("admin", "legal", "manager", "staff"), (req: AuthedRequest, res) => {
   const db = loadDB();
@@ -6537,6 +7009,29 @@ app.post("/api/legal-jobs/:id/documents", requireAuth, uploadLegalDoc.single("fi
   }
 });
 
+// Buka / unduh berkas lampiran Pekerjaan Legal lewat server (bukan href mentah
+// ke /uploads): terautentikasi + tenant-scoped, jalan untuk disk lokal MAUPUN
+// cloud storage privat, dan kalau berkas hilang jawabannya JSON error yang
+// jelas (bukan halaman aplikasi). ?download=1 -> attachment, default inline.
+app.get("/api/legal-jobs/:id/documents/:docId/file", requireAuth, async (req: AuthedRequest, res) => {
+  const db = loadDB();
+  const job = findLegalJob(db, tenantOf(req), req.params.id);
+  if (!job) return res.status(404).json({ error: "Pekerjaan legal tidak ditemukan." });
+  const doc = (job.documents || []).find((d) => d.id === req.params.docId);
+  if (!doc) return res.status(404).json({ error: "Dokumen tidak ditemukan." });
+  try {
+    const buf = await readStoredDocument({ key: doc.key, url: doc.url } as StoredDocumentRef, uploadDir);
+    res.setHeader("Content-Type", doc.mimeType || "application/octet-stream");
+    res.setHeader("Content-Length", buf.length);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Disposition", contentDisposition(req.query.download === "1" ? "attachment" : "inline", doc.name));
+    res.send(buf);
+  } catch (err: any) {
+    logger.error({ err, jobId: job.id, docId: doc.id }, "Gagal membuka berkas Pekerjaan Legal");
+    res.status(err?.status || 500).json({ error: err?.message || "Gagal membuka berkas." });
+  }
+});
+
 // ----- Link formulir eksternal (Bagikan Link Formulir) -----
 
 function legalFormLinkFor(db: any, tid: string): LegalFormLink {
@@ -6593,17 +7088,13 @@ app.get("/api/legal-form/:token", apiLimiter, (req, res) => {
   if (!link) return res.status(404).json({ error: "Link formulir tidak valid atau sudah tidak berlaku." });
   const tenant = (db.tenants as any[]).find((t) => t.id === link.tenantId);
   const jobs = legalJobTenantList(db, link.tenantId);
-  // Jenis Dokumen memakai SUMBER YANG SAMA dengan Kontrak Eksternal
-  // (Konfigurasi > Master Data > Jenis Dokumen) — supaya admin cukup kelola
-  // satu daftar, bukan dua daftar terpisah yang gampang tidak sinkron.
-  const md = withSettingsDefaults(rawSettingsFor(db, link.tenantId)).masterData;
-  const docTypeNames = (md?.docTypes || []).map((d: any) => (typeof d === "string" ? d : d.name)).filter(Boolean);
+  // Jenis Dokumen di form ini teks bebas & TERPISAH dari master data Jenis
+  // Dokumen Kontrak (hanya untuk penamaan pekerjaan) — tidak ada relasi.
   const uniq = (arr: (string | undefined)[]) => Array.from(new Set(arr.filter(Boolean))) as string[];
   res.json({
     tenantName: tenant?.name || "Perusahaan",
-    docTypeOptions: uniq(docTypeNames),
     partnerSuggestions: uniq(jobs.map((j) => j.partnerName)),
-    picSuggestions: uniq([...jobs.map((j) => j.picName), "Marketing", "Account Executive", "Business Development", "Operasional"]),
+    picOptions: LEGAL_PIC_OPTIONS,
   });
 });
 
@@ -6615,7 +7106,7 @@ app.post("/api/legal-form/:token/submit", apiLimiter, uploadLegalDoc.single("fil
   const title = String(req.body?.title || "").trim();
   const partnerName = String(req.body?.partnerName || "").trim();
   const docType = String(req.body?.docType || "").trim();
-  const picName = String(req.body?.picName || "").trim();
+  const picName = normalizeLegalPic(req.body?.picName) || "";
   const deadline = String(req.body?.deadline || "").trim();
   const description = String(req.body?.description || "").trim();
   const submitterName = String(req.body?.submitterName || "").trim();

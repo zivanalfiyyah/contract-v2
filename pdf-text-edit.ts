@@ -606,3 +606,114 @@ export function applyPdfEdits(buf: Buffer, req: PdfEditRequest): Promise<PdfEdit
     } finally { closeDoc(m, d); }
   });
 }
+
+// --- bahan konversi PDF -> Word (dipakai pdf-to-docx.ts) ------------------------
+// Fungsi TAMBAHAN — tidak mengubah extractPdfLayout/applyPdfEdits di atas.
+// Selain baris teks (sama persis dgn extractPdfLayout), ikut dibaca objek
+// gambar & path (garis/kotak berwarna) supaya kop, garis pemisah, kotak
+// catatan & logo ikut terbawa ke dokumen Word hasil konversi.
+
+const FPDF_PAGEOBJ_PATH = 2;
+const FPDF_PAGEOBJ_IMAGE = 3;
+
+export interface PdfGraphicRect {
+  x: number; y: number; w: number; h: number; // point, origin kiri-atas halaman
+  fill: string | null; // #rrggbb, null = tanpa isi
+  stroke: string | null; // #rrggbb, null = tanpa garis tepi
+  strokeWidth: number;
+}
+export interface PdfGraphicImage {
+  x: number; y: number; w: number; h: number;
+  width: number; height: number; // piksel
+  rgba: Uint8Array | null; // null = terlalu besar/gagal dirender
+}
+export interface PdfConversionPage extends PdfPageLayout {
+  rects: PdfGraphicRect[];
+  images: PdfGraphicImage[];
+}
+
+function readBitmapRgba(m: M, bmp: number): { width: number; height: number; rgba: Uint8Array } | null {
+  const width = m.FPDFBitmap_GetWidth(bmp);
+  const height = m.FPDFBitmap_GetHeight(bmp);
+  const stride = m.FPDFBitmap_GetStride(bmp);
+  const format = m.FPDFBitmap_GetFormat(bmp); // 1 Gray, 2 BGR, 3 BGRx, 4 BGRA
+  const ptr = m.FPDFBitmap_GetBuffer(bmp);
+  if (!width || !height || !ptr) return null;
+  const src = heap(m);
+  const bpp = format === 1 ? 1 : format === 2 ? 3 : 4;
+  const out = new Uint8Array(width * height * 4);
+  for (let yy = 0; yy < height; yy++) {
+    const row = ptr + yy * stride;
+    for (let xx = 0; xx < width; xx++) {
+      const s = row + xx * bpp;
+      const d = (yy * width + xx) * 4;
+      if (bpp === 1) { out[d] = out[d + 1] = out[d + 2] = src[s]; out[d + 3] = 255; }
+      else {
+        out[d] = src[s + 2]; out[d + 1] = src[s + 1]; out[d + 2] = src[s];
+        out[d + 3] = format === 4 ? src[s + 3] : 255;
+      }
+    }
+  }
+  return { width, height, rgba: out };
+}
+
+function readGraphics(m: M, doc: number, pc: PageCtx): { rects: PdfGraphicRect[]; images: PdfGraphicImage[] } {
+  const rects: PdfGraphicRect[] = [];
+  const images: PdfGraphicImage[] = [];
+  const n = m.FPDFPage_CountObjects(pc.page);
+  const rgb = (c: number[]) => "#" + c.slice(0, 3).map((v) => (v >>> 0).toString(16).padStart(2, "0")).join("");
+  for (let i = 0; i < n; i++) {
+    const obj = m.FPDFPage_GetObject(pc.page, i);
+    if (!obj) continue;
+    const type = m.FPDFPageObj_GetType(obj);
+    if (type !== FPDF_PAGEOBJ_PATH && type !== FPDF_PAGEOBJ_IMAGE) continue;
+    const b = withFloats(m, 4, (p) => (m.FPDFPageObj_GetBounds(obj, p, p + 4, p + 8, p + 12) ? [f32(m, p), f32(m, p + 4), f32(m, p + 8), f32(m, p + 12)] : null));
+    if (!b) continue;
+    const box = { x: b[0] - pc.cropLeft, y: pc.cropTop - b[3], w: b[2] - b[0], h: b[3] - b[1] };
+    if (type === FPDF_PAGEOBJ_PATH) {
+      const mode = withFloats(m, 2, (p) => (m.FPDFPath_GetDrawMode(obj, p, p + 4) ? [m.pdfium.getValue(p, "i32"), m.pdfium.getValue(p + 4, "i32")] : [0, 0]));
+      const color = (getter: "FPDFPageObj_GetFillColor" | "FPDFPageObj_GetStrokeColor") => withFloats(m, 4, (p) => {
+        const ok = (m as any)[getter](obj, p, p + 4, p + 8, p + 12);
+        if (!ok) return null;
+        const c = [0, 1, 2, 3].map((k) => m.pdfium.getValue(p + 4 * k, "i32") >>> 0);
+        return c[3] < 20 ? null : rgb(c);
+      });
+      const strokeWidth = withFloats(m, 1, (p) => (m.FPDFPageObj_GetStrokeWidth(obj, p) ? f32(m, p) : 0));
+      rects.push({ ...box, fill: mode[0] ? color("FPDFPageObj_GetFillColor") : null, stroke: mode[1] ? color("FPDFPageObj_GetStrokeColor") : null, strokeWidth });
+    } else {
+      let bmpData: ReturnType<typeof readBitmapRgba> = null;
+      const bmp = m.FPDFImageObj_GetRenderedBitmap(doc, pc.page, obj);
+      if (bmp) {
+        try {
+          const w = m.FPDFBitmap_GetWidth(bmp), h = m.FPDFBitmap_GetHeight(bmp);
+          if (w * h <= 12_000_000) bmpData = readBitmapRgba(m, bmp);
+        } finally { m.FPDFBitmap_Destroy(bmp); }
+      }
+      images.push({ ...box, width: bmpData?.width || 0, height: bmpData?.height || 0, rgba: bmpData?.rgba || null });
+    }
+  }
+  return { rects, images };
+}
+
+/** Baris teks + garis/kotak + gambar per halaman — bahan konversi PDF -> Word. */
+export function extractPdfForConversion(buf: Buffer): Promise<{ pages: PdfConversionPage[] }> {
+  return serialized(async () => {
+    const m = await getPdfium();
+    const d = openDoc(m, buf);
+    try {
+      const n = m.FPDF_GetPageCount(d.doc);
+      const fontCache = new Map();
+      const pages: PdfConversionPage[] = [];
+      for (let i = 0; i < n; i++) {
+        const pc = openPage(m, d.doc, i);
+        try {
+          const objs = readTextObjects(m, pc.page, pc.textPage, fontCache);
+          const { layout } = layoutOfPage(i, pc, objs);
+          const g = pc.rotation === 0 ? readGraphics(m, d.doc, pc) : { rects: [], images: [] };
+          pages.push({ ...layout, ...g });
+        } finally { closePage(m, pc); }
+      }
+      return { pages };
+    } finally { closeDoc(m, d); }
+  });
+}

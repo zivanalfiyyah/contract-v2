@@ -20,19 +20,23 @@
 //           .docx ASLI (src/docx-patch.ts), part lain disalin apa adanya.
 //  - DOC  : dikonversi ke .docx (LibreOffice di server) utk pratinjau & edit;
 //           .doc asli tetap tersimpan.
+//  - PDF -> Word: tombol "Edit seperti Word" mengubah PDF jadi .docx
+//           (pdf-to-docx.ts, server) sebagai versi baru lalu membuka editor
+//           Word di atas — teks turun baris otomatis. PDF asli tetap utuh.
 // ---------------------------------------------------------------------------
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Download, Edit3, FileText, History, Loader2, RotateCcw, Save, Type, Upload, X,
   Square, Trash2, AlertTriangle, Lock, ZoomIn, ZoomOut, CheckCircle, Bold, Italic,
   Underline, AlignLeft, AlignCenter, AlignRight, AlignJustify, TableRowsSplit, Rows3, TextCursorInput,
-  AlignVerticalSpaceAround,
+  AlignVerticalSpaceAround, FileType2,
 } from "lucide-react";
 import type { Contract, ContractVersion, StoredDocumentRef } from "./types";
 import {
   loadDocx, bindRenderedParagraphs, renderedChars, renderedAlign, renderedLineSpacing, applyPlan, serializeDocx,
   addTableRowAfter, removeTableRow, type ParagraphBinding, type DocxEditPlan, type NewParagraph,
 } from "./docx-patch";
+import DocumentDownloadModal, { buildDocumentDownloadUrl } from "./DocumentDownloadModal";
 
 type ToastFn = (message: string, type?: "success" | "info" | "warning") => void;
 type ConfirmFn = (body: string, opts?: { title?: string; confirmLabel?: string; danger?: boolean }) => Promise<boolean>;
@@ -49,7 +53,7 @@ interface Props {
 interface VersionsResponse {
   currentVersion: number;
   versions: ContractVersion[];
-  capabilities?: { docConversion: boolean; pdfTextEdit: boolean };
+  capabilities?: { docConversion: boolean; pdfTextEdit: boolean; pdfToWord?: boolean; officeToPdf?: boolean; officeToPdfExact?: boolean };
 }
 
 type BuildResult =
@@ -79,6 +83,7 @@ const METHOD_LABEL: Record<string, string> = {
   "pdf-overlay": "Anotasi di workspace (PDF)",
   "revision-upload": "Unggah revisi / kembalikan",
   converted: "Konversi .doc → .docx",
+  "pdf-to-docx": "Diubah dari PDF ke Word",
 };
 
 function nameForVersion(original: string, version: number, ext: string) {
@@ -100,6 +105,7 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
   const [comment, setComment] = useState("");
   const [showHistory, setShowHistory] = useState(true);
   const [pendingEdit, setPendingEdit] = useState(false);
+  const [showDownloadPicker, setShowDownloadPicker] = useState(false);
   const revisionInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<EditorHandle>(null);
 
@@ -208,6 +214,24 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
     }
     setEditMode(true);
     setDirty(false);
+  };
+
+  // "Edit seperti Word": PDF -> .docx (versi baru), lalu langsung mode edit.
+  const startWordEdit = async () => {
+    const ok = await askConfirm(
+      "PDF ini akan diubah menjadi dokumen Word sebagai versi baru, supaya bisa diedit seperti di Word (teks turun baris otomatis, Enter = paragraf baru). PDF asli tetap tersimpan utuh di riwayat versi. Periksa kembali tampilannya setelah diubah.",
+      { title: "Edit seperti Word", confirmLabel: "Ubah ke Word" },
+    );
+    if (!ok) return;
+    setSaving(true);
+    try {
+      const data = await postJson(`/api/contracts/${contract.id}/document-versions/pdf-to-docx`, {});
+      await afterNewVersion(data);
+      setPendingEdit(true);
+      showToast(`PDF diubah ke Word sebagai Versi ${data.version.version} — PDF asli tetap tersimpan.`, "success");
+    } catch (e: any) {
+      showToast(e.message, "warning");
+    } finally { setSaving(false); }
   };
 
   const handleSave = async () => {
@@ -322,6 +346,13 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
               {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Edit3 className="w-3.5 h-3.5" />} Edit Dokumen
             </button>
           )}
+          {!editMode && canEditShown && shownFile?.format === "pdf" && caps?.pdfToWord && (
+            <button type="button" onClick={startWordEdit} disabled={saving || loading}
+              title="Ubah PDF ini menjadi dokumen Word (versi baru) supaya bisa diedit seperti di Word — teks otomatis turun baris. PDF asli tetap tersimpan."
+              className="px-3 py-1.5 text-[11px] font-bold rounded-lg border bg-sky-500/10 border-sky-500/30 text-sky-300 hover:bg-sky-500/20 flex items-center gap-1.5 cursor-pointer disabled:opacity-50">
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileType2 className="w-3.5 h-3.5" />} Edit seperti Word
+            </button>
+          )}
           {editMode && (
             <>
               <input
@@ -358,9 +389,20 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
             </button>
           )}
           {canDownload ? (
-            <a href={downloadHref} className="px-3 py-1.5 text-[11px] font-bold rounded-lg border bg-slate-900 border-slate-800 text-slate-200 hover:border-indigo-500/50 flex items-center gap-1.5">
-              <Download className="w-3.5 h-3.5" /> Download
-            </a>
+            shownFile?.format === "docx" || shownFile?.format === "pdf" ? (
+              // .docx / .pdf: tanyakan dulu format unduhan (Word atau PDF) —
+              // isi tetap versi yang sedang ditampilkan, tidak ada versi baru.
+              <button type="button" onClick={() => setShowDownloadPicker(true)}
+                className="px-3 py-1.5 text-[11px] font-bold rounded-lg border bg-slate-900 border-slate-800 text-slate-200 hover:border-indigo-500/50 flex items-center gap-1.5 cursor-pointer">
+                <Download className="w-3.5 h-3.5" /> Download
+              </button>
+            ) : (
+              // .doc / gambar: belum ada opsi konversi format -> unduh langsung
+              // seperti semula, supaya perilaku existing tidak berubah.
+              <a href={downloadHref} className="px-3 py-1.5 text-[11px] font-bold rounded-lg border bg-slate-900 border-slate-800 text-slate-200 hover:border-indigo-500/50 flex items-center gap-1.5">
+                <Download className="w-3.5 h-3.5" /> Download
+              </a>
+            )
           ) : (
             <span title="Tersedia setelah approval matriks selesai (status FullyApproved ke atas) — kebijakan unduh yang sama dengan Export PDF."
               className="px-3 py-1.5 text-[11px] font-bold rounded-lg border bg-slate-900 border-slate-850 text-slate-600 flex items-center gap-1.5 cursor-not-allowed">
@@ -379,6 +421,9 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
       )}
       {!isViewingCurrent && (
         <p className="text-[11px] text-amber-300/90 flex items-center gap-1.5"><AlertTriangle className="w-3 h-3" /> Anda melihat versi lama (read-only). Versi aktif: {currentVersion === 0 ? "Original" : `Versi ${currentVersion}`}.</p>
+      )}
+      {!editMode && canEditShown && shownFile?.format === "pdf" && caps?.pdfToWord && (
+        <p className="text-[11px] text-sky-300/90">"Edit Dokumen" mengubah teks PDF per baris (tata letak tetap persis). Untuk menambah/mengubah kalimat panjang dengan teks yang otomatis turun baris, pakai "Edit seperti Word" — PDF asli tetap tersimpan.</p>
       )}
       {docAsDocx && !editMode && (
         <p className="text-[11px] text-sky-300/90">Berkas Word 97-2003 (.doc) ditampilkan lewat konversi ke .docx. Klik "Edit Dokumen" untuk membuat versi .docx yang bisa diedit — berkas .doc asli tetap tersimpan.</p>
@@ -436,6 +481,17 @@ export default function UploadedDocumentWorkspace({ contract, canEdit, canDownlo
           </aside>
         )}
       </div>
+
+      <DocumentDownloadModal
+        open={showDownloadPicker}
+        onClose={() => setShowDownloadPicker(false)}
+        sourceFormat={shownFile?.format}
+        officeToPdfAvailable={!!caps?.officeToPdfExact}
+        onPick={(format) => {
+          window.location.href = buildDocumentDownloadUrl(contract.id, shownVersion, format);
+          setShowDownloadPicker(false);
+        }}
+      />
     </div>
   );
 }
@@ -1224,3 +1280,98 @@ const PdfDocumentView = React.forwardRef<EditorHandle, { contractId: string; ver
     );
   },
 );
+
+// ---------------------------------------------------------------------------
+// Viewer BACA-SAJA — dipakai Mode Tinjau & halaman review eksternal untuk
+// kontrak "Upload Dokumen". Menampilkan berkas APA ADANYA (renderer yang sama
+// dgn workspace: PDF via pdf.js, Word via docx-preview) tanpa toolbar edit,
+// riwayat versi, atau unduhan — dan tidak mengubah apa pun pada berkas.
+// ---------------------------------------------------------------------------
+export type ReadOnlyDocFormat = "pdf" | "docx" | "image" | "unsupported";
+
+export function ReadOnlyDocumentView({ src, format, mimeType }: { src: string; format: ReadOnlyDocFormat; mimeType?: string }) {
+  const [buf, setBuf] = useState<ArrayBuffer | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const noop = useCallback(() => {}, []);
+
+  useEffect(() => {
+    if (format === "unsupported") { setLoading(false); return; }
+    let cancelled = false;
+    setLoading(true); setError(null); setBuf(null);
+    fetch(src)
+      .then(async (r) => {
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || `Gagal membuka dokumen (HTTP ${r.status})`);
+        return r.arrayBuffer();
+      })
+      .then((b) => { if (!cancelled) setBuf(b); })
+      .catch((e) => { if (!cancelled) setError(e.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [src, format]);
+
+  return (
+    <div className="bg-slate-800/60 rounded-xl border border-slate-850 overflow-auto max-h-[78vh] min-h-[320px] relative" data-testid="document-viewer-readonly">
+      {loading && (
+        <div className="absolute inset-0 flex items-center justify-center text-slate-400 text-xs gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Memuat dokumen…</div>
+      )}
+      {error && !loading && (
+        <div className="p-6 text-xs text-rose-300 flex items-start gap-2"><AlertTriangle className="w-4 h-4 shrink-0" /> {error}</div>
+      )}
+      {format === "unsupported" && (
+        <div className="p-8 text-center text-xs text-slate-300 space-y-2">
+          <FileText className="w-8 h-8 mx-auto text-slate-500" />
+          <p>Format berkas ini belum bisa dipratinjau di sini (mis. Word 97-2003 tanpa konverter di server).</p>
+        </div>
+      )}
+      {!loading && !error && buf && (
+        format === "pdf" ? <PdfDocumentView contractId="" version={0} data={buf} editMode={false} onDirty={noop} />
+        : format === "docx" ? <DocxDocumentView data={buf} editMode={false} onDirty={noop} />
+        : format === "image" ? <div className="p-4 flex justify-center"><ImageView data={buf} mime={mimeType || "image/png"} /></div>
+        : null
+      )}
+    </div>
+  );
+}
+
+/** Berkas versi AKTIF sebuah kontrak upload, baca-saja (untuk Mode Tinjau internal). */
+export function ContractDocumentReadOnly({ contractId }: { contractId: string }) {
+  const [info, setInfo] = useState<{ src: string; format: ReadOnlyDocFormat; mime?: string; name: string; version: number } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setInfo(null); setError(null);
+    fetch(`/api/contracts/${contractId}/document-versions`)
+      .then(async (r) => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || "Gagal memuat dokumen");
+        return d as VersionsResponse;
+      })
+      .then((d) => {
+        if (cancelled) return;
+        const v = d.versions.find((x) => x.version === d.currentVersion) || d.versions[d.versions.length - 1];
+        if (!v?.file) { setError("Berkas dokumen belum tersedia."); return; }
+        const f = v.file.format;
+        const asDocx = f === "doc" && !!d.capabilities?.docConversion;
+        const format: ReadOnlyDocFormat = f === "pdf" ? "pdf" : f === "docx" || asDocx ? "docx" : f === "image" ? "image" : "unsupported";
+        setInfo({
+          src: `/api/contracts/${contractId}/document?version=${v.version}${asDocx ? "&as=docx" : ""}`,
+          format, mime: v.file.mimeType, name: v.file.fileName, version: v.version,
+        });
+      })
+      .catch((e) => { if (!cancelled) setError(e.message); });
+    return () => { cancelled = true; };
+  }, [contractId]);
+
+  if (error) return <div className="p-6 text-xs text-rose-300 bg-slate-900/60 border border-slate-800 rounded-xl flex items-start gap-2"><AlertTriangle className="w-4 h-4 shrink-0" /> {error}</div>;
+  if (!info) return <div className="p-10 text-xs text-slate-400 flex items-center justify-center gap-2"><Loader2 className="w-4 h-4 animate-spin" /> Memuat dokumen…</div>;
+  return (
+    <div className="space-y-2">
+      <p className="text-[11px] text-slate-500 truncate">
+        Berkas: <b className="text-slate-300">{info.name}</b> (versi {info.version}, aktif) — ditampilkan apa adanya, baca-saja.
+      </p>
+      <ReadOnlyDocumentView src={info.src} format={info.format} mimeType={info.mime} />
+    </div>
+  );
+}

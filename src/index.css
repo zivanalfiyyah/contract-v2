@@ -1,116 +1,136 @@
-/* Light design foundation (modern SaaS / HR-dashboard style). The whole app is
-   authored with Tailwind slate utility classes; in Tailwind v4 those resolve
-   through CSS variables, so re-mapping the slate ramp here re-skins the entire
-   app to a light theme in one place — no per-component edits. The mapping
-   INVERTS the lightness axis (high slate number = dark surface on the old dark
-   theme → light surface here; low number = light text → dark text here), which
-   preserves every prominence/elevation relationship the components rely on. */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+/* Fondasi tampilan: putih + biru + oranye, font sans, bayangan lembut (tanpa
+   glow / kilap). Seluruh aplikasi ditulis dengan utilitas
+   slate-* dan indigo-*; di Tailwind v4 keduanya lewat variabel CSS, jadi
+   memetakan ulang deret warna di sini mengganti tampilan semua halaman
+   sekaligus. Angka slate tinggi = permukaan, rendah = teks (sama seperti
+   sebelumnya, hanya warnanya yang berganti). */
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap');
 @import "tailwindcss";
 
 @theme {
-  /* Inter — clean, neutral grotesque matching the reference dashboard. */
-  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 
-  /* ---- Slate ramp remapped for a LIGHT theme ----
-     Backgrounds (bg-slate-*): 900 = white cards that float; 950 = light-gray
-     page/inputs (recessed); 800/700 = light-gray hover/elevated. Borders
-     (border-slate-800, the app's default) land on a soft light hairline. */
-  --color-slate-950: #f4f6f9;  /* page background / recessed input fill */
-  --color-slate-900: #ffffff;  /* card / panel surface (floats white) */
-  --color-slate-850: #f6f8fb;  /* subtle raised surface */
-  --color-slate-800: #e9edf3;  /* hover / elevated fill AND default border */
-  --color-slate-750: #eef1f6;
-  --color-slate-700: #dde3ec;  /* stronger border / secondary-button fill */
-  --color-slate-650: #cfd7e3;
+  /* ---- TERANG: putih ---- */
+  --color-slate-950: #f1f6fc;  /* isi pucat: tile, input, trek grafik */
+  --color-slate-900: #ffffff;  /* kartu putih */
+  --color-slate-850: #f6f9fd;
+  --color-slate-800: #e3ebf5;  /* garis tipis (jarang dipakai) */
+  --color-slate-750: #ebf1f8;
+  --color-slate-700: #d2deed;
+  --color-slate-650: #bccbe0;
 
-  /* Text ramp: 100 = primary (darkest), stepping lighter to 600 (faintest).
-     Same ordering the components assume, just resolved to dark-on-light. */
-  --color-slate-600: #9aa3b2;  /* faintest labels */
-  --color-slate-500: #7b8493;  /* most-muted text */
-  --color-slate-400: #5c6879;  /* muted text */
-  --color-slate-300: #41506a;  /* secondary text */
-  --color-slate-200: #29374d;  /* near-primary text */
-  --color-slate-100: #1c2837;  /* primary text (headings/body) */
-  --color-slate-50:  #0f1626;  /* rarely used — deepest text */
+  --color-slate-600: #a9b4c6;
+  --color-slate-500: #86929f;
+  --color-slate-400: #66738a;
+  --color-slate-300: #475469;
+  --color-slate-200: #2d3748;
+  --color-slate-100: #1c2433;  /* teks utama */
+  --color-slate-50:  #0e131c;
 
-  /* Accent -400 shades are tuned for a DARK ground (they read as bright pops
-     there). On white they lose contrast, so nudge each to roughly its -500
-     value: same hue, more saturated/darker → readable accent text, icons, and
-     active-nav labels on light. -600/-500 (button fills) are left untouched. */
-  --color-indigo-400: #5b61e6;
-  --color-emerald-400: #059f76;
-  --color-rose-400: #e5405e;
-  --color-amber-400: #d68207;
+  /* ---- Biru (menggantikan indigo) ---- */
+  --color-indigo-50:  #eff7fd;
+  --color-indigo-100: #dcedfa;
+  --color-indigo-200: #bddcf4;
+  --color-indigo-300: #94c6ec;
+  --color-indigo-400: #3a86c2;  /* teks/ikon aksen */
+  --color-indigo-500: #5ba6dc;
+  --color-indigo-600: #6aaee0;  /* tombol utama (biru pucat) */
+  --color-indigo-700: #4f98d0;
+  --color-indigo-800: #3b7fb6;
+  --color-indigo-900: #2a6293;
+  --color-indigo-950: #1b4568;
+
+  /* Oranye aksen (chip ikon, menu aktif, sorotan kecil) */
+  --color-peach: #fdeedf;
+  --color-peach-strong: #f9cfa8;
+  --color-shell: #e8f0fa;
+  --color-mist: #d3e8f8;          /* biru sangat pucat */
+  --color-mist-strong: #a9d3f0;   /* panel biru lebih pekat */
+  --color-soft-blue: #72b6e6;     /* biru pucat: tombol/menu aktif */
+  --sky-a: #dcf0fc;
+  --sky-b: #c4e2f6;
+  --fog-a: #f6f8fb;
+  --fog-b: #e1e8f1;
+  --page-a: #eef5fd;
+  --page-b: #dfebf8;
+  --shadow-soft: 0 12px 34px -10px rgba(110, 145, 200, 0.28), 0 2px 8px rgba(110, 145, 200, 0.07);
+  --color-brand-orange: #e2691f;
+
+  /* -400 disetel agar terbaca di latar terang. */
+  --color-emerald-400: #0f8a63;
+  --color-rose-400: #d63d56;
+  --color-amber-400: #b86e06;
   --color-violet-400: #7c53e8;
-  --color-sky-400: #0c96da;
+  --color-sky-400: #0c7fb8;
 
-  /* Tighter, intentional radii (kept from the previous foundation). */
-  --radius-lg: 0.5rem;      /* 8px  */
-  --radius-xl: 0.625rem;    /* 10px */
-  --radius-2xl: 0.875rem;   /* 14px */
-  --radius-3xl: 1.125rem;   /* 18px */
+  --radius-md: 0.5rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.875rem;
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.75rem;
 }
 
 :root {
-  --scrollbar-thumb: #cbd3e0;
-  --scrollbar-thumb-hover: #b3bccb;
-  --selection-text: #1c2837;
-
-  /* Ambient background glow — kalem di light mode. */
-  --ambient-1: color-mix(in oklch, var(--color-indigo-500) 8%, transparent);
-  --ambient-2: color-mix(in oklch, var(--color-violet-500) 6%, transparent);
-  --ambient-3: color-mix(in oklch, var(--color-emerald-500) 5%, transparent);
-  --accent-glow: 32%;
-  --card-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 10px 28px -14px rgba(15, 23, 42, 0.10);
+  --scrollbar-thumb: #c5d3e6;
+  --scrollbar-thumb-hover: #a9bcd6;
+  --selection-text: #1c2433;
 }
 
+/* ---- GELAP: arang kebiruan hangat ---- */
 .dark {
-  --selection-text: #eef1f6;
+  --selection-text: #f3efe6;
 
-  /* Lebih kelihatan di dark mode — inilah "vibe" modern-glow-nya. */
-  --ambient-1: color-mix(in oklch, var(--color-indigo-500) 20%, transparent);
-  --ambient-2: color-mix(in oklch, var(--color-violet-500) 16%, transparent);
-  --ambient-3: color-mix(in oklch, var(--color-emerald-500) 10%, transparent);
-  --accent-glow: 55%;
-  --card-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 14px 36px -16px rgba(99, 102, 241, 0.28);
-}
+  --color-slate-950: #232b38;
+  --color-slate-900: #1a212c;
+  --color-slate-850: #202836;
+  --color-slate-800: #2c3544;
+  --color-slate-750: #323c4d;
+  --color-slate-700: #3d485b;
+  --color-slate-650: #4a566b;
 
-/* ---- DARK MODE ----
-   Toggle by adding class="dark" to <html> (done in App.tsx via a small
-   ThemeProvider that reads/writes localStorage + prefers-color-scheme).
-   Because every component is authored with the same slate-* utilities and
-   those utilities resolve through the CSS variables above, we don't touch
-   any component: overriding the variables under `.dark` re-skins the whole
-   app back to the original dark theme in one place, same trick as the
-   light remap above but reversed. */
-.dark {
-  --color-slate-950: #0b0f19;  /* page background / recessed input fill */
-  --color-slate-900: #10161f;  /* card / panel surface */
-  --color-slate-850: #141b26;  /* subtle raised surface */
-  --color-slate-800: #1c2534;  /* hover / elevated fill AND default border */
-  --color-slate-750: #212b3d;
-  --color-slate-700: #2b3750;  /* stronger border / secondary-button fill */
-  --color-slate-650: #34405e;
+  --color-slate-600: #7b7f8a;
+  --color-slate-500: #9a9da6;
+  --color-slate-400: #b3b3b0;
+  --color-slate-300: #c9c6bd;
+  --color-slate-200: #dcd8cd;
+  --color-slate-100: #efebe1;
+  --color-slate-50:  #ffffff;
 
-  --color-slate-600: #64748b;  /* faintest labels */
-  --color-slate-500: #7d8ba0;  /* most-muted text */
-  --color-slate-400: #97a3b8;  /* muted text */
-  --color-slate-300: #b6c0d1;  /* secondary text */
-  --color-slate-200: #d3d9e4;  /* near-primary text */
-  --color-slate-100: #eef1f6;  /* primary text (headings/body) */
-  --color-slate-50:  #ffffff;  /* deepest/brightest text */
+  --color-indigo-50:  #12304a;
+  --color-indigo-100: #174058;
+  --color-indigo-200: #1f5272;
+  --color-indigo-300: #a6d2f2;
+  --color-indigo-400: #8cc4ee;
+  --color-indigo-500: #4f9ad2;
+  --color-indigo-600: #438ac2;
+  --color-indigo-700: #3774a8;
+  --color-indigo-800: #2d6089;
+  --color-indigo-900: #234b6d;
+  --color-indigo-950: #183550;
 
-  /* Accent -400 shades restored to their brighter, dark-ground-friendly hues. */
-  --color-indigo-400: #818cf8;
-  --color-emerald-400: #34d399;
-  --color-rose-400: #fb7185;
-  --color-amber-400: #fbbf24;
+  --color-peach: #3b2c21;
+  --color-peach-strong: #e8a874;
+  --color-shell: #0e131b;
+  --color-mist: #2a3d54;
+  --color-mist-strong: #2f4766;
+  --color-soft-blue: #4a8ec4;
+  --sky-a: #243a54;
+  --sky-b: #1d3149;
+  --fog-a: #232b38;
+  --fog-b: #1b222d;
+  --page-a: #121923;
+  --page-b: #0d1219;
+  --shadow-soft: 0 12px 34px -10px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.25);
+  --color-brand-orange: #f08a4b;
+
+  --color-emerald-400: #4fc99b;
+  --color-rose-400: #f0788c;
+  --color-amber-400: #f0b44d;
   --color-violet-400: #a78bfa;
-  --color-sky-400: #38bdf8;
+  --color-sky-400: #5cbcec;
 
-  --scrollbar-thumb: #2a3345;
-  --scrollbar-thumb-hover: #3a465c;
+  --scrollbar-thumb: #343a48;
+  --scrollbar-thumb-hover: #454c5e;
 }
 
 @layer base {
@@ -118,104 +138,51 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
-    font-feature-settings: "cv02", "cv03", "cv04", "ss01";
   }
 
-  /* Soft light-gray ground so white cards read as deliberately elevated.
-     Uses the theme variables (not hardcoded hex) so it flips with .dark.
-     The layered radial-gradients are the "ambient glow" from the modern
-     reference — subtle in light mode, richer in dark mode (see --ambient-*
-     above). background-attachment: fixed keeps it steady while the page
-     scrolls, like a backdrop rather than part of the content. */
   body {
-    background-color: var(--color-slate-950);
-    background-image:
-      radial-gradient(1100px circle at 14% -10%, var(--ambient-1), transparent 60%),
-      radial-gradient(900px circle at 100% 15%, var(--ambient-2), transparent 55%),
-      radial-gradient(1000px circle at -5% 100%, var(--ambient-3), transparent 55%);
+    background-color: var(--color-shell);
+    background-image: linear-gradient(160deg, var(--page-a) 0%, var(--page-b) 100%);
     background-attachment: fixed;
     color: var(--color-slate-100);
-    transition: background-color 0.15s ease, color 0.15s ease;
   }
 
-  /* ---- "Modern glass" polish, applied globally via attribute selectors ----
-     Every card/panel in the app is authored with the same handful of Tailwind
-     token combos (rounded-xl/2xl/3xl + border-slate-800, bg-*-600 solid CTA
-     buttons, bg-*-500/10 icon chips). Targeting those literal class tokens
-     here re-skins every card and accent across all tabs in one place — the
-     same trick as the slate remap above — without touching a single
-     component. */
-
-  /* Card depth: soft ambient shadow on any panel using the standard
-     border-slate-800 + large-radius combo (dashboard cards, modals, panels). */
-  [class*="border-slate-800"]:is([class~="rounded-xl"], [class~="rounded-2xl"], [class~="rounded-3xl"]) {
-    box-shadow: var(--card-shadow);
-  }
-
-  /* Solid accent buttons get a subtle glossy sheen + colored glow underneath,
-     instead of a flat fill. */
-  [class~="bg-indigo-600"],
-  [class~="bg-emerald-600"],
-  [class~="bg-rose-600"],
-  [class~="bg-amber-600"] {
-    background-image: linear-gradient(135deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0) 55%);
-  }
-  [class~="bg-indigo-600"] { box-shadow: 0 8px 20px -8px color-mix(in oklch, var(--color-indigo-500) var(--accent-glow), transparent); }
-  [class~="bg-emerald-600"] { box-shadow: 0 8px 20px -8px color-mix(in oklch, var(--color-emerald-500) var(--accent-glow), transparent); }
-  [class~="bg-rose-600"] { box-shadow: 0 8px 20px -8px color-mix(in oklch, var(--color-rose-500) var(--accent-glow), transparent); }
-  [class~="bg-amber-600"] { box-shadow: 0 8px 20px -8px color-mix(in oklch, var(--color-amber-500) var(--accent-glow), transparent); }
-
-  /* Soft-tint icon chips (bg-*-500/10) get a faint matching glow ring so the
-     colored icons feel lit-up rather than flat. */
-  [class~="bg-indigo-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-indigo-500) 50%, transparent); }
-  [class~="bg-emerald-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-emerald-500) 50%, transparent); }
-  [class~="bg-rose-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-rose-500) 50%, transparent); }
-  [class~="bg-amber-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-amber-500) 50%, transparent); }
-  [class~="bg-violet-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-violet-500) 50%, transparent); }
-  [class~="bg-sky-500/10"] { box-shadow: 0 0 22px -10px color-mix(in oklch, var(--color-sky-500) 50%, transparent); }
-
-  /* Premium micro-detail: headings track slightly tighter, digits align. */
-  h1, h2, h3, h4, h5 {
-    letter-spacing: -0.015em;
-  }
   .tabular, table {
     font-variant-numeric: tabular-nums;
   }
 
-  /* Consistent, subtle keyboard-focus ring (accent). */
   :focus-visible {
-    outline: 2px solid color-mix(in oklch, var(--color-indigo-500) 60%, transparent);
+    outline: 2px solid var(--color-indigo-500);
     outline-offset: 1px;
     border-radius: 2px;
   }
 
   ::selection {
-    background-color: color-mix(in oklch, var(--color-indigo-500) 22%, transparent);
+    background-color: color-mix(in oklch, var(--color-indigo-500) 25%, transparent);
     color: var(--selection-text);
   }
 
-  /* Thin, quiet scrollbars — colors follow the theme variables. */
   * {
     scrollbar-width: thin;
     scrollbar-color: var(--scrollbar-thumb) transparent;
   }
-  *::-webkit-scrollbar {
-    width: 9px;
-    height: 9px;
-  }
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
+  *::-webkit-scrollbar { width: 9px; height: 9px; }
+  *::-webkit-scrollbar-track { background: transparent; }
   *::-webkit-scrollbar-thumb {
     background-color: var(--scrollbar-thumb);
     border-radius: 9999px;
     border: 2px solid transparent;
     background-clip: content-box;
   }
-  *::-webkit-scrollbar-thumb:hover {
-    background-color: var(--scrollbar-thumb-hover);
-  }
+  *::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); }
 }
+
+/* Bayangan lembut menyebar (bukan glow berwarna): kartu, dropdown, modal. */
+.card-soft,
+[class*="shadow-"]:not([class*="shadow-none"]) { box-shadow: var(--shadow-soft) !important; }
+[class*="border-slate-800"]:is([class~="rounded-2xl"], [class~="rounded-3xl"]) { box-shadow: var(--shadow-soft); }
+.card-sky { background: linear-gradient(180deg, var(--sky-a), var(--sky-b)); }
+.card-fog { background: linear-gradient(180deg, var(--fog-a), var(--fog-b)); }
 
 /* Transisi halus saat pindah tab di toolbar editor dokumen (ribbon). */
 @keyframes ribbon-fade {
@@ -224,3 +191,207 @@
 }
 .ribbon-fade { animation: ribbon-fade 0.18s ease-out; }
 @media (prefers-reduced-motion: reduce) { .ribbon-fade { animation: none; } }
+
+/* ---- KERTAS DOKUMEN & DARK MODE ----
+   1) Template: pratinjau kontrak memakai variabel slate-*, jadi otomatis
+      gelap di dark mode. Saat EXPORT PDF, App.tsx menambahkan kelas
+      .paper-light pada elemen pratinjau: kelas ini mengunci ulang palet
+      slate ke nilai TERANG untuk seluruh isinya (variabel CSS diwariskan ke
+      turunan), sehingga PDF tetap kertas putih bertinta gelap walau UI gelap. */
+.paper-light {
+  --color-slate-950: #f4f6f9;
+  --color-slate-900: #ffffff;
+  --color-slate-850: #f6f8fb;
+  --color-slate-800: #e9edf3;
+  --color-slate-750: #eef1f6;
+  --color-slate-700: #dde3ec;
+  --color-slate-650: #cfd7e3;
+  --color-slate-600: #9aa3b2;
+  --color-slate-500: #7b8493;
+  --color-slate-400: #5c6879;
+  --color-slate-300: #41506a;
+  --color-slate-200: #29374d;
+  --color-slate-100: #1c2837;
+  --color-slate-50:  #0f1626;
+  --color-indigo-400: #2a5cae;
+  --color-emerald-400: #059f76;
+  --color-rose-400: #e5405e;
+  --color-amber-400: #d68207;
+  --color-violet-400: #7c53e8;
+  --color-sky-400: #0c96da;
+}
+
+/* 2) Dokumen upload (Word/PDF) dirender sebagai halaman putih oleh docx-preview
+      / pdf.js — bukan elemen bertema. Di dark mode halaman dibalik dengan
+      filter (putih -> abu sangat gelap, teks hitam -> terang, hue tetap) hanya
+      pada TAMPILAN di layar; berkas asli yang diunduh tidak berubah. Gambar di
+      dalam .docx dikembalikan ke warna aslinya (filter ganda saling
+      meniadakan). Gambar yang tertanam di halaman PDF ikut terbalik karena
+      sudah menyatu di kanvas. */
+.dark .docx-wrapper > section.docx,
+.dark [data-page] > canvas {
+  filter: invert(0.92) hue-rotate(180deg);
+}
+.dark .docx-wrapper > section.docx img {
+  filter: invert(1) hue-rotate(180deg);
+}
+/* Tepi halaman: bayangan bawaan hitam akan jadi "cahaya" putih bila ikut
+   dibalik, jadi diganti garis tipis (hitam -> terang setelah dibalik). */
+html.dark .docx-wrapper > section.docx {
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); /* html.dark: menang atas style inline .docx-workspace */
+}
+.dark [data-page] {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+/* Sembunyikan scrollbar pada rel ikon sidebar. */
+.no-scrollbar { scrollbar-width: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+
+/* ---- TABEL GLOBAL (gaya "Orders"): header pil pucat, baris lega dengan
+   garis tipis, hover biru pucat. Berlaku ke SEMUA <table> yang punya <thead>
+   di aplikasi. Tabel di dalam dokumen kontrak diberi kelas .plain-table agar
+   tidak ikut berubah. ---- */
+table:has(> thead):not(.plain-table) { border-collapse: separate; border-spacing: 0; }
+table:has(> thead):not(.plain-table) > thead > tr > th {
+  background: var(--color-slate-950);
+  color: var(--color-slate-400);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  font-family: inherit;
+  border-bottom: 0 !important;
+  padding-top: 0.8rem;
+  padding-bottom: 0.8rem;
+}
+table:has(> thead):not(.plain-table) > thead > tr { background: transparent !important; border: 0 !important; }
+table:has(> thead):not(.plain-table) > thead > tr > th:first-child { border-top-left-radius: 14px; border-bottom-left-radius: 14px; }
+table:has(> thead):not(.plain-table) > thead > tr > th:last-child { border-top-right-radius: 14px; border-bottom-right-radius: 14px; }
+table:has(> thead):not(.plain-table) > tbody > tr > td {
+  border-top: 1px solid color-mix(in srgb, var(--color-slate-800) 70%, transparent);
+  padding-top: 0.95rem;
+  padding-bottom: 0.95rem;
+  vertical-align: middle;
+}
+table:has(> thead):not(.plain-table) > tbody > tr:first-child > td { border-top-color: transparent; }
+table:has(> thead):not(.plain-table) > tbody > tr { border: 0 !important; transition: background-color .15s; }
+table:has(> thead):not(.plain-table) > tbody > tr:hover > td {
+  background: color-mix(in srgb, var(--color-slate-950) 75%, transparent);
+}
+table:has(> thead):not(.plain-table) > tbody > tr > td:first-child { border-top-left-radius: 14px; border-bottom-left-radius: 14px; }
+table:has(> thead):not(.plain-table) > tbody > tr > td:last-child { border-top-right-radius: 14px; border-bottom-right-radius: 14px; }
+/* Pembungkus tabel: kartu putih besar bersudut lembut. */
+.table-card { background: var(--color-slate-900) !important; border: 0 !important; border-radius: 28px !important; box-shadow: var(--shadow-soft) !important; padding: 0.75rem 1rem; overflow: hidden; }
+.table-card .overflow-x-auto { border: 0 !important; }
+
+/* Drawer filter */
+@keyframes drawer-in { from { transform: translateX(-24px); opacity: 0; } to { transform: none; opacity: 1; } }
+.drawer-in { animation: drawer-in .22s ease-out; }
+@media (prefers-reduced-motion: reduce) { .drawer-in { animation: none; } }
+
+/* ---- GRADASI PASTEL TIPIS (biru -> oranye) untuk tombol & kartu ---- */
+.card-grad {
+  background-image: linear-gradient(135deg,
+    transparent 0%,
+    color-mix(in srgb, var(--color-mist) 38%, transparent) 55%,
+    color-mix(in srgb, var(--color-peach) 70%, transparent) 130%);
+}
+.btn-grad-soft {
+  background-image: linear-gradient(135deg, var(--color-mist) 0%, var(--color-peach) 140%);
+  box-shadow: none !important;
+}
+.btn-grad-soft:hover { filter: brightness(0.97); }
+.btn-grad-primary {
+  background-image: linear-gradient(135deg, var(--color-soft-blue) 0%, color-mix(in srgb, var(--color-soft-blue) 72%, var(--color-peach-strong)) 140%);
+  box-shadow: none !important;
+}
+.btn-grad-primary:hover { filter: brightness(1.05); }
+
+/* Modal form: panel melayang di tengah, latar halaman diburamkan */
+.modal-backdrop { background: color-mix(in srgb, var(--color-slate-950) 45%, transparent); backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); animation: modal-fade .18s ease-out; }
+.modal-panel { box-shadow: var(--shadow-soft) !important; animation: modal-pop .2s ease-out; }
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-pop { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .modal-backdrop, .modal-panel { animation: none; } }
+
+/* ---- CHECKBOX bergaya (menggantikan kotak bawaan browser) ---- */
+input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none;
+  width: 1.15rem; height: 1.15rem; flex-shrink: 0;
+  border-radius: 0.45rem;
+  border: 1.5px solid var(--color-slate-700);
+  background-color: var(--color-slate-900);
+  background-repeat: no-repeat; background-position: center; background-size: 72%;
+  cursor: pointer; vertical-align: middle;
+  transition: background-color .15s, border-color .15s, box-shadow .15s;
+}
+input[type="checkbox"]:hover { border-color: var(--color-soft-blue); }
+input[type="checkbox"]:focus-visible { outline: 2px solid color-mix(in srgb, var(--color-soft-blue) 55%, transparent); outline-offset: 2px; }
+input[type="checkbox"]:checked {
+  background-color: var(--color-soft-blue); border-color: var(--color-soft-blue);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 8.5l3 3 6-7'/%3E%3C/svg%3E");
+}
+input[type="checkbox"]:indeterminate {
+  background-color: var(--color-soft-blue); border-color: var(--color-soft-blue);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M4 8h8'/%3E%3C/svg%3E");
+}
+input[type="checkbox"]:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ===== Halaman Konfigurasi: kontras warna & input seragam ===== */
+html:not(.dark) .cfg-content .text-violet-300, html:not(.dark) .cfg-content .text-violet-400 { color: #6b5bc4; }
+html:not(.dark) .cfg-content .text-sky-300, html:not(.dark) .cfg-content .text-sky-400, html:not(.dark) .cfg-content .text-indigo-300, html:not(.dark) .cfg-content .text-indigo-400 { color: #3a86b8; }
+html:not(.dark) .cfg-content .text-emerald-300, html:not(.dark) .cfg-content .text-emerald-400 { color: #2f8f6b; }
+html:not(.dark) .cfg-content .text-amber-300, html:not(.dark) .cfg-content .text-amber-400, html:not(.dark) .cfg-content .text-amber-200 { color: #b36a1f; }
+html:not(.dark) .cfg-content .text-rose-400 { color: #d1495b; }
+.cfg-content input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), .cfg-content select, .cfg-content textarea { border-radius: 0.9rem; }
+.cfg-content > .space-y-4 > p:first-child, .cfg-content > .space-y-4 > .flex.gap-2 { margin-top: 0; }
+/* Konfigurasi: semua kartu di area konten ikut gradasi samar oren–biru pucat */
+.cfg-content .card-soft:not(.card-grad):not(.card-sky):not(.card-fog):not(input):not(select):not(button) {
+  background-image: linear-gradient(135deg, transparent 0%, color-mix(in srgb, var(--color-mist) 38%, transparent) 55%, color-mix(in srgb, var(--color-peach) 55%, transparent) 130%);
+}
+
+/* Detail kontrak: toolbar header — deretan pil seragam bertema biru-oren pastel.
+   Semua tombol sekunder = pil putih bershadow lembut (tanpa tint warna-warni);
+   tombol utama = gradasi biru; toggle mati = pil transparan redup. */
+.ct-toolbar > button, .ct-toolbar > a {
+  border-radius: 9999px !important; border: 0 !important;
+  background: var(--color-slate-900) !important; color: var(--color-slate-300) !important;
+  box-shadow: var(--shadow-soft) !important;
+  height: 2.3rem; padding: 0 1rem !important; display: inline-flex; align-items: center; gap: .4rem;
+  font-size: .72rem; font-weight: 600; transition: filter .15s, transform .15s;
+}
+.ct-toolbar > button:hover:not(:disabled), .ct-toolbar > a:hover { filter: brightness(.97); transform: translateY(-1px); }
+.ct-toolbar > button:disabled { opacity: .5; }
+.ct-toolbar > button svg { color: var(--color-soft-blue); flex-shrink: 0; }
+/* toggle dalam keadaan mati (Kop/Logo/Meterai) */
+.ct-toolbar > button[class*="text-slate-500"] { background: transparent !important; box-shadow: none !important; color: var(--color-slate-500) !important; outline: 1px dashed color-mix(in srgb, var(--color-slate-500) 35%, transparent); outline-offset: -1px; }
+.ct-toolbar > button[class*="text-slate-500"] svg { color: currentColor; }
+/* aksi utama */
+.ct-toolbar > button[class*="bg-indigo-600"], .ct-toolbar > button.ct-primary {
+  background-image: linear-gradient(135deg, var(--color-soft-blue) 0%, color-mix(in srgb, var(--color-soft-blue) 72%, var(--color-peach-strong)) 140%) !important;
+  background-color: var(--color-soft-blue) !important; color: #fff !important; font-weight: 700;
+}
+.ct-toolbar > button[class*="bg-indigo-600"] svg, .ct-toolbar > button.ct-primary svg { color: #fff; }
+/* ada perubahan belum disimpan -> nuansa peach */
+.ct-toolbar > button[class*="bg-amber-500/20"] { background: var(--color-peach) !important; color: var(--color-slate-100) !important; }
+.ct-toolbar > button[class*="bg-amber-500/20"] svg { color: var(--color-peach-strong); }
+.ct-toolbar > button .animate-pulse { background: var(--color-peach-strong) !important; }
+/* kontainer segmented (ID/EN/ID+EN, Kiri-Kanan/Atas-Bawah) */
+.ct-toolbar > div { border-radius: 9999px !important; border: 0 !important; background: var(--color-slate-900) !important; box-shadow: var(--shadow-soft) !important; height: 2.3rem; padding: 3px !important; display: inline-flex; align-items: center; }
+.ct-toolbar > div button { border-radius: 9999px !important; height: 100%; padding: 0 .85rem !important; font-size: .7rem; color: var(--color-slate-500); }
+.ct-toolbar > div button:hover:not(:disabled) { color: var(--color-slate-100); }
+.ct-toolbar > div button[class*="bg-indigo-600"] {
+  background-image: linear-gradient(135deg, var(--color-soft-blue) 0%, color-mix(in srgb, var(--color-soft-blue) 72%, var(--color-peach-strong)) 140%) !important;
+  background-color: var(--color-soft-blue) !important; color: #fff !important;
+}
+/* badge jumlah komentar */
+.ct-toolbar > button > span.absolute { background: var(--color-peach-strong) !important; }
+
+/* Sorotan sesaat pada elemen tujuan tautan "isi di sini" (Konfigurasi) */
+.cfg-flash { animation: cfg-flash 1.8s ease-out; }
+@keyframes cfg-flash {
+  0%, 35% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-soft-blue) 70%, transparent), var(--shadow-soft); background-color: color-mix(in srgb, var(--color-peach) 55%, transparent); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}

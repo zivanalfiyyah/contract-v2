@@ -303,7 +303,9 @@ export function makeDefaultUsers(): any[] {
 }
 
 function defaultTenantRecord(): any {
-  return { id: DEFAULT_TENANT_ID, name: "PT Semesta Digital Terpadu", branch: "Jakarta Pusat", active: true, createdAt: new Date().toISOString() };
+  // platforms: platform kerja sama milik perusahaan ini (token {Platform} di
+  // nomor kontrak) — diatur di Konfigurasi > Kelola Perusahaan.
+  return { id: DEFAULT_TENANT_ID, name: "PT Semesta Digital Terpadu", branch: "Jakarta Pusat", active: true, platforms: ["Asmat", "Tiketux"], createdAt: new Date().toISOString() };
 }
 
 /**

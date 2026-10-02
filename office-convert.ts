@@ -91,3 +91,52 @@ export function convertDocToDocx(buf: Buffer): Promise<Buffer> {
   queue = p.catch(() => undefined);
   return p;
 }
+
+// ---------------------------------------------------------------------------
+// Konversi Word (.docx) -> PDF memakai LibreOffice (headless).
+//
+// Dipakai oleh tombol "Download" / "Download Dokumen" saat pengguna memilih
+// format PDF untuk versi dokumen yang tersimpan sebagai .docx. Berkas .docx
+// yang tersimpan TIDAK diubah — ini murni ekspor untuk diunduh, bukan versi
+// dokumen baru. Memakai antrean yang sama dengan convertDocToDocx karena
+// LibreOffice tidak aman dijalankan paralel dengan profil yang sama.
+// ---------------------------------------------------------------------------
+export function convertDocxToPdf(buf: Buffer): Promise<Buffer> {
+  const run = async () => {
+    const soffice = findSoffice();
+    if (!soffice) {
+      throw Object.assign(new Error("Ekspor ke PDF membutuhkan LibreOffice di server (belum terpasang). Pasang LibreOffice atau set LIBREOFFICE_PATH, lalu muat ulang."), { status: 501 });
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "clm-pdf-"));
+    try {
+      const input = path.join(dir, "input.docx");
+      fs.writeFileSync(input, buf);
+      const profile = "file:///" + path.join(dir, "profile").replace(/\\/g, "/").replace(/^\/+/, "");
+      await new Promise<void>((resolve, reject) => {
+        const child = spawn(soffice, [
+          `-env:UserInstallation=${profile}`,
+          "--headless", "--norestore", "--nolockcheck", "--nodefault",
+          "--convert-to", "pdf",
+          "--outdir", dir, input,
+        ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+        let stderr = "";
+        child.stderr.on("data", (d) => { stderr += d; });
+        const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Konversi ke PDF melebihi batas waktu.")); }, 120_000);
+        child.on("error", (e) => { clearTimeout(timer); reject(e); });
+        child.on("close", (code) => {
+          clearTimeout(timer);
+          if (code === 0) resolve();
+          else reject(new Error(`LibreOffice gagal mengonversi ke PDF (kode ${code}). ${stderr.slice(0, 300)}`));
+        });
+      });
+      const out = path.join(dir, "input.pdf");
+      if (!fs.existsSync(out)) throw new Error("LibreOffice tidak menghasilkan berkas PDF.");
+      return fs.readFileSync(out);
+    } finally {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) { logger.warn({ err }, "Gagal membersihkan folder konversi sementara"); }
+    }
+  };
+  const p = queue.then(run, run);
+  queue = p.catch(() => undefined);
+  return p;
+}

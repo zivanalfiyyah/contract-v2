@@ -10,17 +10,24 @@ import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import { diffWords } from "diff";
 import DOMPurify from "dompurify";
-import UploadedDocumentWorkspace from "./UploadedDocumentWorkspace";
+import UploadedDocumentWorkspace, { ReadOnlyDocumentView } from "./UploadedDocumentWorkspace";
+import { ContractDocumentMarkup, DocxMarkupView, acceptDocxMarkup, type MarkupItem, type MarkupSeed } from "./DocxMarkupReview";
+import DocumentDownloadModal, { buildDocumentDownloadUrl, type SourceDocFormat } from "./DocumentDownloadModal";
 import {
   FileText,
   Briefcase,
   Users,
   LayoutDashboard,
   Plus,
+  Hash,
+  Save,
   Search,
   Settings,
   CheckCircle,
   Clock,
+  CheckCircle2,
+  SlidersHorizontal,
+  ArrowUpDown,
   ShieldAlert,
   Sparkles,
   RefreshCw,
@@ -53,6 +60,8 @@ import {
   Languages,
   FolderOpen,
   Scale,
+  Gavel,
+  ScrollText,
   Pencil,
   Workflow,
   ClipboardList,
@@ -551,17 +560,35 @@ function sortRows<T>(rows: T[], sort: SortState, accessors: Record<string, (r: T
     return String(va).localeCompare(String(vb), "id", { numeric: true }) * mult;
   });
 }
-function SortableTh({ label, colKey, sort, onSort, className = "", align = "left" }: {
-  label: string; colKey: string; sort: SortState; onSort: (k: string) => void; className?: string; align?: "left" | "right" | "center";
+// Format berkas dokumen sebuah kontrak: dari berkas unggahan (Word/PDF/gambar)
+// bila ada, kalau tidak "PDF" bila punya master PDF, selain itu "Digital".
+type DocKind = "PDF" | "Word" | "Gambar" | "Berkas" | "Digital";
+function contractDocKind(c: Contract): DocKind {
+  const ref = c.currentDocument || c.originalDocument;
+  if (ref) {
+    if (ref.format === "pdf") return "PDF";
+    if (ref.format === "docx" || ref.format === "doc") return "Word";
+    if (ref.format === "image") return "Gambar";
+    return "Berkas";
+  }
+  return c.masterPdfUrl ? "PDF" : "Digital";
+}
+function fileKindFromName(name?: string): "PDF" | "Word" | "Gambar" | "Berkas" | "" {
+  if (!name) return "";
+  const ext = name.split(".").pop()?.toLowerCase() || "";
+  if (ext === "pdf") return "PDF";
+  if (ext === "doc" || ext === "docx") return "Word";
+  if (["jpg", "jpeg", "png"].includes(ext)) return "Gambar";
+  return "Berkas";
+}
+
+// Kepala kolom polos: pengurutan per kolom DIHILANGKAN (diurutkan lewat tombol
+// "Urutkan" Terbaru/Terlama pada data keseluruhan). Props sort/onSort dipertahankan
+// agar pemanggil lama tidak perlu diubah.
+function SortableTh({ label, className = "" }: {
+  label: string; colKey?: string; sort?: SortState; onSort?: (k: string) => void; className?: string; align?: "left" | "right" | "center";
 }) {
-  const active = sort.key === colKey;
-  return (
-    <th className={`cursor-pointer select-none hover:text-slate-200 transition ${className}`} onClick={() => onSort(colKey)} title="Klik untuk urutkan naik/turun">
-      <span className={`inline-flex items-center gap-1 ${align === "right" ? "justify-end w-full" : align === "center" ? "justify-center w-full" : ""}`}>
-        {label}<span className={active ? "text-indigo-400" : "text-slate-600"}>{active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}</span>
-      </span>
-    </th>
-  );
+  return <th className={`text-left ${className}`}>{label}</th>;
 }
 
 // Substitusi {{variabel}} jadi teks polos — dipakai saat klausul perlu dirender
@@ -611,9 +638,11 @@ type MarginItem = {
   kind?: string;
   resolved?: boolean;
   anchor?: { quote?: string } | null;
+  replacement?: string;  // usulan teks pengganti (kind "replace")
+  status?: string;       // "pending" | "accepted" | "rejected" untuk usulan coret/ganti
 };
 type MarginClause = { id: string; title: string; heading?: string; content: string };
-type MarginDraftSeed = { clauseId: string; clauseTitle: string; quote: string; kind: "comment" | "strike" };
+type MarginDraftSeed = { clauseId: string; clauseTitle: string; quote: string; kind: "comment" | "strike" | "replace" };
 
 const MARGIN_CARD_GAP = 10;   // jarak minimum antar kartu saat bertumpuk
 const MARGIN_CARD_FALLBACK_H = 84;
@@ -622,23 +651,27 @@ const MARGIN_CARD_FALLBACK_H = 84;
 // yang sama berbagi satu tanda (dan satu tanda bisa merujuk banyak komentar).
 function buildMarkGroups(text: string, items: MarginItem[]) {
   const found = items
-    .filter((c) => c.anchor?.quote && text.includes(c.anchor.quote as string))
+    // Usulan yang sudah diputuskan (diterima/ditolak) tidak digambar lagi —
+    // sama seperti markup dokumen upload.
+    .filter((c) => c.anchor?.quote && c.status !== "accepted" && c.status !== "rejected" && text.includes(c.anchor.quote as string))
     .map((c) => {
       const q = c.anchor!.quote as string;
       const start = text.indexOf(q);
-      return { id: c.id, kind: c.kind, resolved: !!c.resolved, start, end: start + q.length };
+      return { id: c.id, kind: c.kind, resolved: !!c.resolved, replacement: c.replacement, start, end: start + q.length };
     })
     .filter((r) => r.start >= 0);
-  const byRange = new Map<string, { start: number; end: number; ids: string[]; strike: boolean; resolved: boolean }>();
+  const byRange = new Map<string, { start: number; end: number; ids: string[]; strike: boolean; resolved: boolean; replacement?: string }>();
   for (const r of found) {
     const key = r.start + ":" + r.end;
+    const isStrike = r.kind === "strike" || r.kind === "replace";
     const g = byRange.get(key);
     if (g) {
       g.ids.push(r.id);
-      g.strike = g.strike || r.kind === "strike";
+      g.strike = g.strike || isStrike;
       g.resolved = g.resolved && r.resolved;
+      if (!g.replacement && r.kind === "replace" && r.replacement) g.replacement = r.replacement;
     } else {
-      byRange.set(key, { start: r.start, end: r.end, ids: [r.id], strike: r.kind === "strike", resolved: r.resolved });
+      byRange.set(key, { start: r.start, end: r.end, ids: [r.id], strike: isStrike, resolved: r.resolved, replacement: r.kind === "replace" ? r.replacement : undefined });
     }
   }
   return Array.from(byRange.values()).sort((a, b) => a.start - b.start || b.end - a.end);
@@ -659,12 +692,20 @@ function renderMarkedClause(text: string, items: MarginItem[], activeId: string 
     const ids = g.ids.join(",");
     nodes.push(
       g.strike ? (
-        <span
-          key={"mk" + i}
-          data-cmt-id={ids}
-          title="Usulan coret — klik untuk membuka komentarnya"
-          className={`cursor-pointer rounded px-0.5 line-through decoration-rose-500 decoration-2 transition ${g.resolved ? "opacity-40" : ""} ${isActive ? "bg-rose-500/30 ring-2 ring-rose-400" : "bg-rose-500/10"}`}
-        >{seg}</span>
+        <React.Fragment key={"mk" + i}>
+          <span
+            data-cmt-id={ids}
+            title={g.replacement ? "Usulan ganti — klik untuk membuka komentarnya" : "Usulan coret — klik untuk membuka komentarnya"}
+            className={`cursor-pointer rounded px-0.5 line-through decoration-rose-500 decoration-2 transition ${g.resolved ? "opacity-40" : ""} ${isActive ? "bg-rose-500/30 ring-2 ring-rose-400" : "bg-rose-500/10"}`}
+          >{seg}</span>
+          {g.replacement && (
+            <ins
+              data-cmt-id={ids}
+              title="Teks pengganti yang diusulkan"
+              className={`ml-0.5 cursor-pointer rounded px-0.5 no-underline border-b-2 border-emerald-500 bg-emerald-500/20 text-emerald-500 transition ${g.resolved ? "opacity-40" : ""}`}
+            >{g.replacement}</ins>
+          )}
+        </React.Fragment>
       ) : (
         <mark
           key={"mk" + i}
@@ -851,7 +892,7 @@ function WordMarginReview({
     if (first) onActiveChange(first);
   };
 
-  const fireDraft = (kind: "comment" | "strike") => {
+  const fireDraft = (kind: "comment" | "strike" | "replace") => {
     if (!toolbar) return;
     onStartDraft({ clauseId: toolbar.clauseId, clauseTitle: toolbar.clauseTitle, quote: toolbar.quote, kind });
     setToolbar(null);
@@ -919,12 +960,17 @@ function WordMarginReview({
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => fireDraft("comment")}
               className="px-2 py-1 text-[10px] font-semibold rounded bg-amber-500/15 text-amber-300 hover:bg-amber-500/30 cursor-pointer"
-            >✎ Komentar Baru</button>
+            >✎ Komentar</button>
             <button
               onMouseDown={(e) => e.preventDefault()}
               onClick={() => fireDraft("strike")}
               className="px-2 py-1 text-[10px] font-semibold rounded bg-rose-500/15 text-rose-300 hover:bg-rose-500/30 cursor-pointer"
-            >✂ Usulkan Coret</button>
+            >✂ Coret</button>
+            <button
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => fireDraft("replace")}
+              className="px-2 py-1 text-[10px] font-semibold rounded bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/30 cursor-pointer"
+            >⇄ Ganti</button>
           </div>
         </div>
       )}
@@ -970,10 +1016,13 @@ function GuestNotice({ notice, onDismiss }: { notice: { text: string; kind: "err
   const isErr = notice.kind === "error";
   return (
     <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 w-[92vw] max-w-md animate-fadeIn" role="status" aria-live="polite">
-      <div className={`flex items-start gap-2.5 px-4 py-3 rounded-xl border shadow-lg ${isErr ? "bg-rose-50 border-rose-200" : "bg-emerald-50 border-emerald-200"}`}>
-        {isErr ? <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" /> : <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />}
-        <p className={`text-[13px] leading-snug flex-1 ${isErr ? "text-rose-700" : "text-emerald-700"}`}>{notice.text}</p>
-        <button onClick={onDismiss} aria-label="Tutup pemberitahuan" className="text-slate-400 hover:text-slate-600 font-bold cursor-pointer leading-none">✕</button>
+      {/* Warna permukaan & teks lewat variabel tema (slate-*) supaya ikut mode
+          terang/gelap; jenis pesan dibedakan oleh border & ikon, bukan latar
+          pastel yang hanya terbaca di tema terang. */}
+      <div className={`flex items-start gap-2.5 px-4 py-3 rounded-xl border shadow-lg bg-slate-900 ${isErr ? "border-rose-500/50" : "border-emerald-500/50"}`}>
+        {isErr ? <AlertTriangle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" /> : <CheckCircle className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />}
+        <p className="text-[13px] leading-snug flex-1 text-slate-100">{notice.text}</p>
+        <button onClick={onDismiss} aria-label="Tutup pemberitahuan" className="text-slate-400 hover:text-slate-200 font-bold cursor-pointer leading-none">✕</button>
       </div>
     </div>
   );
@@ -1017,8 +1066,13 @@ function ExternalReviewPage({ token }: { token: string }) {
   // Active anchored draft: { clauseId, clauseTitle, start, end, quote, kind }
   const [draft, setDraft] = useState<any>(null);
   const [draftText, setDraftText] = useState("");
+  const [draftReplacement, setDraftReplacement] = useState(""); // teks pengganti (usulan "Ganti" pada pasal)
   const [activeId, setActiveId] = useState<string | null>(null);
   const [confirmApprove, setConfirmApprove] = useState(false);
+  // Markup dokumen Word (.docx): usulan yang sedang ditulis tamu.
+  const [mkSeed, setMkSeed] = useState<MarkupSeed | null>(null);
+  const [mkText, setMkText] = useState("");
+  const [mkReplacement, setMkReplacement] = useState("");
   const { notice, notify, dismissNotice } = useGuestNotice();
 
   const load = async () => {
@@ -1043,21 +1097,77 @@ function ExternalReviewPage({ token }: { token: string }) {
       start: start >= 0 ? start : 0, end: start >= 0 ? start + seed.quote.length : 0,
     });
     setDraftText("");
+    setDraftReplacement("");
     setActiveId("__draft__");
   };
   const submitComment = async () => {
+    if (!name.trim()) { notify("Isi nama Anda dulu."); return; }
+    // Sama seperti markup dokumen upload: alasan opsional untuk Coret/Ganti.
+    const repl = draftReplacement.replace(/[\r\n]+/g, " ").trim();
+    if (draft.kind === "replace" && !repl) { notify("Isi teks pengganti."); return; }
+    const reason = draftText.trim();
+    const text = reason || (draft.kind === "replace" ? `Usul ganti: "${draft.quote}" → "${repl}"` : draft.kind === "strike" ? `Usul hapus: "${draft.quote}"` : "");
+    if (!text) { notify("Tulis komentarnya."); return; }
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/external-review/${token}/comments`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name, clauseId: draft.clauseId, clauseTitle: draft.clauseTitle, text, kind: draft.kind,
+          anchor: { start: draft.start, end: draft.end, quote: draft.quote },
+          ...(draft.kind !== "comment" ? { clauseMarkup: true } : {}),
+          ...(draft.kind === "replace" ? { replacement: repl } : {}),
+        }),
+      });
+      const j = await res.json();
+      if (!res.ok) { notify(j.error || "Gagal mengirim komentar."); }
+      else { setDraft(null); setDraftText(""); setDraftReplacement(""); setActiveId(null); notify(draft.kind === "comment" ? "Komentar terkirim." : "Usulan terkirim.", "success"); await load(); }
+    } catch { notify("Gagal mengirim komentar."); }
+    finally { setBusy(false); }
+  };
+  // Kontrak upload: berkas ditampilkan apa adanya (baca-saja), jadi komentar
+  // yang tersedia sementara adalah komentar UMUM untuk seluruh dokumen (tanpa
+  // sorotan kalimat) — clauseId khusus "__document__".
+  const submitGeneralComment = async () => {
+    if (data?.locked) { notify("Review ini sudah terkunci sejak Anda menyetujui (Setuju/OK). Hubungi pemilik dokumen untuk membuka akses kembali."); return; }
     if (!name.trim()) { notify("Isi nama Anda dulu."); return; }
     if (!draftText.trim()) { notify("Tulis komentarnya."); return; }
     setBusy(true);
     try {
       const res = await fetch(`/api/external-review/${token}/comments`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, clauseId: draft.clauseId, clauseTitle: draft.clauseTitle, text: draftText, kind: draft.kind, anchor: { start: draft.start, end: draft.end, quote: draft.quote } }),
+        body: JSON.stringify({ name, clauseId: "__document__", clauseTitle: "Dokumen", text: draftText, kind: "comment" }),
       });
       const j = await res.json();
       if (!res.ok) { notify(j.error || "Gagal mengirim komentar."); }
-      else { setDraft(null); setDraftText(""); setActiveId(null); notify("Komentar terkirim.", "success"); await load(); }
+      else { setDraftText(""); notify("Komentar terkirim.", "success"); await load(); }
     } catch { notify("Gagal mengirim komentar."); }
+    finally { setBusy(false); }
+  };
+  const submitMarkup = async () => {
+    if (!mkSeed) return;
+    if (data?.locked) { notify("Review ini sudah terkunci sejak Anda menyetujui (Setuju/OK). Hubungi pemilik dokumen untuk membuka akses kembali."); return; }
+    if (!name.trim()) { notify("Isi nama Anda dulu."); return; }
+    const repl = mkReplacement.replace(/[\r\n]+/g, " ").trim();
+    if (mkSeed.kind === "replace" && !repl) { notify("Isi teks pengganti."); return; }
+    const reason = mkText.trim();
+    const text = reason || (mkSeed.kind === "replace" ? `Usul ganti: "${mkSeed.quote}" → "${repl}"` : mkSeed.kind === "strike" ? `Usul hapus: "${mkSeed.quote}"` : "");
+    if (!text) { notify("Tulis komentarnya."); return; }
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/external-review/${token}/comments`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name, clauseId: "__document__", clauseTitle: "Dokumen", text, kind: mkSeed.kind,
+          anchor: { start: mkSeed.start, end: mkSeed.end, quote: mkSeed.quote },
+          docAnchor: { paraIndex: mkSeed.paraIndex },
+          ...(mkSeed.kind === "replace" ? { replacement: repl } : {}),
+        }),
+      });
+      const j = await res.json();
+      if (!res.ok) { notify(j.error || "Gagal mengirim markup."); }
+      else { setMkSeed(null); setMkText(""); setMkReplacement(""); notify("Terkirim.", "success"); await load(); }
+    } catch { notify("Gagal mengirim markup."); }
     finally { setBusy(false); }
   };
   const approve = async () => {
@@ -1108,7 +1218,7 @@ function ExternalReviewPage({ token }: { token: string }) {
   ];
   const marginItems: MarginItem[] = allComments
     .filter((x) => !x.parentId)
-    .map((x) => ({ id: x.id, clauseId: String(x.clauseId), kind: x.kind, resolved: !!x.resolved, anchor: x.anchor }));
+    .map((x) => ({ id: x.id, clauseId: String(x.clauseId), kind: x.kind, resolved: !!x.resolved, anchor: x.anchor, replacement: x.replacement, status: x.status }));
   if (draft) {
     marginItems.push({ id: "__draft__", clauseId: String(draft.clauseId), kind: draft.kind, resolved: false, anchor: { quote: draft.quote } });
   }
@@ -1117,22 +1227,31 @@ function ExternalReviewPage({ token }: { token: string }) {
     if (item.id === "__draft__") {
       if (!draft) return null;
       return (
-        <div className={`rounded-xl border-l-4 shadow-xl bg-slate-900 border border-dashed p-3 space-y-2 ${draft.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-amber-400 border-amber-700/60"}`}>
+        <div className={`rounded-xl border-l-4 shadow-xl bg-slate-900 border border-dashed p-3 space-y-2 ${draft.kind === "comment" ? "border-l-amber-400 border-amber-700/60" : draft.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-emerald-500 border-emerald-700/60"}`}>
           <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
-            {draft.kind === "strike" ? "✂ Usulan Coret" : "✎ Komentar Baru"}
+            {draft.kind === "comment" ? "✎ Komentar Baru" : draft.kind === "strike" ? "✂ Usulan Coret" : "⇄ Usulan Ganti"}
           </p>
-          <p className={`text-[11px] italic ${draft.kind === "strike" ? "text-rose-300 line-through" : "text-amber-200"}`}>"{draft.quote}"</p>
+          <p className={`text-[11px] italic ${draft.kind === "comment" ? "text-amber-200" : "text-rose-300 line-through"}`}>"{draft.quote}"</p>
+          {draft.kind === "replace" && (
+            <input
+              autoFocus
+              value={draftReplacement}
+              onChange={(e) => setDraftReplacement(e.target.value)}
+              placeholder="Teks pengganti…"
+              className="w-full px-2 py-1.5 bg-slate-950 border border-emerald-700/50 rounded-lg text-xs text-emerald-200 focus:outline-none focus:border-emerald-500"
+            />
+          )}
           <textarea
-            autoFocus
+            autoFocus={draft.kind !== "replace"}
             value={draftText}
             onChange={(e) => setDraftText(e.target.value)}
             rows={3}
-            placeholder="Tulis catatan / alasan revisi…"
+            placeholder={draft.kind === "comment" ? "Tulis komentar…" : "Alasan (opsional)…"}
             className="w-full px-2 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-xs focus:outline-none focus:border-indigo-500"
           />
           <div className="flex gap-2">
             <button onClick={submitComment} disabled={busy} className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-[11px] font-bold rounded-lg cursor-pointer">Kirim</button>
-            <button onClick={() => { setDraft(null); setActiveId(null); }} className="px-2 py-1 text-slate-400 hover:text-slate-200 text-[11px] rounded-lg cursor-pointer">Batal</button>
+            <button onClick={() => { setDraft(null); setDraftReplacement(""); setActiveId(null); }} className="px-2 py-1 text-slate-400 hover:text-slate-200 text-[11px] rounded-lg cursor-pointer">Batal</button>
           </div>
         </div>
       );
@@ -1141,7 +1260,7 @@ function ExternalReviewPage({ token }: { token: string }) {
     if (!cm) return null;
     const replies = allComments.filter((x) => x.parentId === cm.id);
     return (
-      <div className={`rounded-xl bg-slate-900 border p-3 space-y-1.5 cursor-pointer transition border-l-4 ${cm.kind === "strike" ? "border-l-rose-500" : "border-l-amber-400"} ${isActive ? "border-indigo-500 shadow-xl ring-1 ring-indigo-500/40" : "border-slate-800 shadow-md hover:border-slate-700"}`}>
+      <div className={`rounded-xl bg-slate-900 border p-3 space-y-1.5 cursor-pointer transition border-l-4 ${cm.kind === "strike" || cm.kind === "replace" ? "border-l-rose-500" : "border-l-amber-400"} ${isActive ? "border-indigo-500 shadow-xl ring-1 ring-indigo-500/40" : "border-slate-800 shadow-md hover:border-slate-700"}`}>
         <div className="flex items-center gap-1.5">
           <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold shrink-0 ${cm.external ? "bg-amber-500/20 text-amber-300" : "bg-indigo-500/20 text-indigo-300"}`}>
             {String(cm.userName || "?").charAt(0).toUpperCase()}
@@ -1150,7 +1269,15 @@ function ExternalReviewPage({ token }: { token: string }) {
           {cm.external && <span className="text-[8px] font-bold px-1 py-px rounded bg-amber-500/20 text-amber-300 uppercase shrink-0">Eksternal</span>}
         </div>
         {cm.anchor?.quote && (
-          <p className={`text-[10px] italic ${cm.kind === "strike" ? "text-rose-300/80 line-through" : "text-amber-200/80"}`}>"{cm.anchor.quote}"</p>
+          <p className={`text-[10px] italic ${cm.kind === "strike" || cm.kind === "replace" ? "text-rose-300/80 line-through" : "text-amber-200/80"}`}>"{cm.anchor.quote}"</p>
+        )}
+        {cm.kind === "replace" && cm.replacement && (
+          <p className="text-[10px] text-emerald-300 border-l-2 border-emerald-500 pl-2 underline decoration-emerald-500/60">→ "{cm.replacement}"</p>
+        )}
+        {cm.status && cm.status !== "pending" && (
+          <span className={`inline-block text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${cm.status === "accepted" ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-300"}`}>
+            {cm.status === "accepted" ? "✓ Diterima" : "✕ Ditolak"}
+          </span>
         )}
         <p className="text-[11px] text-slate-300 whitespace-pre-wrap">{cm.text}</p>
         {replies.map((rp) => (
@@ -1176,7 +1303,7 @@ function ExternalReviewPage({ token }: { token: string }) {
         onConfirm={doApprove}
         onCancel={() => setConfirmApprove(false)}
       />
-      <div className="max-w-6xl mx-auto p-4 sm:p-6 space-y-5">
+      <div className={`${c.documentSource === "upload" ? "max-w-7xl" : "max-w-6xl"} mx-auto p-4 sm:p-6 space-y-5`}>
         <header className="bg-slate-950/60 border border-slate-800 rounded-2xl p-5">
           <p className="text-[11px] uppercase tracking-wide text-indigo-400 font-bold">Tinjauan Dokumen — Pihak Kedua</p>
           <h1 className="text-xl font-bold mt-1">{c.title}</h1>
@@ -1196,13 +1323,106 @@ function ExternalReviewPage({ token }: { token: string }) {
             </p>
           ) : (
             <p className="text-[11px] text-slate-500 mt-2">
-              <b>Sorot (block) kalimat</b> pada klausul di bawah → muncul tombol <b>✎ Komentar Baru</b> / <b>✂ Usulkan Coret</b>.
-              Komentar tampil sebagai kartu di margin kanan, tersambung garis ke kalimatnya. Bila sudah sesuai, klik <b>Setuju / OK</b>.
+              {c.documentSource === "upload" ? (
+                c.documentMarkup
+                  ? <><b>Sorot teks</b> pada dokumen → pilih <b>✎ Komentar</b>, <b>✂ Coret</b>, atau <b>⇄ Ganti</b> (usulan teks pengganti). Pemilik dokumen yang menentukan diterima atau tidaknya. Bila sudah sesuai, klik <b>Setuju / OK</b>.</>
+                  : <>Baca dokumen, tulis <b>komentar</b> pada kolom komentar di sebelahnya bila ada yang perlu direvisi. Bila sudah sesuai, klik <b>Setuju / OK</b>.</>
+              ) : (
+                <>
+                  <b>Sorot (block) kalimat</b> pada klausul di bawah → muncul tombol <b>✎ Komentar</b> / <b>✂ Coret</b> / <b>⇄ Ganti</b> (usulan teks pengganti).
+                  Komentar tampil sebagai kartu di margin kanan, tersambung garis ke kalimatnya. Bila sudah sesuai, klik <b>Setuju / OK</b>.
+                </>
+              )}
             </p>
           )}
         </header>
 
         <div className="bg-slate-950/40 border border-slate-800 rounded-2xl p-5 sm:p-7">
+          {c.documentSource === "upload" ? (
+            <div className="space-y-5">
+              <p className="text-[11px] text-slate-500 truncate">
+                Berkas: <b className="text-slate-300">{c.documentName || "Dokumen"}</b>{c.documentVersion != null ? ` (versi ${c.documentVersion}, aktif)` : ""} — ditampilkan apa adanya, baca-saja.
+              </p>
+              {/* Susunan sama dgn Mode Tinjau internal: dokumen di kiri, kolom
+                  komentar/coret di kanan sejajar dokumen (bukan di bawahnya). */}
+              <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-5 items-start">
+              <div className="min-w-0">
+              {c.documentMarkup ? (
+                <DocxMarkupView
+                  src={`/api/external-review/${token}/document`}
+                  items={allComments.filter((x) => !x.parentId && x.docAnchor && x.anchor).map((x) => ({
+                    id: x.id, kind: (x.kind || "comment") as MarkupItem["kind"], resolved: !!x.resolved, status: x.status,
+                    paraIndex: x.docAnchor.paraIndex, start: x.anchor.start, end: x.anchor.end, quote: x.anchor.quote, replacement: x.replacement,
+                  }))}
+                  activeId={activeId}
+                  onActiveChange={setActiveId}
+                  canMark={!data.locked}
+                  onStartDraft={(seed) => {
+                    if (data.locked) { notify("Review ini sudah terkunci sejak Anda menyetujui (Setuju/OK). Hubungi pemilik dokumen untuk membuka akses kembali."); return; }
+                    setMkSeed(seed); setMkText(""); setMkReplacement("");
+                  }}
+                  onNotify={(m) => notify(m)}
+                />
+              ) : (
+                <ReadOnlyDocumentView src={`/api/external-review/${token}/document`} format={c.documentFormat || "unsupported"} mimeType={c.documentMime} />
+              )}
+              </div>
+              <div className="space-y-3 lg:sticky lg:top-4 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto">
+              <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wide">Komentar ({allComments.filter((x) => !x.parentId).length})</h3>
+              {mkSeed && (
+                <div className={`rounded-xl bg-slate-900 border border-dashed p-3 space-y-2 border-l-4 ${mkSeed.kind === "comment" ? "border-l-amber-400 border-amber-600/60" : mkSeed.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-emerald-500 border-emerald-700/60"}`}>
+                  <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                    {mkSeed.kind === "comment" ? "✎ Komentar Baru" : mkSeed.kind === "strike" ? "✂ Usulan Coret" : "⇄ Usulan Ganti"}
+                  </p>
+                  <p className={`text-[12px] italic ${mkSeed.kind === "comment" ? "text-amber-200" : "text-rose-300 line-through"}`}>"{mkSeed.quote}"</p>
+                  {mkSeed.kind === "replace" && (
+                    <input autoFocus value={mkReplacement} onChange={(e) => setMkReplacement(e.target.value)} placeholder="Teks pengganti…"
+                      className="w-full px-3 py-2 bg-slate-950 border border-emerald-700/50 rounded-lg text-sm text-emerald-200 focus:outline-none focus:border-emerald-500" />
+                  )}
+                  <textarea autoFocus={mkSeed.kind !== "replace"} value={mkText} onChange={(e) => setMkText(e.target.value)} rows={3}
+                    placeholder={mkSeed.kind === "comment" ? "Tulis komentar…" : "Alasan (opsional)…"}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-100 focus:outline-none focus:border-indigo-500" />
+                  <div className="flex gap-2">
+                    <button onClick={submitMarkup} disabled={busy} className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-bold rounded-lg cursor-pointer">Kirim</button>
+                    <button onClick={() => { setMkSeed(null); setMkText(""); setMkReplacement(""); }} className="px-3 py-2 text-slate-400 hover:text-slate-200 text-sm rounded-lg cursor-pointer">Batal</button>
+                  </div>
+                </div>
+              )}
+              <div className="space-y-3">
+                {allComments.filter((x) => !x.parentId).length === 0 && (
+                  <div className="rounded-xl border border-dashed border-slate-800 p-3 text-[11px] text-slate-500">Belum ada komentar.</div>
+                )}
+                {allComments.filter((x) => !x.parentId).map((cm) => (
+                  <div key={cm.id} onClick={() => setActiveId(cm.id)}
+                    className={`rounded-xl bg-slate-900 border border-l-4 p-3 space-y-1 cursor-pointer ${cm.kind === "strike" || cm.kind === "replace" ? "border-l-rose-500" : "border-l-amber-400"} ${activeId === cm.id ? "border-indigo-500" : "border-slate-800"}`}>
+                    <p className="text-[11px] font-bold text-slate-200">
+                      {cm.externalName || cm.userName}
+                      <span className="ml-2 font-normal text-slate-500">{new Date(cm.createdAt).toLocaleString("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</span>
+                    </p>
+                    {cm.anchor?.quote && (
+                      <p className={`text-[11px] italic ${cm.kind === "strike" || cm.kind === "replace" ? "text-rose-300 line-through" : "text-amber-200"}`}>"{cm.anchor.quote}"</p>
+                    )}
+                    {cm.kind === "replace" && cm.replacement && (
+                      <p className="text-[11px] text-emerald-300 border-l-2 border-emerald-500 pl-2 underline decoration-emerald-500/60">→ "{cm.replacement}"</p>
+                    )}
+                    {cm.status && cm.status !== "pending" && (
+                      <span className={`inline-block text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${cm.status === "accepted" ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-300"}`}>
+                        {cm.status === "accepted" ? "✓ Diterima" : "✕ Ditolak"}
+                      </span>
+                    )}
+                    <p className={`text-[12px] leading-relaxed whitespace-pre-wrap ${cm.resolved ? "text-slate-500 line-through" : "text-slate-300"}`}>{cm.text}</p>
+                  </div>
+                ))}
+                <textarea value={draftText} onChange={(e) => setDraftText(e.target.value)} rows={3} disabled={busy || data.locked}
+                  placeholder={data.locked ? "Review terkunci." : "Tulis komentar untuk dokumen ini…"}
+                  className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-sm text-slate-100 focus:outline-none focus:border-indigo-500 disabled:opacity-50" />
+                <button onClick={submitGeneralComment} disabled={busy || data.locked || !draftText.trim()}
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-sm font-bold rounded-lg cursor-pointer">Kirim Komentar</button>
+              </div>
+              </div>
+              </div>
+            </div>
+          ) : (
           <WordMarginReview
             clauses={clauseList}
             items={marginItems}
@@ -1216,9 +1436,35 @@ function ExternalReviewPage({ token }: { token: string }) {
               </div>
             }
           />
+          )}
         </div>
         <p className="text-center text-[10px] text-slate-600 py-4">Tinjauan aman berbasis token. Anda hanya dapat melihat &amp; mengomentari klausul dokumen ini.</p>
       </div>
+    </div>
+  );
+}
+
+// Pilihan baku "PIC Pemberi Pekerjaan" (sama dengan LEGAL_PIC_OPTIONS di server.ts).
+// "Lainnya" memunculkan kolom nama divisi → disimpan sebagai "Lainnya – <divisi>".
+const LEGAL_PIC_OPTIONS = ["Marketing", "Business Partnership", "Account Executive", "Operasional", "Finance", "Management", "HR/GA", "IT/System", "Lainnya"];
+function legalPicError(v: string): string | null {
+  if (!v) return "PIC Pemberi Pekerjaan wajib dipilih.";
+  if (v === "Lainnya") return "Isi nama divisi untuk pilihan “Lainnya”.";
+  return null;
+}
+function LegalPicSelect({ value, onChange, className }: { value: string; onChange: (v: string) => void; className: string }) {
+  const [sel, setSel] = useState(() => (value.startsWith("Lainnya") ? "Lainnya" : value));
+  const [other, setOther] = useState(() => (value.startsWith("Lainnya – ") ? value.slice("Lainnya – ".length) : ""));
+  const emit = (s: string, o: string) => onChange(s === "Lainnya" ? (o.trim() ? `Lainnya – ${o.trim()}` : "Lainnya") : s);
+  return (
+    <div className="space-y-2">
+      <select value={sel} onChange={(e) => { setSel(e.target.value); emit(e.target.value, other); }} className={className}>
+        <option value="">Pilih PIC pemberi pekerjaan…</option>
+        {LEGAL_PIC_OPTIONS.map((o) => <option key={o} value={o}>{o}</option>)}
+      </select>
+      {sel === "Lainnya" && (
+        <input value={other} maxLength={80} onChange={(e) => { setOther(e.target.value); emit(sel, e.target.value); }} placeholder="Tulis nama divisi / requester" className={className} autoFocus />
+      )}
     </div>
   );
 }
@@ -1232,7 +1478,7 @@ function ExternalReviewPage({ token }: { token: string }) {
 function LegalExternalFormPage({ token }: { token: string }) {
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
-  const [meta, setMeta] = useState<{ tenantName: string; docTypeOptions: string[]; partnerSuggestions: string[]; picSuggestions: string[] } | null>(null);
+  const [meta, setMeta] = useState<{ tenantName: string; partnerSuggestions: string[] } | null>(null);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const { notice, notify, dismissNotice } = useGuestNotice();
@@ -1274,8 +1520,8 @@ function LegalExternalFormPage({ token }: { token: string }) {
   const submit = async () => {
     if (!form.title.trim()) return notify("Judul Pekerjaan wajib diisi.");
     if (!form.partnerName.trim()) return notify("Partner/Pihak wajib diisi.");
-    if (!form.docType.trim()) return notify("Jenis Dokumen wajib dipilih.");
-    if (!form.picName.trim()) return notify("PIC Pemberi Pekerjaan wajib diisi.");
+    if (!form.docType.trim()) return notify("Jenis Dokumen wajib diisi.");
+    { const pe = legalPicError(form.picName); if (pe) return notify(pe); }
     if (!form.deadline) return notify("Deadline wajib diisi.");
     setBusy(true);
     try {
@@ -1343,18 +1589,14 @@ function LegalExternalFormPage({ token }: { token: string }) {
             </div>
             <div className="space-y-1.5">
               <label className={labelCls}>Jenis Dokumen <span className="text-rose-500">*</span></label>
-              <select value={form.docType} onChange={set("docType")} className={inputCls}>
-                <option value="">Pilih jenis</option>
-                {meta?.docTypeOptions.map((d) => <option key={d} value={d}>{d}</option>)}
-              </select>
+              <input value={form.docType} onChange={set("docType")} placeholder='Contoh: "PKS", "NDA", "Addendum"' className={inputCls} />
             </div>
           </div>
 
           <div className="grid sm:grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <label className={labelCls}>PIC Pemberi Pekerjaan <span className="text-rose-500">*</span></label>
-              <input value={form.picName} onChange={set("picName")} placeholder="Marketing, AE, Business Dev, dll" list="pic-suggestions" className={inputCls} />
-              <datalist id="pic-suggestions">{meta?.picSuggestions.map((p) => <option key={p} value={p} />)}</datalist>
+              <LegalPicSelect value={form.picName} onChange={(v) => setForm((f) => ({ ...f, picName: v }))} className={inputCls} />
             </div>
             <div className="space-y-1.5">
               <label className={labelCls}>Deadline <span className="text-rose-500">*</span></label>
@@ -1894,6 +2136,30 @@ let activeStructural: { table: HTMLTableElement | null; cell: HTMLTableCellEleme
 // SELEKSI DOM aktif, jadi satu toolbar ini otomatis "ngikutin" contentEditable
 // manapun yang barusan difokus, asal tombolnya sendiri tidak pernah mencuri
 // fokus (onMouseDown preventDefault, sama pola dgn Btn di RichTextEditor).
+// Sama seperti InsertCard, tapi utk aksi yg butuh <input type="file"> atau
+// <select> tersembunyi di atasnya (dipakai spt file input Gambar/PDF yang
+// sebelumnya juga berupa <label> — polanya dipertahankan, cuma tampilannya
+// dibesarkan jadi kartu).
+// WAJIB di luar DocToolbar (bukan komponen yang dibuat di dalam render-nya):
+// saat dialog pilih-file terbuka, editor kehilangan fokus → lampiran disimpan
+// (onBlur) → App render ulang → komponen yang didefinisikan di dalam render
+// dianggap TIPE BARU oleh React sehingga <input type="file"> yang sedang
+// dipakai dilepas & diganti elemen baru. File yang dipilih lalu tidak pernah
+// sampai ke onChange — Insert Image & Insert PDF "tidak terjadi apa-apa".
+function InsertCardWrap({ title, icon, label, disabled, children }: { title: string; icon: any; label: string; disabled?: boolean; children: any }) {
+  return (
+    <label
+      onMouseDown={(e) => e.preventDefault()}
+      title={title}
+      className={`relative flex flex-col items-center justify-center gap-1 rounded-md py-1.5 px-2.5 min-w-[64px] text-slate-300 transition-colors ${disabled ? "opacity-50 cursor-wait" : "hover:bg-indigo-500/10 hover:text-indigo-400 cursor-pointer"}`}
+    >
+      {icon}
+      <span className="text-[10px] font-medium leading-none text-center whitespace-nowrap">{label}</span>
+      {children}
+    </label>
+  );
+}
+
 function DocToolbar() {
   const exec = (cmd: string, arg?: string) => {
     try { document.execCommand("styleWithCSS", false, "true"); } catch { /* noop */ }
@@ -1915,11 +2181,18 @@ function DocToolbar() {
   const insertPdfAsImages = async (file: File) => {
     setPdfBusy(true);
     try {
-      const pdfjsLib = await import("pdfjs-dist");
-      pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-        "pdfjs-dist/build/pdf.worker.mjs",
-        import.meta.url,
-      ).toString();
+      // Build "legacy" pdf.js (sama seperti UploadedDocumentWorkspace): build
+      // modern v6 memakai API JS sangat baru (Map.getOrInsertComputed) yang
+      // belum ada di banyak browser → error "getOrInsertComputed is not a
+      // function" dan PDF gagal disisipkan. Legacy build menyertakan polyfill.
+      // Worker di-resolve lewat "?url" Vite — `new URL("pdfjs-dist/...",
+      // import.meta.url)` dengan nama paket (bukan path relatif) tidak
+      // di-resolve Vite dan berujung 404.
+      const [pdfjsLib, workerMod]: any[] = await Promise.all([
+        import("pdfjs-dist/legacy/build/pdf.mjs"),
+        import("pdfjs-dist/legacy/build/pdf.worker.mjs?url"),
+      ]);
+      pdfjsLib.GlobalWorkerOptions.workerSrc = workerMod.default;
       const buf = await file.arrayBuffer();
       const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
       let html = "";
@@ -2039,21 +2312,8 @@ function DocToolbar() {
       <span className="text-[10px] font-medium leading-none text-center whitespace-nowrap">{label}</span>
     </button>
   );
-  // Sama seperti InsertCard, tapi utk aksi yg butuh <input type="file"> atau
-  // <select> tersembunyi di atasnya (dipakai spt file input Gambar/PDF yang
-  // sebelumnya juga berupa <label> — polanya dipertahankan, cuma tampilannya
-  // dibesarkan jadi kartu).
-  const InsertCardWrap = ({ title, icon, label, disabled, children }: { title: string; icon: any; label: string; disabled?: boolean; children: any }) => (
-    <label
-      onMouseDown={(e) => e.preventDefault()}
-      title={title}
-      className={`relative flex flex-col items-center justify-center gap-1 rounded-md py-1.5 px-2.5 min-w-[64px] text-slate-300 transition-colors ${disabled ? "opacity-50 cursor-wait" : "hover:bg-indigo-500/10 hover:text-indigo-400 cursor-pointer"}`}
-    >
-      {icon}
-      <span className="text-[10px] font-medium leading-none text-center whitespace-nowrap">{label}</span>
-      {children}
-    </label>
-  );
+  // InsertCardWrap (kartu utk input file Gambar/PDF & select Dynamic Field)
+  // didefinisikan DI LUAR DocToolbar — lihat komentar di atas DocToolbar.
   // Tombol ikon + teks label sejajar (bukan dropdown) — dipakai khusus utk
   // seksi "Table Tools". Revisi (feedback user): dropdown "Baris & Kolom…"
   // dianggap kurang jelas krn aksinya tersembunyi di balik klik dropdown
@@ -2541,10 +2801,88 @@ const LEGAL_STATUS_LABEL: Record<string, string> = {
 };
 const LEGAL_WORKFLOW_ORDER = ["draft", "review_internal", "review_eksternal", "revisi_negosiasi", "finalisasi", "penomoran", "ttd", "distribusi", "arsip", "selesai"];
 const LEGAL_PRIORITY_STYLE: Record<string, string> = {
-  Tinggi: "bg-rose-500/15 text-rose-400 border-rose-500/25",
-  Sedang: "bg-amber-500/15 text-amber-400 border-amber-500/25",
-  Rendah: "bg-slate-500/15 text-slate-400 border-slate-500/25",
+  Tinggi: "bg-brand-orange text-white border-transparent",
+  Sedang: "bg-peach text-brand-orange border-transparent",
+  Rendah: "bg-mist text-indigo-400 border-transparent",
 };
+const LEGAL_STATUS_ICON: Record<string, any> = {
+  menunggu_persetujuan: Inbox, draft: Pencil, review_internal: ClipboardList, review_eksternal: Scale,
+  revisi_negosiasi: MessageSquare, finalisasi: Stamp, ttd: PenTool, selesai: CheckCircle,
+};
+const LEGAL_PILL = "text-[11px] px-2.5 py-1 rounded-full font-semibold whitespace-nowrap bg-mist text-indigo-400";
+
+// Kepala halaman bergradasi + ikon samar (seragam dengan Konfigurasi).
+function LegalHero({ Icon, title, sub, right }: { Icon: any; title: string; sub: string; right?: any }) {
+  return (
+    <div className="card-grad card-soft bg-slate-900 rounded-[28px] px-6 py-5 flex flex-col md:flex-row md:items-center gap-4 relative overflow-hidden">
+      <Gavel aria-hidden className="pointer-events-none absolute -right-4 -top-8 w-40 h-40 text-soft-blue opacity-[0.12] rotate-6" strokeWidth={1.2} />
+      <ScrollText aria-hidden className="pointer-events-none absolute right-44 -bottom-6 w-24 h-24 text-peach-strong opacity-30 -rotate-12" strokeWidth={1.2} />
+      <Scale aria-hidden className="pointer-events-none absolute right-96 -top-3 w-16 h-16 text-soft-blue opacity-[0.12] rotate-6" strokeWidth={1.2} />
+      <div className="flex items-center gap-4 min-w-0 relative flex-1">
+        <span className="w-12 h-12 rounded-full bg-peach flex items-center justify-center shrink-0"><Icon className="w-5 h-5 text-slate-300" /></span>
+        <div className="min-w-0">
+          <h2 className="text-[22px] leading-tight font-medium text-slate-100">{title}</h2>
+          <p className="text-xs text-slate-500 mt-0.5">{sub}</p>
+        </div>
+      </div>
+      {right && <div className="relative shrink-0">{right}</div>}
+    </div>
+  );
+}
+
+// Kartu ringkasan status (klik = filter / buka daftar).
+function LegalStatCard({ status, count, active, onClick }: { key?: any; status: string; count: number; active?: boolean; onClick: () => void }) {
+  const Icon = LEGAL_STATUS_ICON[status] || FileText;
+  return (
+    <button onClick={onClick}
+      className={`text-left p-4 rounded-[22px] card-soft card-grad relative overflow-hidden transition cursor-pointer hover:brightness-[1.02] ${active ? "bg-mist ring-2 ring-soft-blue/60" : "bg-slate-900"}`}>
+      <span className={`w-8 h-8 rounded-full flex items-center justify-center mb-3 ${status === "menunggu_persetujuan" ? "bg-peach-strong" : "bg-peach"}`}><Icon className="w-4 h-4 text-slate-100" /></span>
+      <p className="text-[26px] leading-none font-medium text-slate-100 tabular">{count}</p>
+      <p className="text-[11px] text-slate-500 leading-tight mt-1.5">{LEGAL_STATUS_LABEL[status]}</p>
+    </button>
+  );
+}
+
+// Kartu isi: lingkaran ikon + judul + (aksi) lalu konten.
+function LegalPanel({ Icon, title, subtitle, right, tone, children }: { Icon: any; title: string; subtitle?: string; right?: any; tone?: "peach"; children: any }) {
+  return (
+    <div className="card-soft bg-slate-900 rounded-[28px] p-6 space-y-4 min-w-0">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <span className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${tone === "peach" ? "bg-peach-strong" : "bg-mist"}`}><Icon className="w-[17px] h-[17px] text-slate-100" /></span>
+          <div className="min-w-0">
+            <h3 className="text-[16px] font-medium text-slate-100 leading-snug">{title}</h3>
+            {subtitle && <p className="text-[11px] text-slate-500 leading-snug mt-0.5">{subtitle}</p>}
+          </div>
+        </div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// Modal & panel seragam.
+function LegalModal({ title, sub, Icon, onClose, children, footer, wide }: { title: string; sub?: string; Icon: any; onClose: () => void; children: any; footer?: any; wide?: boolean }) {
+  return (
+    <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className={`modal-panel relative w-full ${wide ? "max-w-md" : "max-w-sm"} max-h-[90vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] space-y-4`}>
+        <button type="button" onClick={onClose} aria-label="Tutup" className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 flex items-center justify-center cursor-pointer"><X className="w-4 h-4" /></button>
+        <div className="flex items-start gap-3 pr-10">
+          <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Icon className="w-5 h-5 text-slate-300" /></span>
+          <div className="min-w-0">
+            <h3 className="text-[18px] font-semibold text-slate-100 leading-tight">{title}</h3>
+            {sub && <p className="text-xs text-slate-500 mt-0.5">{sub}</p>}
+          </div>
+        </div>
+        {children}
+        {footer && <div className="flex items-center justify-end gap-2 pt-1">{footer}</div>}
+      </div>
+    </div>
+  );
+}
+const LEGAL_BTN_GHOST = "px-5 py-2.5 rounded-full text-xs font-semibold text-slate-400 hover:text-slate-100 bg-slate-950 cursor-pointer";
+const LEGAL_BTN_PRIMARY = "px-6 py-2.5 rounded-full btn-grad-primary text-white text-xs font-bold cursor-pointer disabled:opacity-50 disabled:cursor-default flex items-center gap-1.5";
 // Label & warna badge status KONTRAK — duplikat sengaja dari
 // contractStatusLabel/contractStatusBadgeClass di dalam komponen App (yang
 // terikat closure App, tidak bisa dipakai komponen top-level seperti
@@ -2558,17 +2896,18 @@ const CONTRACT_STATUS_LABEL_ID: Record<string, string> = {
   Finalisasi: "Finalisasi", ProsesTTD: "Proses TTD",
 };
 const CONTRACT_STATUS_BADGE_CLASS: Record<string, string> = {
-  Aktif: "bg-emerald-500/15 text-emerald-400 border-emerald-500/25",
-  TidakAktif: "bg-orange-500/15 text-orange-400 border-orange-500/25",
-  Draft: "bg-amber-500/15 text-amber-400 border-amber-500/25",
-  OnReview: "bg-indigo-500/15 text-indigo-400 border-indigo-500/25",
-  FullyApproved: "bg-teal-500/15 text-teal-400 border-teal-500/25",
-  Archived: "bg-purple-500/15 text-purple-400 border-purple-500/25",
-  Terminated: "bg-rose-500/15 text-rose-400 border-rose-500/25",
-  ReviewInternalEksternal: "bg-sky-500/15 text-sky-400 border-sky-500/25",
-  RevisiNegosiasi: "bg-fuchsia-500/15 text-fuchsia-400 border-fuchsia-500/25",
-  Finalisasi: "bg-indigo-500/15 text-indigo-400 border-indigo-500/25",
-  ProsesTTD: "bg-teal-500/15 text-teal-400 border-teal-500/25",
+  // Pastel biru/oranye senada dashboard — biru = berjalan baik, oranye = perlu perhatian.
+  Aktif: "bg-mist text-indigo-400 border-transparent",
+  TidakAktif: "bg-slate-800 text-slate-400 border-transparent",
+  Draft: "bg-slate-800 text-slate-300 border-transparent",
+  OnReview: "bg-peach text-brand-orange border-transparent",
+  FullyApproved: "bg-mist text-indigo-400 border-transparent",
+  Archived: "bg-slate-800 text-slate-400 border-transparent",
+  Terminated: "bg-peach text-brand-orange border-transparent",
+  ReviewInternalEksternal: "bg-peach text-brand-orange border-transparent",
+  RevisiNegosiasi: "bg-peach text-brand-orange border-transparent",
+  Finalisasi: "bg-mist text-indigo-400 border-transparent",
+  ProsesTTD: "bg-mist text-indigo-400 border-transparent",
 };
 // Bentuk LegalJob yang dikembalikan API (lihat withLinkedContract di
 // server.ts) — nempel field `linkedContract` di atas LegalJob biasa, dihitung
@@ -2585,6 +2924,33 @@ function fmtDateTimeID(s?: string): string {
   try { return new Date(s).toLocaleString("id-ID", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }); } catch { return s; }
 }
 
+// Buka/unduh lampiran Pekerjaan Legal lewat endpoint server (bukan href mentah
+// ke /uploads). Href mentah jatuh ke fallback SPA kalau berkasnya tak ada di
+// disk, sehingga malah membuka halaman aplikasi (Monitoring Kontrak). Jendela
+// dibuka SINKRON dulu (anti popup-blocker), lalu diarahkan ke blob hasil fetch.
+async function openLegalJobDocument(
+  jobId: string, doc: { id: string; name: string }, mode: "view" | "download",
+  notify: (t: string, k?: "error" | "success") => void,
+) {
+  const w = mode === "view" ? window.open("", "_blank") : null;
+  try {
+    const res = await fetch(`/api/legal-jobs/${jobId}/documents/${doc.id}/file`);
+    if (!res.ok) {
+      let msg = "Gagal membuka berkas.";
+      try { msg = (await res.json()).error || msg; } catch { /* bukan JSON */ }
+      w?.close(); notify(msg); return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    if (w) { w.location.href = url; }
+    else {
+      const a = document.createElement("a");
+      a.href = url; a.download = doc.name;
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch { w?.close(); notify("Gagal terhubung ke server."); }
+}
+
 // Halaman "Pekerjaan Legal" — tombol Tambah Pekerjaan Legal membuka modal
 // Bagikan Link Formulir (bukan form internal lagi); pekerjaan yang masuk
 // dari form eksternal direview lewat tabel "Pekerjaan Masuk" sebelum masuk
@@ -2599,6 +2965,8 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
   };
 
   const [shareOpen, setShareOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+  const [inputOpen, setInputOpen] = useState(false);
   const [approveJob, setApproveJob] = useState<LegalJob | null>(null);
   const [rejectJob, setRejectJob] = useState<LegalJob | null>(null);
   const [detailJob, setDetailJob] = useState<LegalJobWithLink | null>(null);
@@ -2634,51 +3002,38 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       {toast && (
-        <div className={`fixed top-5 right-5 z-[100] animate-fadeIn shadow-2xl flex items-center gap-2.5 pl-3.5 pr-4 py-3 rounded-lg border bg-white max-w-sm ${toast.kind === "error" ? "border-rose-400" : "border-emerald-400"}`}>
-          {toast.kind === "error" ? <AlertTriangle className="text-rose-500 w-4 h-4 shrink-0" /> : <CheckCircle className="text-emerald-500 w-4 h-4 shrink-0" />}
-          <p className="text-[13px] font-semibold leading-snug text-slate-800">{toast.text}</p>
+        <div className="fixed top-5 right-5 z-[100] animate-fadeIn card-soft bg-slate-900 flex items-center gap-2.5 pl-3 pr-5 py-3 rounded-full max-w-sm" role="status" aria-live="polite">
+          <span className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${toast.kind === "error" ? "bg-peach" : "bg-mist"}`}>
+            {toast.kind === "error" ? <AlertTriangle className="text-brand-orange w-3.5 h-3.5" /> : <CheckCircle className="text-indigo-400 w-3.5 h-3.5" />}
+          </span>
+          <p className="text-[12.5px] font-semibold leading-snug text-slate-100">{toast.text}</p>
         </div>
       )}
 
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="space-y-1">
-          <h2 className="text-xl font-semibold text-slate-100 tracking-tight">Pekerjaan Legal</h2>
-          <p className="text-[13px] text-slate-500 max-w-xl">Kelola seluruh pekerjaan Legal dari awal hingga selesai.</p>
-        </div>
-        <button onClick={() => setShareOpen(true)} className="flex items-center gap-2 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[13px] font-semibold transition cursor-pointer shrink-0">
-          <Plus className="w-4 h-4" /> Tambah Pekerjaan Legal
-        </button>
-      </div>
+      <LegalHero Icon={Briefcase} title="Pekerjaan Legal" sub="Kelola seluruh pekerjaan Legal dari awal hingga selesai."
+        right={<button onClick={() => setAddOpen(true)} className="flex items-center gap-2 px-5 py-2.5 rounded-full btn-grad-primary text-white text-xs font-bold cursor-pointer"><Plus className="w-4 h-4" /> Tambah Pekerjaan Legal</button>} />
 
       {/* Kartu ringkasan status — klik untuk filter tabel utama di bawah. */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-3">
         {cardStatuses.map((s) => (
-          <button key={s} onClick={() => setStatusFilter(s === statusFilter ? "semua" : s)}
-            className={`text-left p-3 rounded-xl border transition cursor-pointer ${statusFilter === s ? "bg-indigo-600/20 border-indigo-500/40" : "bg-slate-900/60 border-slate-800 hover:border-slate-700"}`}>
-            <p className="text-lg font-bold text-slate-100">{countOf(s)}</p>
-            <p className="text-[10.5px] text-slate-500 leading-tight mt-0.5">{LEGAL_STATUS_LABEL[s]}</p>
-          </button>
+          <LegalStatCard key={s} status={s} count={countOf(s)} active={statusFilter === s} onClick={() => setStatusFilter(s === statusFilter ? "semua" : s)} />
         ))}
       </div>
 
       {/* ===== Tabel "Pekerjaan Masuk" (Belum Diproses) ===== */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-        <div className="p-4 flex items-center gap-2 border-b border-slate-800">
-          <Inbox className="w-4 h-4 text-amber-400" />
-          <h3 className="text-sm font-semibold text-slate-100">Pekerjaan Masuk <span className="text-slate-500 font-normal">(Belum Diproses)</span></h3>
-          <span className="ml-auto text-[11px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/25 font-semibold">{incoming.length} menunggu</span>
-        </div>
+      <LegalPanel Icon={Inbox} tone="peach" title="Pekerjaan Masuk" subtitle="Belum diproses — dari formulir eksternal"
+        right={<span className="text-[11px] px-3 py-1 rounded-full bg-peach text-brand-orange font-semibold whitespace-nowrap">{incoming.length} menunggu</span>}>
         {loading ? (
-          <p className="p-6 text-center text-xs text-slate-500">Memuat…</p>
+          <p className="py-6 text-center text-xs text-slate-500">Memuat…</p>
         ) : incoming.length === 0 ? (
-          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan masuk dari formulir eksternal.</p>
+          <p className="py-6 text-center text-xs text-slate-500">Belum ada pekerjaan masuk dari formulir eksternal.</p>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto no-scrollbar">
             <table className="w-full text-[12.5px]">
               <thead>
-                <tr className="text-left text-slate-500 border-b border-slate-800">
+                <tr className="text-left text-slate-500">
                   <th className="p-3 font-semibold">Judul Pekerjaan</th>
                   <th className="p-3 font-semibold">Partner/Pihak</th>
                   <th className="p-3 font-semibold">Jenis</th>
@@ -2691,22 +3046,29 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
               </thead>
               <tbody>
                 {incoming.map((j) => (
-                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
-                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                  <tr key={j.id}>
+                    <td className="p-3 font-medium text-slate-100">{j.title}</td>
                     <td className="p-3 text-slate-400">{j.partnerName}</td>
                     <td className="p-3 text-slate-400">{j.docType}</td>
                     <td className="p-3 text-slate-400">{j.picName}</td>
                     <td className="p-3 text-slate-400">{fmtDateID(j.deadline)}</td>
                     <td className="p-3">
                       {j.documents.length > 0 ? (
-                        <a href={j.documents[0].url} target="_blank" rel="noreferrer" className="text-indigo-400 hover:underline text-[11.5px]">Lihat berkas</a>
-                      ) : <span className="text-slate-600">—</span>}
+                        <div className="flex flex-col gap-0.5">
+                          {j.documents.map((d, di) => (
+                            <button key={d.id} type="button" onClick={() => openLegalJobDocument(j.id, d, "view", notify)}
+                              title={d.name} className="text-left text-[#3a7fa8] font-semibold hover:underline text-[11.5px] cursor-pointer max-w-[160px] truncate">
+                              {j.documents.length > 1 ? `Berkas ${di + 1}: ${d.name}` : "Lihat berkas"}
+                            </button>
+                          ))}
+                        </div>
+                      ) : <span className="text-slate-500">—</span>}
                     </td>
                     <td className="p-3 text-slate-500">{fmtDateTimeID(j.createdAt)}</td>
                     <td className="p-3">
                       <div className="flex items-center justify-end gap-1.5">
-                        <button onClick={() => setApproveJob(j)} title="Setujui" className="p-1.5 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 cursor-pointer"><ThumbsUp className="w-3.5 h-3.5" /></button>
-                        <button onClick={() => setRejectJob(j)} title="Tidak Disetujui" className="p-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 cursor-pointer"><ThumbsDown className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => setApproveJob(j)} title="Setujui" className="w-8 h-8 rounded-full bg-mist hover:brightness-95 text-indigo-400 flex items-center justify-center cursor-pointer"><ThumbsUp className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => setRejectJob(j)} title="Tidak Disetujui" className="w-8 h-8 rounded-full bg-peach hover:brightness-95 text-brand-orange flex items-center justify-center cursor-pointer"><ThumbsDown className="w-3.5 h-3.5" /></button>
                       </div>
                     </td>
                   </tr>
@@ -2715,28 +3077,26 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
             </table>
           </div>
         )}
-      </div>
+      </LegalPanel>
 
       {/* ===== Tabel "Pekerjaan Legal" Utama ===== */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-        <div className="p-4 flex flex-wrap items-center gap-2 border-b border-slate-800">
-          <Layers className="w-4 h-4 text-indigo-400" />
-          <h3 className="text-sm font-semibold text-slate-100">Pekerjaan Legal</h3>
-          <div className="ml-auto flex items-center gap-2">
+      <LegalPanel Icon={Layers} title="Daftar Pekerjaan Legal" subtitle={statusFilter === "semua" ? "Semua status" : `Filter: ${LEGAL_STATUS_LABEL[statusFilter]}`}
+        right={
+          <div className="flex items-center gap-2 bg-slate-950 rounded-full pl-3 pr-2 py-1.5">
             <Filter className="w-3.5 h-3.5 text-slate-500" />
-            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="bg-slate-950 border border-slate-800 rounded-lg text-[12px] px-2 py-1.5 text-slate-300 focus:outline-none focus:border-indigo-500">
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="bg-transparent text-[12px] text-slate-300 focus:outline-none cursor-pointer" style={{ border: "none", boxShadow: "none" }}>
               <option value="semua">Semua Status</option>
               {LEGAL_WORKFLOW_ORDER.map((s) => <option key={s} value={s}>{LEGAL_STATUS_LABEL[s]}</option>)}
             </select>
           </div>
-        </div>
+        }>
         {mainJobs.length === 0 ? (
-          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan pada status ini.</p>
+          <p className="py-6 text-center text-xs text-slate-500">Belum ada pekerjaan pada status ini.</p>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto no-scrollbar">
             <table className="w-full text-[12.5px]">
               <thead>
-                <tr className="text-left text-slate-500 border-b border-slate-800">
+                <tr className="text-left text-slate-500">
                   <th className="p-3 font-semibold">Judul Pekerjaan</th>
                   <th className="p-3 font-semibold">Jenis</th>
                   <th className="p-3 font-semibold">Partner</th>
@@ -2749,27 +3109,27 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
               </thead>
               <tbody>
                 {mainJobs.map((j) => (
-                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
-                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                  <tr key={j.id}>
+                    <td className="p-3 font-medium text-slate-100">{j.title}</td>
                     <td className="p-3 text-slate-400">{j.docType}</td>
                     <td className="p-3 text-slate-400">{j.partnerName}</td>
                     <td className="p-3 text-slate-400">{j.picName}</td>
                     <td className="p-3">
                       {j.linkedContract ? (
                         <div className="flex flex-col gap-0.5 w-fit">
-                          <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[j.linkedContract.status] || "bg-slate-500/15 text-slate-400 border-slate-500/25"}`}>
+                          <span className={`text-[11px] px-2.5 py-1 rounded-full font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[j.linkedContract.status] || "bg-slate-800 text-slate-400"}`}>
                             {CONTRACT_STATUS_LABEL_ID[j.linkedContract.status] || j.linkedContract.status}
                           </span>
-                          <button onClick={() => onOpenContract(j.linkedContract!.id)} className="text-[9.5px] text-indigo-400 hover:underline text-left cursor-pointer">mengikuti Kontrak →</button>
+                          <button onClick={() => onOpenContract(j.linkedContract!.id)} className="text-[9.5px] text-[#3a7fa8] font-semibold hover:underline text-left cursor-pointer pl-1">mengikuti Kontrak →</button>
                         </div>
                       ) : (
-                        <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold whitespace-nowrap">{LEGAL_STATUS_LABEL[j.status]}</span>
+                        <span className={LEGAL_PILL}>{LEGAL_STATUS_LABEL[j.status]}</span>
                       )}
                     </td>
                     <td className="p-3 text-slate-400">{fmtDateID(j.deadline)}</td>
-                    <td className="p-3">{j.priority && <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}</td>
+                    <td className="p-3">{j.priority && <span className={`text-[11px] px-2.5 py-1 rounded-full font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}</td>
                     <td className="p-3 text-right">
-                      <button onClick={() => setDetailJob(j)} className="text-indigo-400 hover:underline text-[12px] font-semibold cursor-pointer">Lihat Detail</button>
+                      <button onClick={() => setDetailJob(j)} className="px-3.5 py-1.5 rounded-full bg-mist text-indigo-400 hover:brightness-95 text-[11.5px] font-semibold cursor-pointer whitespace-nowrap">Lihat Detail</button>
                     </td>
                   </tr>
                 ))}
@@ -2777,22 +3137,18 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
             </table>
           </div>
         )}
-      </div>
+      </LegalPanel>
 
       {/* ===== Tabel "Ditolak / Arsip Penolakan" ===== */}
-      <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-        <div className="p-4 flex items-center gap-2 border-b border-slate-800">
-          <FileX className="w-4 h-4 text-rose-400" />
-          <h3 className="text-sm font-semibold text-slate-100">Ditolak <span className="text-slate-500 font-normal">/ Arsip Penolakan</span></h3>
-          <span className="ml-auto text-[11px] px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-400 border border-rose-500/25 font-semibold">{rejected.length}</span>
-        </div>
+      <LegalPanel Icon={FileX} title="Ditolak" subtitle="Arsip penolakan"
+        right={<span className="text-[11px] px-3 py-1 rounded-full bg-slate-950 text-slate-400 font-semibold">{rejected.length}</span>}>
         {rejected.length === 0 ? (
-          <p className="p-6 text-center text-xs text-slate-500">Belum ada pekerjaan yang ditolak.</p>
+          <p className="py-6 text-center text-xs text-slate-500">Belum ada pekerjaan yang ditolak.</p>
         ) : (
-          <div className="overflow-x-auto">
+          <div className="overflow-x-auto no-scrollbar">
             <table className="w-full text-[12.5px]">
               <thead>
-                <tr className="text-left text-slate-500 border-b border-slate-800">
+                <tr className="text-left text-slate-500">
                   <th className="p-3 font-semibold">Judul Pekerjaan</th>
                   <th className="p-3 font-semibold">Partner</th>
                   <th className="p-3 font-semibold">Alasan Penolakan</th>
@@ -2802,8 +3158,8 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
               </thead>
               <tbody>
                 {rejected.map((j) => (
-                  <tr key={j.id} className="border-b border-slate-800/60 hover:bg-slate-800/20">
-                    <td className="p-3 font-medium text-slate-200">{j.title}</td>
+                  <tr key={j.id}>
+                    <td className="p-3 font-medium text-slate-100">{j.title}</td>
                     <td className="p-3 text-slate-400">{j.partnerName}</td>
                     <td className="p-3 text-slate-400 max-w-xs truncate" title={j.rejectionReason}>{j.rejectionReason}</td>
                     <td className="p-3 text-slate-400">{j.rejectedByName}</td>
@@ -2814,8 +3170,16 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
             </table>
           </div>
         )}
-      </div>
-
+      </LegalPanel>
+      {addOpen && (
+        <AddLegalJobChooser onClose={() => setAddOpen(false)}
+          onShare={() => { setAddOpen(false); setShareOpen(true); }}
+          onDirect={() => { setAddOpen(false); setInputOpen(true); }} />
+      )}
+      {inputOpen && (
+        <DirectLegalJobModal onClose={() => setInputOpen(false)} notify={notify}
+          onSaved={async () => { setInputOpen(false); notify("Pekerjaan disimpan dan langsung masuk alur kerja (Draft).", "success"); setStatusFilter("semua"); await fetchJobs(); }} />
+      )}
       {shareOpen && <ShareFormLinkModal onClose={() => setShareOpen(false)} notify={notify} />}
       {approveJob && (
         <ApprovePriorityModal
@@ -2849,6 +3213,130 @@ function PekerjaanLegalPage({ currentUser, onOpenContract }: { currentUser: any;
           onOpenContract={onOpenContract}
         />
       )}
+    </div>
+  );
+}
+
+// Pilihan cara menambah pekerjaan: diisi PIC pemberi (link/QR) atau diinput Staff Legal.
+function AddLegalJobChooser({ onClose, onShare, onDirect }: { onClose: () => void; onShare: () => void; onDirect: () => void }) {
+  const Opt = ({ Icon, title, desc, tag, onClick }: { Icon: any; title: string; desc: string; tag: string; onClick: () => void }) => (
+    <button onClick={onClick} className="text-left p-5 rounded-[22px] card-grad card-soft bg-slate-900 hover:brightness-[1.02] hover:-translate-y-0.5 transition cursor-pointer flex flex-col gap-3 relative overflow-hidden">
+      <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center"><Icon className="w-5 h-5 text-slate-300" /></span>
+      <div className="space-y-1">
+        <h4 className="text-[15px] font-semibold text-slate-100 leading-snug">{title}</h4>
+        <p className="text-[12px] text-slate-400 leading-relaxed">{desc}</p>
+      </div>
+      <span className="mt-auto self-start text-[10.5px] font-semibold px-2.5 py-1 rounded-full bg-mist text-indigo-400">{tag}</span>
+    </button>
+  );
+  return (
+    <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="modal-panel relative w-full max-w-2xl max-h-[90vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] space-y-5">
+        <button type="button" onClick={onClose} aria-label="Tutup" className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 flex items-center justify-center cursor-pointer"><X className="w-4 h-4" /></button>
+        <div className="flex items-start gap-3 pr-10">
+          <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Plus className="w-5 h-5 text-slate-300" /></span>
+          <div>
+            <h3 className="text-[18px] font-semibold text-slate-100 leading-tight">Tambah Pekerjaan Legal</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Pilih siapa yang mengisi data pekerjaan ini.</p>
+          </div>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Opt Icon={QrCode} title="Diisi oleh PIC pemberi pekerjaan" desc="Bagikan link / QR formulir. PIC mengisi sendiri, lalu masuk ke “Pekerjaan Masuk” untuk Anda setujui dan beri prioritas." tag="Perlu persetujuan" onClick={onShare} />
+          <Opt Icon={Pencil} title="Diinput langsung oleh Staff Legal" desc="Isi formulirnya sendiri bila PIC tidak sempat. Pekerjaan langsung masuk alur kerja (Draft) dengan prioritas yang Anda pilih." tag="Langsung masuk Draft" onClick={onDirect} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Form input langsung oleh Staff Legal (POST /api/legal-jobs).
+function DirectLegalJobModal({ onClose, notify, onSaved }: { onClose: () => void; notify: (t: string, k?: "error" | "success") => void; onSaved: () => void }) {
+  const [f, setF] = useState({ title: "", partnerName: "", docType: "", picName: "", deadline: "", priority: "", description: "", submitterName: "" });
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+  const set = (k: keyof typeof f) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => setF((x) => ({ ...x, [k]: e.target.value }));
+  const inp = "w-full px-4 py-2.5 bg-slate-950 rounded-full text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none";
+  const lbl = "text-[10px] font-bold uppercase tracking-wider text-slate-500";
+
+  const pickFile = (picked: File | null) => {
+    if (!picked) { setFile(null); return; }
+    const ok = ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "image/jpeg", "image/png"].includes(picked.type);
+    if (!ok) { notify("Format berkas tidak didukung. Gunakan PDF, DOC, DOCX, XLS, XLSX, JPG, atau PNG."); return; }
+    if (picked.size > 10 * 1024 * 1024) { notify("Ukuran berkas maksimal 10MB."); return; }
+    setFile(picked);
+  };
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!f.title.trim()) return notify("Judul Pekerjaan wajib diisi.");
+    if (!f.partnerName.trim()) return notify("Partner/Pihak wajib diisi.");
+    if (!f.docType.trim()) return notify("Jenis Dokumen wajib diisi.");
+    const pe = legalPicError(f.picName); if (pe) return notify(pe);
+    if (!f.deadline) return notify("Deadline wajib diisi.");
+    if (!f.priority) return notify("Prioritas wajib dipilih.");
+    setBusy(true);
+    try {
+      const fd = new FormData();
+      Object.entries(f).forEach(([k, v]) => fd.append(k, String(v)));
+      if (file) fd.append("file", file);
+      const res = await fetch("/api/legal-jobs", { method: "POST", body: fd });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) notify(j.error || "Gagal menyimpan pekerjaan.");
+      else onSaved();
+    } catch { notify("Gagal terhubung ke server."); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={onClose}>
+      <form onSubmit={submit} onClick={(e) => e.stopPropagation()} className="modal-panel relative w-full max-w-2xl max-h-[92vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] space-y-4">
+        <button type="button" onClick={onClose} aria-label="Tutup" className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 flex items-center justify-center cursor-pointer"><X className="w-4 h-4" /></button>
+        <div className="flex items-start gap-3 pr-10">
+          <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Pencil className="w-5 h-5 text-slate-300" /></span>
+          <div>
+            <h3 className="text-[18px] font-semibold text-slate-100 leading-tight">Input Pekerjaan oleh Staff Legal</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Langsung masuk alur kerja utama (status Draft) — tanpa tahap persetujuan.</p>
+          </div>
+        </div>
+
+        <div className="space-y-1.5"><label className={lbl}>Judul Pekerjaan *</label><input value={f.title} onChange={set("title")} placeholder='Contoh: "PKS ASMaT ZTrans"' className={inp} autoFocus /></div>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <div className="space-y-1.5"><label className={lbl}>Partner / Pihak *</label><input value={f.partnerName} onChange={set("partnerName")} placeholder="Nama partner/mitra" className={inp} /></div>
+          <div className="space-y-1.5"><label className={lbl}>Jenis Dokumen *</label><input value={f.docType} onChange={set("docType")} placeholder='Contoh: "PKS", "NDA", "Addendum"' className={inp} /></div>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <div className="space-y-1.5"><label className={lbl}>PIC Pemberi Pekerjaan *</label><LegalPicSelect value={f.picName} onChange={(v) => setF((x) => ({ ...x, picName: v }))} className={inp} /></div>
+          <div className="space-y-1.5"><label className={lbl}>Deadline *</label><input type="date" value={f.deadline} onChange={set("deadline")} className={inp} /></div>
+        </div>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <div className="space-y-1.5">
+            <label className={lbl}>Prioritas *</label>
+            <div className="grid grid-cols-3 gap-2">
+              {["Tinggi", "Sedang", "Rendah"].map((p) => (
+                <button key={p} type="button" onClick={() => setF((x) => ({ ...x, priority: p }))}
+                  className={`py-2.5 rounded-full text-xs font-bold cursor-pointer transition ${f.priority === p ? LEGAL_PRIORITY_STYLE[p] + " ring-2 ring-soft-blue/60" : "bg-slate-950 text-slate-400 hover:text-slate-100"}`}>{p}</button>
+              ))}
+            </div>
+          </div>
+          <div className="space-y-1.5"><label className={lbl}>Nama Requester <span className="normal-case font-normal">(opsional)</span></label><input value={f.submitterName} onChange={set("submitterName")} placeholder="Orang yang meminta pekerjaan ini" className={inp} /></div>
+        </div>
+        <div className="space-y-1.5"><label className={lbl}>Keterangan <span className="normal-case font-normal">(opsional)</span></label>
+          <textarea value={f.description} onChange={set("description")} rows={3} placeholder="Deskripsi tambahan pekerjaan" className="w-full px-4 py-3 bg-slate-950 rounded-[18px] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none" /></div>
+        <div className="space-y-1.5">
+          <label className={lbl}>Upload Dokumen <span className="normal-case font-normal">(opsional)</span></label>
+          <button type="button" onClick={() => fileRef.current?.click()} className="w-full flex items-center justify-center gap-2 py-3 rounded-full bg-mist text-indigo-400 hover:brightness-95 text-[12px] font-semibold cursor-pointer">
+            <Upload className="w-3.5 h-3.5" /> {file ? file.name : "Pilih berkas (PDF, DOC, XLS, JPG, PNG — maks. 10MB)"}
+          </button>
+          <input ref={fileRef} type="file" className="hidden" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png" onChange={(e) => { pickFile(e.target.files?.[0] || null); e.target.value = ""; }} />
+          {file && <button type="button" onClick={() => setFile(null)} className="text-[11px] text-slate-500 hover:text-slate-300 cursor-pointer pl-2">Hapus berkas</button>}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button type="button" onClick={onClose} className={LEGAL_BTN_GHOST}>Batal</button>
+          <button type="submit" disabled={busy} className={LEGAL_BTN_PRIMARY}><Plus className="w-3.5 h-3.5" /> {busy ? "Menyimpan…" : "Simpan Pekerjaan"}</button>
+        </div>
+      </form>
     </div>
   );
 }
@@ -2892,92 +3380,72 @@ function ShareFormLinkModal({ onClose, notify }: { onClose: () => void; notify: 
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
-        <div className="p-5 border-b border-slate-800 flex items-center justify-between">
-          <h3 className="font-bold text-slate-100 text-sm">Bagikan Link Formulir</h3>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-200 cursor-pointer"><X className="w-4 h-4" /></button>
-        </div>
-        <div className="p-5 space-y-4">
-          <p className="text-[12.5px] text-slate-400 leading-relaxed">Bagikan link ini ke pihak eksternal (marketing, partner, divisi lain) untuk mengajukan Pekerjaan Legal. Prioritas ditentukan oleh Staff Legal saat approve, bukan oleh pengisi.</p>
-          {loading ? (
-            <p className="text-xs text-slate-500 text-center py-4">Memuat…</p>
-          ) : data ? (
-            <>
-              <div className="flex items-center gap-2">
-                <input readOnly value={data.url} className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-[11.5px] text-slate-300 font-mono truncate" />
-                <button onClick={copyLink} className="shrink-0 flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg cursor-pointer">
-                  <Copy className="w-3.5 h-3.5" /> {copied ? "Tersalin!" : "Copy"}
-                </button>
-              </div>
-              <div className="flex flex-col items-center gap-2 py-3 border-y border-slate-800">
-                <img src={data.qrDataUrl} alt="QR Code formulir" className="w-40 h-40 rounded-lg bg-white p-2" />
-                <p className="text-[10.5px] text-slate-500 flex items-center gap-1"><QrCode className="w-3 h-3" /> Scan untuk membuka formulir</p>
-              </div>
-              {!confirmRegen ? (
-                <button onClick={() => setConfirmRegen(true)} className="w-full text-center text-[12px] font-semibold text-rose-400 hover:text-rose-300 cursor-pointer">Generate Ulang Link</button>
-              ) : (
-                <div className="bg-rose-500/10 border border-rose-500/25 rounded-xl p-3 space-y-2">
-                  <p className="text-[11.5px] text-rose-300">Link lama akan langsung tidak berlaku. Lanjutkan?</p>
-                  <div className="flex gap-2">
-                    <button onClick={regenerate} disabled={busy} className="flex-1 py-1.5 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg cursor-pointer">{busy ? "Memproses…" : "Ya, Generate Ulang"}</button>
-                    <button onClick={() => setConfirmRegen(false)} className="flex-1 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-lg cursor-pointer">Batal</button>
-                  </div>
-                </div>
-              )}
-            </>
+    <LegalModal Icon={QrCode} title="Bagikan Link Formulir" sub="Untuk pihak eksternal mengajukan Pekerjaan Legal" onClose={onClose} wide>
+      <p className="text-[12.5px] text-slate-400 leading-relaxed">Bagikan link ini ke pihak eksternal (marketing, partner, divisi lain) untuk mengajukan Pekerjaan Legal. Prioritas ditentukan oleh Staff Legal saat approve, bukan oleh pengisi.</p>
+      {loading ? (
+        <p className="text-xs text-slate-500 text-center py-4">Memuat…</p>
+      ) : data ? (
+        <>
+          <div className="flex items-center gap-2">
+            <input readOnly value={data.url} className="flex-1 min-w-0 px-4 py-2.5 bg-slate-950 rounded-full text-[11.5px] text-slate-300 font-mono truncate focus:outline-none" />
+            <button onClick={copyLink} className="shrink-0 flex items-center gap-1.5 px-5 py-2.5 rounded-full btn-grad-primary text-white text-xs font-bold cursor-pointer">
+              <Copy className="w-3.5 h-3.5" /> {copied ? "Tersalin!" : "Copy"}
+            </button>
+          </div>
+          <div className="flex flex-col items-center gap-2 py-4 rounded-[22px] bg-slate-950">
+            <img src={data.qrDataUrl} alt="QR Code formulir" className="w-40 h-40 rounded-[18px] bg-white p-2" />
+            <p className="text-[10.5px] text-slate-500 flex items-center gap-1"><QrCode className="w-3 h-3" /> Scan untuk membuka formulir</p>
+          </div>
+          {!confirmRegen ? (
+            <button onClick={() => setConfirmRegen(true)} className="w-full text-center text-[12px] font-semibold text-brand-orange hover:underline cursor-pointer">Generate Ulang Link</button>
           ) : (
-            <p className="text-xs text-rose-400 text-center py-4">Gagal memuat link.</p>
+            <div className="bg-peach rounded-[18px] p-3.5 space-y-2.5">
+              <p className="text-[11.5px] text-brand-orange font-medium">Link lama akan langsung tidak berlaku. Lanjutkan?</p>
+              <div className="flex gap-2">
+                <button onClick={regenerate} disabled={busy} className="flex-1 py-2 rounded-full bg-brand-orange hover:brightness-105 disabled:opacity-50 text-white text-xs font-bold cursor-pointer">{busy ? "Memproses…" : "Ya, Generate Ulang"}</button>
+                <button onClick={() => setConfirmRegen(false)} className="flex-1 py-2 rounded-full bg-slate-900 text-slate-400 hover:text-slate-100 text-xs font-semibold cursor-pointer">Batal</button>
+              </div>
+            </div>
           )}
-        </div>
-      </div>
-    </div>
+        </>
+      ) : (
+        <p className="text-xs text-brand-orange text-center py-4">Gagal memuat link.</p>
+      )}
+    </LegalModal>
   );
 }
 
 function ApprovePriorityModal({ job, onClose, onConfirm }: { job: LegalJob; onClose: () => void; onConfirm: (priority: string) => void }) {
   const [priority, setPriority] = useState<string>("");
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden">
-        <div className="p-5 space-y-3">
-          <h3 className="font-bold text-slate-100 text-sm">Setujui &amp; Pilih Prioritas</h3>
-          <p className="text-[12px] text-slate-400">"{job.title}" — {job.partnerName}</p>
-          <div className="grid grid-cols-3 gap-2 pt-1">
-            {["Tinggi", "Sedang", "Rendah"].map((p) => (
-              <button key={p} onClick={() => setPriority(p)}
-                className={`py-2 rounded-xl text-xs font-bold border cursor-pointer transition ${priority === p ? LEGAL_PRIORITY_STYLE[p] + " ring-1 ring-inset" : "bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700"}`}>
-                {p}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="p-4 border-t border-slate-800 flex justify-end gap-2.5">
-          <button onClick={onClose} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl cursor-pointer">Batal</button>
-          <button onClick={() => priority && onConfirm(priority)} disabled={!priority} className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-bold rounded-xl cursor-pointer">Simpan</button>
-        </div>
+    <LegalModal Icon={ThumbsUp} title="Setujui & Pilih Prioritas" sub={`"${job.title}" — ${job.partnerName}`} onClose={onClose}
+      footer={<>
+        <button onClick={onClose} className={LEGAL_BTN_GHOST}>Batal</button>
+        <button onClick={() => priority && onConfirm(priority)} disabled={!priority} className={LEGAL_BTN_PRIMARY}>Simpan</button>
+      </>}>
+      <div className="grid grid-cols-3 gap-2 pt-1">
+        {["Tinggi", "Sedang", "Rendah"].map((p) => (
+          <button key={p} onClick={() => setPriority(p)}
+            className={`py-2.5 rounded-full text-xs font-bold cursor-pointer transition ${priority === p ? LEGAL_PRIORITY_STYLE[p] + " ring-2 ring-soft-blue/60" : "bg-slate-950 text-slate-400 hover:text-slate-100"}`}>
+            {p}
+          </button>
+        ))}
       </div>
-    </div>
+    </LegalModal>
   );
 }
 
 function RejectReasonModal({ job, onClose, onConfirm }: { job: LegalJob; onClose: () => void; onConfirm: (reason: string) => void }) {
   const [reason, setReason] = useState("");
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-fadeIn">
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm shadow-2xl overflow-hidden">
-        <div className="p-5 space-y-3">
-          <h3 className="font-bold text-slate-100 text-sm">Alasan Penolakan</h3>
-          <p className="text-[12px] text-slate-400">"{job.title}" — {job.partnerName}</p>
-          <textarea autoFocus value={reason} onChange={(e) => setReason(e.target.value)} rows={4} placeholder="Wajib diisi — alasan ini akan tersimpan di arsip penolakan."
-            className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-rose-500" />
-        </div>
-        <div className="p-4 border-t border-slate-800 flex justify-end gap-2.5">
-          <button onClick={onClose} className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold rounded-xl cursor-pointer">Batal</button>
-          <button onClick={() => reason.trim() && onConfirm(reason.trim())} disabled={!reason.trim()} className="px-5 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-40 text-white text-xs font-bold rounded-xl cursor-pointer">Tidak Disetujui</button>
-        </div>
-      </div>
-    </div>
+    <LegalModal Icon={ThumbsDown} title="Alasan Penolakan" sub={`"${job.title}" — ${job.partnerName}`} onClose={onClose}
+      footer={<>
+        <button onClick={onClose} className={LEGAL_BTN_GHOST}>Batal</button>
+        <button onClick={() => reason.trim() && onConfirm(reason.trim())} disabled={!reason.trim()} className="px-6 py-2.5 rounded-full bg-brand-orange hover:brightness-105 text-white text-xs font-bold cursor-pointer disabled:opacity-50 disabled:cursor-default">Tidak Disetujui</button>
+      </>}>
+      <textarea autoFocus value={reason} onChange={(e) => setReason(e.target.value)} rows={4} placeholder="Wajib diisi — alasan ini akan tersimpan di arsip penolakan."
+        className="w-full px-4 py-3 bg-slate-950 rounded-[18px] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none" />
+    </LegalModal>
   );
 }
 
@@ -3016,34 +3484,37 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-black/50 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-slate-900 border-l border-slate-800 w-full max-w-lg h-full overflow-y-auto shadow-2xl">
-        <div className="p-5 border-b border-slate-800 flex items-start justify-between sticky top-0 bg-slate-900 z-10">
-          <div>
-            <p className="text-[10.5px] uppercase tracking-wide text-slate-500 font-bold">Detail Pekerjaan Legal</p>
-            <h3 className="font-bold text-slate-100 text-base mt-0.5">{job.title}</h3>
+    <div className="modal-backdrop fixed inset-0 z-[60] flex justify-end" onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="modal-panel bg-slate-900 w-full max-w-lg h-full overflow-y-auto no-scrollbar rounded-l-[28px]">
+        <div className="px-6 pt-6 pb-4 flex items-start justify-between gap-3 sticky top-0 bg-slate-900 z-10">
+          <div className="flex items-start gap-3 min-w-0">
+            <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Briefcase className="w-5 h-5 text-slate-300" /></span>
+            <div className="min-w-0">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500 font-bold">Detail Pekerjaan Legal</p>
+              <h3 className="font-semibold text-slate-100 text-[17px] leading-snug mt-0.5">{job.title}</h3>
+            </div>
           </div>
-          <button onClick={onClose} className="text-slate-500 hover:text-slate-200 cursor-pointer"><X className="w-5 h-5" /></button>
+          <button onClick={onClose} aria-label="Tutup" className="w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 flex items-center justify-center cursor-pointer shrink-0"><X className="w-4 h-4" /></button>
         </div>
 
-        <div className="p-5 space-y-5">
+        <div className="px-6 pb-6 space-y-5">
           {/* Info umum */}
-          <div className="grid grid-cols-2 gap-x-4 gap-y-2.5 text-[12.5px]">
+          <div className="card-grad card-soft bg-slate-900 rounded-[22px] p-4 grid grid-cols-2 gap-x-4 gap-y-3 text-[12.5px]">
             <InfoField label="Jenis" value={job.docType} />
             <InfoField label="Partner" value={job.partnerName} />
             <InfoField label="PIC Pemberi" value={job.picName} />
             <InfoField label="Deadline" value={fmtDateID(job.deadline)} />
             <InfoField label="Status" value={job.linkedContract
-              ? <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${CONTRACT_STATUS_BADGE_CLASS[job.linkedContract.status] || ""}`}>{CONTRACT_STATUS_LABEL_ID[job.linkedContract.status] || job.linkedContract.status}</span>
-              : <span className="text-[11px] px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold">{LEGAL_STATUS_LABEL[job.status]}</span>} />
-            <InfoField label="Prioritas" value={job.priority ? <span className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[job.priority]}`}>{job.priority}</span> : "—"} />
+              ? <span className={`text-[11px] px-2.5 py-1 rounded-full font-semibold ${CONTRACT_STATUS_BADGE_CLASS[job.linkedContract.status] || ""}`}>{CONTRACT_STATUS_LABEL_ID[job.linkedContract.status] || job.linkedContract.status}</span>
+              : <span className={LEGAL_PILL}>{LEGAL_STATUS_LABEL[job.status]}</span>} />
+            <InfoField label="Prioritas" value={job.priority ? <span className={`text-[11px] px-2.5 py-1 rounded-full font-semibold ${LEGAL_PRIORITY_STYLE[job.priority]}`}>{job.priority}</span> : "—"} />
             <InfoField label="Sumber" value={job.source === "eksternal" ? "Formulir Eksternal" : "Input Internal"} />
             <InfoField label="Tgl. Request" value={fmtDateID(job.createdAt)} />
           </div>
           {job.description && (
             <div>
-              <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide mb-1">Keterangan</p>
-              <p className="text-[12.5px] text-slate-300 leading-relaxed">{job.description}</p>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Keterangan</p>
+              <p className="text-[12.5px] text-slate-400 leading-relaxed">{job.description}</p>
             </div>
           )}
 
@@ -3053,38 +3524,38 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
               withLinkedContract di server.ts); kalau belum, statusnya cuma
               menunggu ditautkan lewat form Buat Kontrak Eksternal. */}
           {job.linkedContract ? (
-            <div className="p-3.5 bg-indigo-500/10 border border-indigo-500/25 rounded-xl space-y-2.5">
-              <p className="text-[11.5px] text-indigo-300 leading-relaxed">Status pekerjaan ini <b>otomatis mengikuti</b> status Kontrak yang terhubung — tidak bisa diubah manual dari sini.</p>
+            <div className="p-4 bg-mist rounded-[22px] space-y-3">
+              <p className="text-[11.5px] text-slate-400 leading-relaxed">Status pekerjaan ini <b className="text-slate-100">otomatis mengikuti</b> status Kontrak yang terhubung — tidak bisa diubah manual dari sini.</p>
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
-                  <p className="text-[12px] font-semibold text-slate-100 truncate">{job.linkedContract.title}</p>
+                  <p className="text-[12.5px] font-semibold text-slate-100 truncate">{job.linkedContract.title}</p>
                   <p className="text-[10.5px] text-slate-500">{job.linkedContract.contractNumber}</p>
                 </div>
-                <span className={`shrink-0 text-[11px] px-2 py-0.5 rounded-full border font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[job.linkedContract.status] || ""}`}>
+                <span className={`shrink-0 text-[11px] px-2.5 py-1 rounded-full font-semibold whitespace-nowrap bg-slate-900 text-indigo-400`}>
                   {CONTRACT_STATUS_LABEL_ID[job.linkedContract.status] || job.linkedContract.status}
                 </span>
               </div>
               <button onClick={() => onOpenContract(job.linkedContract!.id)}
-                className="w-full flex items-center justify-center gap-2 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-[12.5px] font-bold rounded-xl cursor-pointer">
+                className="w-full flex items-center justify-center gap-2 py-2.5 rounded-full btn-grad-primary text-white text-[12.5px] font-bold cursor-pointer">
                 <ArrowRight className="w-3.5 h-3.5" /> Buka Kontrak
               </button>
             </div>
           ) : (
-            <div className="p-3.5 bg-slate-950/60 border border-slate-800 rounded-xl">
-              <p className="text-[11.5px] text-slate-500 leading-relaxed">Status di atas belum berjalan otomatis — akan mengikuti status Kontrak begitu pekerjaan ini ditautkan lewat form <b className="text-slate-300">Buat Kontrak Eksternal</b> (dropdown "Pilih Judul Pekerjaan Legal").</p>
+            <div className="p-4 bg-slate-950 rounded-[22px]">
+              <p className="text-[11.5px] text-slate-500 leading-relaxed">Status di atas belum berjalan otomatis — akan mengikuti status Kontrak begitu pekerjaan ini ditautkan lewat form <b className="text-slate-100">Buat Kontrak Eksternal</b> (dropdown "Pilih Judul Pekerjaan Legal").</p>
             </div>
           )}
 
           {/* Tabs */}
-          <div className="flex border-b border-slate-800 gap-1">
+          <div className="inline-flex flex-wrap items-center gap-1 p-1 rounded-full bg-slate-950">
             {[
               { id: "dokumen", label: `Dokumen (${job.documents.length})`, Icon: FolderOpen },
               { id: "timeline", label: `Timeline (${job.timeline.length})`, Icon: History },
               { id: "catatan", label: `Catatan (${job.notes.length})`, Icon: StickyNote },
             ].map((t) => (
               <button key={t.id} onClick={() => setTab(t.id as any)}
-                className={`flex items-center gap-1.5 px-3 py-2 text-[12px] font-semibold border-b-2 -mb-px cursor-pointer transition ${tab === t.id ? "border-indigo-500 text-indigo-400" : "border-transparent text-slate-500 hover:text-slate-300"}`}>
-                <t.Icon className="w-3.5 h-3.5" /> {t.label}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-[12px] font-semibold cursor-pointer transition ${tab === t.id ? "bg-slate-900 text-slate-100 card-soft" : "text-slate-500 hover:text-slate-300"}`}>
+                <t.Icon className={`w-3.5 h-3.5 ${tab === t.id ? "text-soft-blue" : ""}`} /> {t.label}
               </button>
             ))}
           </div>
@@ -3093,17 +3564,23 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
             <div className="space-y-2">
               {job.documents.length === 0 && <p className="text-xs text-slate-500 text-center py-4">Belum ada dokumen.</p>}
               {job.documents.map((d) => (
-                <a key={d.id} href={d.url} target="_blank" rel="noreferrer" className="flex items-center gap-2.5 p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl hover:border-slate-700">
-                  <FileText className="w-4 h-4 text-indigo-400 shrink-0" />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[12px] text-slate-200 truncate">{d.name}</p>
-                    <p className="text-[10.5px] text-slate-500">{d.uploadedBy} · {fmtDateTimeID(d.uploadedAt)}</p>
-                  </div>
-                  <Download className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                </a>
+                <div key={d.id} className="flex items-center gap-2.5 px-3.5 py-3 bg-slate-950/60 rounded-[18px] hover:bg-slate-950 transition">
+                  <button type="button" onClick={() => openLegalJobDocument(job.id, d, "view", notify)} title="Buka berkas"
+                    className="flex items-center gap-3 min-w-0 flex-1 text-left cursor-pointer">
+                    <span className="w-8 h-8 rounded-full bg-mist flex items-center justify-center shrink-0"><FileText className="w-4 h-4 text-indigo-400" /></span>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[12px] font-medium text-slate-100 truncate">{d.name}</p>
+                      <p className="text-[10.5px] text-slate-500">{d.uploadedBy} · {fmtDateTimeID(d.uploadedAt)}</p>
+                    </div>
+                  </button>
+                  <button type="button" onClick={() => openLegalJobDocument(job.id, d, "download", notify)} title="Unduh"
+                    className="w-8 h-8 rounded-full text-slate-500 hover:text-slate-100 hover:bg-slate-900 flex items-center justify-center cursor-pointer shrink-0">
+                    <Download className="w-3.5 h-3.5" />
+                  </button>
+                </div>
               ))}
               <button onClick={() => fileInputRef.current?.click()} disabled={busy}
-                className="w-full flex items-center justify-center gap-2 py-2 border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-xl text-[12px] text-slate-400 cursor-pointer">
+                className="w-full flex items-center justify-center gap-2 py-3 rounded-full bg-mist text-indigo-400 hover:brightness-95 text-[12px] font-semibold cursor-pointer disabled:opacity-50">
                 <Upload className="w-3.5 h-3.5" /> Upload Dokumen
               </button>
               <input ref={fileInputRef} type="file" className="hidden" accept=".pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png"
@@ -3112,14 +3589,14 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
           )}
 
           {tab === "timeline" && (
-            <div className="space-y-3">
+            <div className="space-y-4 pl-1">
               {job.timeline.slice().reverse().map((t) => (
                 <div key={t.id} className="flex gap-3">
-                  <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />
+                  <div className="w-2 h-2 rounded-full bg-soft-blue mt-1.5 shrink-0" />
                   <div className="min-w-0 flex-1 pb-1">
-                    <p className="text-[12px] text-slate-200">{t.label}</p>
+                    <p className="text-[12.5px] text-slate-100">{t.label}</p>
                     {t.detail && <p className="text-[11px] text-slate-500 mt-0.5">{t.detail}</p>}
-                    <p className="text-[10.5px] text-slate-600 mt-0.5">{t.actor ? `${t.actor} · ` : ""}{fmtDateTimeID(t.at)}</p>
+                    <p className="text-[10.5px] text-slate-500 mt-0.5">{t.actor ? `${t.actor} · ` : ""}{fmtDateTimeID(t.at)}</p>
                   </div>
                 </div>
               ))}
@@ -3130,15 +3607,15 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
             <div className="space-y-3">
               {job.notes.length === 0 && <p className="text-xs text-slate-500 text-center py-4">Belum ada catatan.</p>}
               {job.notes.slice().reverse().map((n) => (
-                <div key={n.id} className="p-2.5 bg-slate-950/60 border border-slate-800 rounded-xl">
+                <div key={n.id} className="px-4 py-3 bg-slate-950/60 rounded-[18px]">
                   <p className="text-[12px] text-slate-300 whitespace-pre-wrap">{n.text}</p>
                   <p className="text-[10.5px] text-slate-500 mt-1">{n.authorName} · {fmtDateTimeID(n.createdAt)}</p>
                 </div>
               ))}
-              <div className="flex gap-2">
+              <div className="flex gap-2 items-end">
                 <textarea value={noteText} onChange={(e) => setNoteText(e.target.value)} rows={2} placeholder="Tulis catatan…"
-                  className="flex-1 px-3 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500" />
-                <button onClick={addNote} disabled={busy || !noteText.trim()} className="px-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg cursor-pointer"><Send className="w-3.5 h-3.5" /></button>
+                  className="flex-1 px-4 py-3 bg-slate-950 rounded-[18px] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none" />
+                <button onClick={addNote} disabled={busy || !noteText.trim()} aria-label="Kirim catatan" className="w-10 h-10 rounded-full btn-grad-primary disabled:opacity-50 text-white flex items-center justify-center cursor-pointer shrink-0"><Send className="w-3.5 h-3.5" /></button>
               </div>
             </div>
           )}
@@ -3150,8 +3627,8 @@ function LegalJobDetailDrawer({ job, currentUser, onClose, onChanged, notify, on
 function InfoField({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div>
-      <p className="text-[10.5px] font-semibold text-slate-500 uppercase tracking-wide">{label}</p>
-      <div className="text-slate-200 mt-0.5">{value}</div>
+      <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">{label}</p>
+      <div className="text-slate-100 mt-0.5">{value}</div>
     </div>
   );
 }
@@ -3182,139 +3659,623 @@ function DashboardLegalPage({ currentUser, onOpenPekerjaanLegal }: { currentUser
   const maxChart = Math.max(1, ...data.chartByStatus.map((c: any) => c.count));
 
   return (
-    <div className="space-y-6">
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div className="space-y-1">
-          <h2 className="text-xl font-semibold text-slate-100 tracking-tight">Dashboard Legal</h2>
-          <p className="text-[13px] text-slate-500 max-w-xl">Ringkasan kondisi semua pekerjaan legal — data real-time, klik kartu untuk melihat daftarnya.</p>
-        </div>
-      </div>
+    <div className="space-y-5">
+      <LegalHero Icon={Scale} title="Dashboard Legal" sub="Ringkasan kondisi semua pekerjaan legal — data real-time, klik kartu untuk melihat daftarnya." />
 
       {/* Ringkasan Pekerjaan Legal */}
-      <div>
-        <h3 className="text-[12px] font-bold text-slate-500 uppercase tracking-wide mb-2">Ringkasan Pekerjaan Legal</h3>
-        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
-          {cardStatuses.map((s) => (
-            <button key={s} onClick={onOpenPekerjaanLegal}
-              className="text-left p-3 rounded-xl border bg-slate-900/60 border-slate-800 hover:border-indigo-500/40 transition cursor-pointer">
-              <p className="text-lg font-bold text-slate-100">{data.statusCounts[s] || 0}</p>
-              <p className="text-[10.5px] text-slate-500 leading-tight mt-0.5">{LEGAL_STATUS_LABEL[s]}</p>
-            </button>
-          ))}
-        </div>
+      <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-3">
+        {cardStatuses.map((s) => (
+          <LegalStatCard key={s} status={s} count={data.statusCounts[s] || 0} onClick={onOpenPekerjaanLegal} />
+        ))}
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-4">
+      <div className="grid lg:grid-cols-2 gap-5">
         {/* Surat-Menyurat */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-3"><Send className="w-4 h-4 text-slate-500" /> Surat-Menyurat</h3>
+        <LegalPanel Icon={Send} title="Surat-Menyurat" subtitle="Modul surat masuk & keluar">
           {data.suratMenyurat.available === false ? (
-            <p className="text-[12px] text-slate-500 italic py-2">Modul Surat-Menyurat belum tersedia di sistem ini.</p>
+            <p className="text-[12px] text-slate-500 italic py-3 px-1">Modul Surat-Menyurat belum tersedia di sistem ini.</p>
           ) : (
             <p className="text-[12px] text-slate-500">—</p>
           )}
-        </div>
+        </LegalPanel>
 
         {/* Monitoring Kontrak */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-3"><FileCheck className="w-4 h-4 text-emerald-400" /> Monitoring Kontrak</h3>
-          <div className="grid grid-cols-3 gap-2 text-center">
-            <div><p className="text-lg font-bold text-emerald-400">{data.monitoringKontrak.aktif}</p><p className="text-[10px] text-slate-500">Aktif</p></div>
-            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir30}</p><p className="text-[10px] text-slate-500">&lt;30 hari</p></div>
-            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir60}</p><p className="text-[10px] text-slate-500">30–60 hari</p></div>
-            <div><p className="text-lg font-bold text-amber-400">{data.monitoringKontrak.akanBerakhir90}</p><p className="text-[10px] text-slate-500">60–90 hari</p></div>
-            <div><p className="text-lg font-bold text-rose-400">{data.monitoringKontrak.expired}</p><p className="text-[10px] text-slate-500">Expired</p></div>
+        <LegalPanel Icon={FileCheck} title="Monitoring Kontrak" subtitle="Masa berlaku kontrak berjalan">
+          <div className="grid grid-cols-3 gap-2.5 text-center">
+            {[
+              { v: data.monitoringKontrak.aktif, l: "Aktif", c: "bg-mist text-indigo-400" },
+              { v: data.monitoringKontrak.akanBerakhir30, l: "< 30 hari", c: "bg-peach text-brand-orange" },
+              { v: data.monitoringKontrak.akanBerakhir60, l: "30–60 hari", c: "bg-peach text-brand-orange" },
+              { v: data.monitoringKontrak.akanBerakhir90, l: "60–90 hari", c: "bg-peach text-brand-orange" },
+              { v: data.monitoringKontrak.expired, l: "Expired", c: "bg-brand-orange text-white" },
+            ].map((m) => (
+              <div key={m.l} className={`rounded-[18px] py-3 ${m.c}`}>
+                <p className="text-[22px] leading-none font-medium tabular">{m.v}</p>
+                <p className={`text-[10.5px] mt-1.5 ${m.l === "Expired" ? "text-white/90" : "text-slate-500"}`}>{m.l}</p>
+              </div>
+            ))}
           </div>
-        </div>
+        </LegalPanel>
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-4">
+      <div className="grid lg:grid-cols-2 gap-5">
         {/* Yang Perlu Ditindaklanjuti */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
-            <ShieldAlert className="w-4 h-4 text-amber-400" />
-            <h3 className="text-sm font-semibold text-slate-100">Yang Perlu Ditindaklanjuti</h3>
-          </div>
+        <LegalPanel Icon={ShieldAlert} title="Yang Perlu Ditindaklanjuti" subtitle="Pekerjaan prioritas & mendesak">
           {data.needsFollowUp.length === 0 ? (
-            <p className="p-5 text-center text-xs text-slate-500">Tidak ada yang mendesak saat ini.</p>
+            <p className="py-6 text-center text-xs text-slate-500">Tidak ada yang mendesak saat ini.</p>
           ) : (
-            <div className="divide-y divide-slate-800/60">
+            <div className="space-y-1.5 max-h-80 overflow-y-auto no-scrollbar">
               {data.needsFollowUp.map((j: any) => (
-                <button key={j.id} onClick={onOpenPekerjaanLegal} className="w-full text-left p-3 flex items-center justify-between gap-3 hover:bg-slate-800/20 cursor-pointer">
+                <button key={j.id} onClick={onOpenPekerjaanLegal} className="w-full text-left px-4 py-3 rounded-[18px] flex items-center justify-between gap-3 bg-slate-950/60 hover:bg-slate-950 transition cursor-pointer">
                   <div className="min-w-0">
-                    <p className="text-[12.5px] text-slate-200 truncate">{j.title}</p>
-                    <p className="text-[10.5px] text-slate-500">{j.partnerName} · {LEGAL_STATUS_LABEL[j.status]}</p>
+                    <p className="text-[12.5px] font-medium text-slate-100 truncate">{j.title}</p>
+                    <p className="text-[10.5px] text-slate-500 truncate">{j.partnerName} · {LEGAL_STATUS_LABEL[j.status]}</p>
                   </div>
-                  <div className="text-right shrink-0">
-                    {j.priority && <span className={`text-[10px] px-1.5 py-0.5 rounded-full border font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}
-                    <p className="text-[10.5px] text-slate-500 mt-0.5">{fmtDateID(j.deadline)}</p>
+                  <div className="text-right shrink-0 space-y-1">
+                    {j.priority && <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full font-semibold ${LEGAL_PRIORITY_STYLE[j.priority]}`}>{j.priority}</span>}
+                    <p className="text-[10.5px] text-slate-500">{fmtDateID(j.deadline)}</p>
                   </div>
                 </button>
               ))}
             </div>
           )}
-        </div>
+        </LegalPanel>
 
         {/* Aktivitas Terbaru */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
-            <History className="w-4 h-4 text-indigo-400" />
-            <h3 className="text-sm font-semibold text-slate-100">Aktivitas Terbaru</h3>
-          </div>
+        <LegalPanel Icon={History} title="Aktivitas Terbaru" subtitle="Riwayat pergerakan pekerjaan">
           {data.recentActivity.length === 0 ? (
-            <p className="p-5 text-center text-xs text-slate-500">Belum ada aktivitas.</p>
+            <p className="py-6 text-center text-xs text-slate-500">Belum ada aktivitas.</p>
           ) : (
-            <div className="divide-y divide-slate-800/60 max-h-80 overflow-y-auto">
+            <div className="max-h-80 overflow-y-auto no-scrollbar space-y-3 pl-1">
               {data.recentActivity.map((a: any, i: number) => (
-                <div key={i} className="p-3">
-                  <p className="text-[12px] text-slate-300"><span className="font-semibold text-slate-100">{a.jobTitle}</span> — {a.label}</p>
-                  <p className="text-[10.5px] text-slate-500 mt-0.5">{a.actor ? `${a.actor} · ` : ""}{fmtDateTimeID(a.at)}</p>
+                <div key={i} className="flex gap-3">
+                  <span className="w-2 h-2 rounded-full bg-soft-blue mt-1.5 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-[12px] text-slate-400 leading-snug"><span className="font-semibold text-slate-100">{a.jobTitle}</span> — {a.label}</p>
+                    <p className="text-[10.5px] text-slate-500 mt-0.5">{a.actor ? `${a.actor} · ` : ""}{fmtDateTimeID(a.at)}</p>
+                  </div>
                 </div>
               ))}
             </div>
           )}
-        </div>
+        </LegalPanel>
       </div>
 
-      <div className="grid lg:grid-cols-2 gap-4">
+      <div className="grid lg:grid-cols-2 gap-5">
         {/* Deadline Minggu Ini */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl overflow-hidden">
-          <div className="p-4 border-b border-slate-800 flex items-center gap-2">
-            <CalendarDays className="w-4 h-4 text-rose-400" />
-            <h3 className="text-sm font-semibold text-slate-100">Deadline Minggu Ini</h3>
-          </div>
+        <LegalPanel Icon={CalendarDays} title="Deadline Minggu Ini" subtitle="7 hari ke depan" tone="peach">
           {data.deadlineThisWeek.length === 0 ? (
-            <p className="p-5 text-center text-xs text-slate-500">Tidak ada deadline dalam 7 hari ke depan.</p>
+            <p className="py-6 text-center text-xs text-slate-500">Tidak ada deadline dalam 7 hari ke depan.</p>
           ) : (
-            <table className="w-full text-[12px]">
-              <tbody>
-                {data.deadlineThisWeek.map((j: any) => (
-                  <tr key={j.id} className="border-b border-slate-800/60 last:border-0 hover:bg-slate-800/20 cursor-pointer" onClick={onOpenPekerjaanLegal}>
-                    <td className="p-3 text-slate-500 whitespace-nowrap">{fmtDateID(j.deadline)}</td>
-                    <td className="p-3 text-slate-200">{j.title}</td>
-                    <td className="p-3 text-slate-500">{j.docType}</td>
-                    <td className="p-3"><span className="text-[10.5px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25 font-semibold whitespace-nowrap">{LEGAL_STATUS_LABEL[j.status]}</span></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="space-y-1.5">
+              {data.deadlineThisWeek.map((j: any) => (
+                <button key={j.id} onClick={onOpenPekerjaanLegal} className="w-full text-left px-4 py-3 rounded-[18px] flex items-center gap-3 bg-slate-950/60 hover:bg-slate-950 transition cursor-pointer">
+                  <span className="shrink-0 text-[11px] font-semibold px-2.5 py-1 rounded-full bg-peach text-brand-orange whitespace-nowrap">{fmtDateID(j.deadline)}</span>
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[12.5px] font-medium text-slate-100 truncate">{j.title}</p>
+                    <p className="text-[10.5px] text-slate-500 truncate">{j.docType}</p>
+                  </div>
+                  <span className="shrink-0 text-[10.5px] px-2.5 py-1 rounded-full bg-mist text-indigo-400 font-semibold whitespace-nowrap">{LEGAL_STATUS_LABEL[j.status]}</span>
+                </button>
+              ))}
+            </div>
           )}
-        </div>
+        </LegalPanel>
 
         {/* Grafik Pekerjaan Legal */}
-        <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-4">
-          <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2 mb-4"><PieChart className="w-4 h-4 text-indigo-400" /> Grafik Pekerjaan Legal</h3>
-          <div className="flex items-end gap-2 h-40">
-            {data.chartByStatus.map((c: any) => (
-              <div key={c.status} className="flex flex-col items-center gap-1 flex-1 group">
-                <span className="text-[10px] font-bold text-slate-300">{c.count}</span>
-                <div className={`w-full rounded-t transition-all ${c.count > 0 ? "bg-indigo-500/70" : "bg-slate-800"}`} style={{ height: `${Math.max(4, (c.count / maxChart) * 110)}px` }} />
+        <LegalPanel Icon={PieChart} title="Grafik Pekerjaan Legal" subtitle="Jumlah pekerjaan per status">
+          <div className="flex items-end gap-2 h-44 pt-2">
+            {data.chartByStatus.map((c: any, i: number) => (
+              <div key={c.status} className="flex flex-col items-center gap-1.5 flex-1 min-w-0">
+                <span className="text-[10.5px] font-semibold text-slate-300 tabular">{c.count}</span>
+                <div className={`w-full max-w-[22px] rounded-full transition-all ${c.count > 0 ? (i % 2 === 0 ? "bg-soft-blue" : "bg-peach-strong") : "bg-mist"}`} style={{ height: `${Math.max(8, (c.count / maxChart) * 104)}px` }} />
                 <span className="text-[9px] text-slate-500 text-center leading-tight">{LEGAL_STATUS_LABEL[c.status]}</span>
               </div>
             ))}
           </div>
+        </LegalPanel>
+      </div>
+    </div>
+  );
+}
+
+// Grafik batang mini di kartu statistik. `mixed` = batang berselang biru/oranye
+// pucat (seperti referensi); selain itu batang pucat dengan batang terakhir disorot.
+function MiniBars({ values, labels, mixed }: { values: number[]; labels?: string[]; mixed?: boolean }) {
+  const max = Math.max(1, ...values);
+  return (
+    <div className="flex items-end gap-1.5 shrink-0" aria-hidden="true">
+      {values.map((v, i) => (
+        <div key={i} className="flex flex-col items-center gap-1">
+          <div className="h-12 flex items-end">
+            <span
+              className={`w-2.5 rounded-full ${
+                mixed ? (i % 2 === 0 ? "bg-soft-blue" : "bg-peach-strong") : i === values.length - 1 ? "bg-soft-blue" : "bg-mist"
+              }`}
+              style={{ height: `${Math.max(14, Math.round((v / max) * 100))}%` }}
+            />
+          </div>
+          {labels && <span className="text-[8px] text-slate-500 leading-none">{labels[i]}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Garis mini bertitik (kartu statistik) — tanpa library.
+function MiniLine({ values, labels }: { values: number[]; labels?: string[] }) {
+  const max = Math.max(1, ...values);
+  const W = 80, H = 44, n = values.length;
+  const pts = values.map((v, i) => [n === 1 ? W / 2 : (i / (n - 1)) * W, H - 4 - (v / max) * (H - 10)]);
+  return (
+    <div className="shrink-0" aria-hidden="true">
+      <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="overflow-visible">
+        <polyline points={pts.map((p) => p.join(",")).join(" ")} fill="none" stroke="var(--color-soft-blue)" strokeWidth="1.5" strokeLinejoin="round" />
+        {pts.map((p, i) => (
+          <circle key={i} cx={p[0]} cy={p[1]} r="2.5" fill={i === n - 1 ? "var(--color-brand-orange)" : "var(--color-peach-strong)"} />
+        ))}
+      </svg>
+      {labels && (
+        <div className="flex justify-between mt-1">
+          {(labels.length > 4 ? [labels[0], labels[labels.length - 1]] : labels).map((l, i) => <span key={i} className="text-[8px] text-slate-500 leading-none">{l}</span>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Cincin proporsi (donut) tanpa library: segmen berurutan, angka di tengah.
+function StatusRing({ segments, center, sub }: { segments: { value: number; color: string }[]; center: string; sub: string }) {
+  const total = segments.reduce((a, b) => a + b.value, 0);
+  const R = 44, C = 2 * Math.PI * R;
+  let offset = 0;
+  return (
+    <div className="relative w-36 h-36">
+      <svg viewBox="0 0 120 120" className="w-full h-full -rotate-90">
+        <circle cx="60" cy="60" r={R} fill="none" stroke="var(--color-slate-950)" strokeWidth="14" />
+        {total > 0 && segments.map((sg, i) => {
+          const len = (sg.value / total) * C;
+          const el = sg.value > 0 ? (
+            <circle key={i} cx="60" cy="60" r={R} fill="none" stroke={sg.color} strokeWidth="14" strokeLinecap="round"
+              strokeDasharray={`${Math.max(0, len - 8)} ${C}`} strokeDashoffset={-offset - 4} />
+          ) : null;
+          offset += len;
+          return el;
+        })}
+      </svg>
+      <div className="absolute inset-0 flex flex-col items-center justify-center">
+        <span className="text-[24px] leading-none font-medium text-slate-100 tabular">{center}</span>
+        <span className="text-[11px] text-slate-500 mt-1">{sub}</span>
+      </div>
+    </div>
+  );
+}
+
+// Area yang bisa digulir dengan tinggi terkunci oleh induknya + efek memudar (biru) di tepi
+// bawah selama masih ada isi di bawah. Tinggi dikunci lewat style langsung agar tidak
+// bergantung pada class Tailwind.
+function FadeScroll({ children, className = "", maxHeight, hideScrollbar }: { children: any; className?: string; maxHeight?: string; hideScrollbar?: boolean }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [more, setMore] = useState(false);
+  const check = () => {
+    const el = ref.current;
+    if (!el) return;
+    setMore(el.scrollHeight - el.scrollTop - el.clientHeight > 4);
+  };
+  useEffect(() => {
+    check();
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(check);
+    ro.observe(el);
+    Array.from(el.children).forEach((c: any) => ro.observe(c));
+    return () => ro.disconnect();
+  });
+  return (
+    <div style={{ position: "relative", minHeight: 0, ...(maxHeight ? {} : { flex: "1 1 0%" }) }}>
+      <div
+        ref={ref}
+        onScroll={check}
+        className={`${className} ${hideScrollbar ? "no-scrollbar" : ""}`}
+        style={{
+          overflowY: "auto",
+          ...(maxHeight ? { maxHeight } : { height: "100%" }),
+          ...(more ? { WebkitMaskImage: "linear-gradient(to bottom, #000 calc(100% - 36px), transparent 100%)", maskImage: "linear-gradient(to bottom, #000 calc(100% - 36px), transparent 100%)" } : {}),
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// Cocokkan media query (dipakai untuk sidebar desktop).
+function useMediaQuery(query: string) {
+  const [m, setM] = useState(() => typeof window !== "undefined" && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const h = () => setM(mq.matches);
+    mq.addEventListener("change", h);
+    h();
+    return () => mq.removeEventListener("change", h);
+  }, [query]);
+  return m;
+}
+
+// Batang lebar berwarna oranye pucat (untuk kartu Sharing Fee), batang terakhir disorot.
+function WideBars({ values, labels }: { values: number[]; labels?: string[] }) {
+  const max = Math.max(1, ...values);
+  return (
+    <div className="flex items-end gap-2" aria-hidden="true">
+      {values.map((v, i) => (
+        <div key={i} className="flex-1 flex flex-col items-center gap-1.5">
+          <div className="h-14 w-full flex items-end justify-center">
+            <span
+              className={`w-3.5 rounded-full ${i === values.length - 1 ? "bg-brand-orange" : "bg-peach-strong"}`}
+              style={{ height: `${Math.max(10, Math.round((v / max) * 100))}%`, opacity: v === 0 ? 0.35 : 1 }}
+            />
+          </div>
+          {labels && <span className="text-[9px] text-slate-500 leading-none">{labels[i]}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Pagination ringkas di kaki kartu (hanya muncul bila data melebihi satu halaman).
+// ===== Pengumuman Rilis Kontrak =====
+// Setelah kontrak AKTIF 100%, tim Legal/Admin mengumumkan rilisnya ke orang-orang
+// yang dipilih PER NAMA (bukan role/departemen) + keterangan bebas. Komponen di
+// luar App supaya state lokal (pencarian/centang/keterangan) tidak ter-reset.
+const releaseInitials = (n: string) => n.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]?.toUpperCase()).join("");
+
+function ReleaseAnnounceModal({
+  contract, users, saving, onClose, onSend,
+}: {
+  contract: Contract;
+  users: { id: string; name: string; role: string }[];
+  saving: boolean;
+  onClose: () => void;
+  onSend: (ids: string[], note: string) => void;
+}) {
+  const [sel, setSel] = useState<string[]>([]);
+  const [q, setQ] = useState("");
+  const [note, setNote] = useState("");
+  const filtered = users.filter((u) => u.name.toLowerCase().includes(q.trim().toLowerCase()));
+  const toggle = (id: string) => setSel((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+  const nameOf = (id: string) => users.find((u) => u.id === id)?.name || "Pengguna";
+  const QUICK = [
+    "Kontrak sudah ditandatangani kedua pihak dan resmi berlaku.",
+    "Mohon tindak lanjut sesuai kewajiban dalam kontrak ini.",
+    "Berkas resmi (hasil TTD) sudah tersedia di sistem.",
+  ];
+  return (
+    <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={onClose}>
+      <form
+        onSubmit={(e) => { e.preventDefault(); if (sel.length > 0 && !saving) onSend(sel, note); }}
+        onClick={(e) => e.stopPropagation()}
+        className="modal-panel relative w-full max-w-3xl max-h-[90vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] space-y-5"
+      >
+        <button type="button" onClick={onClose} aria-label="Tutup" className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 flex items-center justify-center cursor-pointer text-lg leading-none">×</button>
+        <div className="flex items-start gap-3 pr-10">
+          <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Bell className="w-5 h-5 text-slate-300" /></span>
+          <div className="min-w-0">
+            <h3 className="text-[18px] font-semibold text-slate-100 leading-tight">Umumkan Rilis Kontrak</h3>
+            <p className="text-xs text-slate-500 mt-0.5 truncate">{contract.contractNumber} · {contract.title}</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          <div className="space-y-2.5 min-w-0">
+            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Penerima (pilih berdasarkan nama)</p>
+            <div className="flex items-center gap-2 bg-slate-950 rounded-full pl-4 pr-4 py-2.5">
+              <Search className="w-4 h-4 text-slate-500 shrink-0" />
+              <input type="text" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Cari nama pengguna…" className="bg-transparent border-none outline-none text-xs text-slate-200 placeholder:text-slate-500 w-full" style={{ border: "none", boxShadow: "none" }} />
+            </div>
+            <div className="max-h-60 overflow-y-auto no-scrollbar space-y-1">
+              {filtered.length === 0 && <p className="text-xs text-slate-500 italic px-2 py-3">Tidak ada nama yang cocok.</p>}
+              {filtered.map((u) => {
+                const on = sel.includes(u.id);
+                return (
+                  <label key={u.id} className={`flex items-center gap-3 px-3 py-2 rounded-full cursor-pointer transition ${on ? "bg-soft-blue/15" : "hover:bg-slate-800/50"}`}>
+                    <input type="checkbox" checked={on} onChange={() => toggle(u.id)} />
+                    <span className="w-7 h-7 rounded-full bg-peach flex items-center justify-center text-[10px] font-bold text-slate-300 shrink-0">{releaseInitials(u.name)}</span>
+                    <span className="text-xs text-slate-200 font-medium truncate">{u.name}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <div className="flex items-center gap-3 text-[11px]">
+              <button type="button" onClick={() => setSel(Array.from(new Set([...sel, ...filtered.map((u) => u.id)])))} className="text-[#3a7fa8] font-semibold hover:underline cursor-pointer">Pilih yang tampil</button>
+              <button type="button" onClick={() => setSel([])} className="text-slate-500 hover:text-slate-300 cursor-pointer">Kosongkan</button>
+            </div>
+          </div>
+
+          <div className="space-y-2.5 min-w-0 flex flex-col">
+            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Keterangan (opsional)</p>
+            <textarea
+              value={note}
+              onChange={(e) => setNote(e.target.value.slice(0, 1000))}
+              rows={5}
+              placeholder="Tulis keterangan untuk penerima, mis. tindak lanjut yang diharapkan…"
+              className="w-full px-4 py-3 bg-slate-950 rounded-[18px] text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none resize-none"
+            />
+            <div className="flex flex-wrap gap-1.5">
+              {QUICK.map((t) => (
+                <button key={t} type="button" onClick={() => setNote(t)} className="text-[10.5px] px-3 py-1.5 rounded-full bg-soft-blue/15 text-[#3a7fa8] hover:bg-soft-blue/25 transition cursor-pointer text-left">{t}</button>
+              ))}
+            </div>
+            <p className="text-[10px] text-slate-500 text-right">{note.length}/1000</p>
+            <div className="rounded-[18px] bg-slate-950 p-3 flex-1">
+              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-2">Akan dikirim ke ({sel.length})</p>
+              {sel.length === 0 ? (
+                <p className="text-xs text-slate-500 italic">Belum ada penerima dipilih.</p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {sel.map((id) => (
+                    <span key={id} className="inline-flex items-center gap-1.5 pl-1.5 pr-1 py-1 rounded-full bg-soft-blue/15 text-xs text-slate-200">
+                      <span className="w-5 h-5 rounded-full bg-peach flex items-center justify-center text-[9px] font-bold text-slate-300">{releaseInitials(nameOf(id))}</span>
+                      {nameOf(id)}
+                      <button type="button" onClick={() => toggle(id)} aria-label={`Hapus ${nameOf(id)}`} className="w-4 h-4 rounded-full hover:bg-slate-800 text-slate-500 hover:text-slate-200 flex items-center justify-center cursor-pointer text-[11px] leading-none">×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button type="button" onClick={onClose} className="px-5 py-2.5 rounded-full text-xs font-semibold text-slate-400 hover:text-slate-100 bg-slate-950 cursor-pointer">Batal</button>
+          <button type="submit" disabled={sel.length === 0 || saving} className="px-6 py-2.5 rounded-full btn-grad-primary text-white text-xs font-bold cursor-pointer disabled:opacity-50 disabled:cursor-default flex items-center gap-1.5">
+            <Bell className="w-3.5 h-3.5" /> {saving ? "Mengirim…" : "Kirim Pengumuman"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+// Riwayat pengumuman rilis — kartu di bawah preview dokumen (hanya setelah kontrak Aktif).
+function ReleaseAnnouncementsCard({ contract, canEdit, onOpen }: { contract: Contract; canEdit: boolean; onOpen: () => void }) {
+  const list = contract.releaseAnnouncements || [];
+  return (
+    <div className="card-grad card-soft bg-slate-900 rounded-[28px] p-6 relative overflow-hidden">
+      <Bell aria-hidden className="pointer-events-none absolute -right-3 -top-6 w-32 h-32 text-soft-blue opacity-[0.12] rotate-12" strokeWidth={1.2} />
+      <Sparkles aria-hidden className="pointer-events-none absolute right-48 -bottom-5 w-20 h-20 text-peach-strong opacity-30 -rotate-12" strokeWidth={1.2} />
+      <div className="relative flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <span className="w-11 h-11 rounded-full bg-peach flex items-center justify-center shrink-0"><Bell className="w-5 h-5 text-slate-300" /></span>
+          <div className="min-w-0">
+            <h3 className="text-[17px] font-semibold text-slate-100 leading-tight">Pengumuman Rilis Kontrak</h3>
+            <p className="text-xs text-slate-500 mt-0.5">Kontrak ini sudah aktif 100%. Beri tahu orang-orang terkait (per nama) bahwa kontrak sudah rilis.</p>
+          </div>
+        </div>
+        {canEdit && (
+          <button onClick={onOpen} className="shrink-0 px-5 py-2.5 rounded-full btn-grad-primary text-white text-xs font-bold cursor-pointer flex items-center gap-1.5">
+            <Bell className="w-3.5 h-3.5" /> Umumkan Rilis
+          </button>
+        )}
+      </div>
+      <div className="relative mt-4 space-y-2.5">
+        {list.length === 0 ? (
+          <p className="text-xs text-slate-500 italic px-1">Belum ada pengumuman yang dikirim.{canEdit ? " Klik “Umumkan Rilis” untuk memilih penerima & menulis keterangan." : ""}</p>
+        ) : list.map((a) => (
+          <div key={a.id} className="rounded-[22px] bg-slate-900 card-soft p-4 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+              <span>Diumumkan oleh <b className="text-slate-300">{a.byName}</b></span>
+              <span>{new Date(a.createdAt).toLocaleString("id-ID", { dateStyle: "medium", timeStyle: "short" })}</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {a.names.map((n, i) => (
+                <span key={n + i} className="inline-flex items-center gap-1.5 pl-1 pr-2.5 py-0.5 rounded-full bg-soft-blue/15 text-xs text-slate-200">
+                  <span className="w-5 h-5 rounded-full bg-peach flex items-center justify-center text-[9px] font-bold text-slate-300">{releaseInitials(n)}</span>{n}
+                </span>
+              ))}
+            </div>
+            {a.note && <p className="text-xs text-slate-400 leading-relaxed">“{a.note}”</p>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DashPager({ page, total, pageSize, onChange }: { page: number; total: number; pageSize: number; onChange: (p: number) => void }) {
+  const pages = Math.ceil(total / pageSize);
+  if (pages <= 1) return null;
+  const from = (page - 1) * pageSize + 1;
+  const to = Math.min(total, page * pageSize);
+  return (
+    <div className="flex items-center justify-between pt-3 border-t border-slate-800 text-[11px] text-slate-500">
+      <span className="tabular">{from}–{to} dari {total}</span>
+      <div className="flex items-center gap-1">
+        <button disabled={page <= 1} onClick={() => onChange(page - 1)} className="w-7 h-7 rounded-full bg-slate-950 hover:bg-slate-850 flex items-center justify-center cursor-pointer disabled:opacity-40 disabled:cursor-default" aria-label="Halaman sebelumnya">
+          <ChevronLeft className="w-3.5 h-3.5" />
+        </button>
+        <span className="px-2 tabular">{page}/{pages}</span>
+        <button disabled={page >= pages} onClick={() => onChange(page + 1)} className="w-7 h-7 rounded-full bg-slate-950 hover:bg-slate-850 flex items-center justify-center cursor-pointer disabled:opacity-40 disabled:cursor-default" aria-label="Halaman berikutnya">
+          <ChevronRight className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// Kepala kartu dashboard yang seragam: lingkaran ikon + judul + keterangan + aksi kanan.
+function DashCardHeader({ Icon, title, subtitle, right }: { Icon: any; title: string; subtitle?: string; right?: any }) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className="w-10 h-10 rounded-full bg-peach-strong flex items-center justify-center shrink-0">
+          <Icon className="w-[17px] h-[17px] text-slate-100" />
+        </span>
+        <div className="min-w-0">
+          <h3 className="text-[16px] font-medium text-slate-100 leading-snug">{title}</h3>
+          {subtitle && <p className="text-[11px] text-slate-500 leading-snug mt-0.5">{subtitle}</p>}
         </div>
       </div>
+      {right}
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Drawer "Filter Kontrak" (Monitoring Kontrak & Kontrak Karyawan). Panel kiri +
+// overlay; semua isian bekerja pada salinan sementara (draft) dan baru
+// berlaku saat "Terapkan Filter" ditekan. Hanya memuat filter atas data yang
+// BENAR-BENAR ada di kontrak (tidak ada kolom fiktif).
+// ---------------------------------------------------------------------------
+type MonitorExtra = {
+  title: string; number: string; party: string; party1: string; docType: string; party2Type: string;
+  startFrom: string; startTo: string; endFrom: string; endTo: string;
+  statuses: string[]; docKinds: string[]; minVal: string; maxVal: string;
+};
+type MonitorHealthKey = "" | "expired" | "critical" | "warning" | "healthy";
+type MonitorDraft = MonitorExtra & {
+  keyword: string; category: string; health: MonitorHealthKey; scope: "all" | "aktif" | "nonaktif";
+};
+const EMPTY_MONITOR_EXTRA: MonitorExtra = {
+  title: "", number: "", party: "", party1: "", docType: "", party2Type: "",
+  startFrom: "", startTo: "", endFrom: "", endTo: "", statuses: [], docKinds: [], minVal: "", maxVal: "",
+};
+function countMonitorFilters(d: MonitorDraft): number {
+  let n = 0;
+  if (d.category !== "Semua") n++;
+  if (d.health) n++;
+  if (d.scope !== "all") n++;
+  n += d.statuses.length + d.docKinds.length;
+  (["title", "number", "party", "party1", "docType", "party2Type", "startFrom", "startTo", "endFrom", "endTo", "minVal", "maxVal"] as const)
+    .forEach((k) => { if (String(d[k]).trim()) n++; });
+  return n;
+}
+const DrawerSection = ({ title, children, last }: { title: string; children: any; last?: boolean }) => (
+  <div className={`pb-5 mb-5 ${last ? "" : "border-b border-slate-800"}`}>
+    <div className="text-[13px] font-bold text-slate-200 mb-3">{title}</div>
+    {children}
+  </div>
+);
+const DrawerCheck = ({ on, text, onClick }: { key?: string; on: boolean; text: string; onClick: () => void }) => (
+  <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer min-h-[27px]">
+    <input type="checkbox" checked={on} onChange={onClick} className="w-4 h-4 accent-[var(--color-soft-blue)] cursor-pointer" /> {text}
+  </label>
+);
+
+function MonitorFilterDrawer({ draft, setDraft, onApply, onReset, onClose, categories, statusOptions, docTypes, party2Types }: {
+  draft: MonitorDraft; setDraft: (fn: (d: MonitorDraft) => MonitorDraft) => void;
+  onApply: () => void; onReset: () => void; onClose: () => void;
+  categories: string[]; statusOptions: { value: string; label: string }[]; docTypes: string[]; party2Types: string[];
+}) {
+  const set = <K extends keyof MonitorDraft>(k: K, v: MonitorDraft[K]) => setDraft((d) => ({ ...d, [k]: v }));
+  const toggle = (k: "statuses" | "docKinds", v: string) =>
+    setDraft((d) => ({ ...d, [k]: d[k].includes(v) ? d[k].filter((x) => x !== v) : [...d[k], v] }));
+  const input = "w-full h-10 px-3 rounded-xl bg-slate-950 text-xs text-slate-100 placeholder:text-slate-500 border border-transparent focus:outline-none focus:border-indigo-500 focus:bg-slate-900 transition";
+  const label = "block text-[11px] font-semibold text-slate-400 mb-1.5";
+  const pill = (on: boolean) => `px-3 py-1.5 rounded-full text-[11px] font-semibold cursor-pointer transition ${on ? "bg-mist text-indigo-400" : "bg-slate-950 text-slate-400 hover:text-slate-200"}`;
+  return (
+    <div className="fixed inset-0 z-[60] bg-slate-950/40 backdrop-blur-[2px]" onClick={onClose}>
+      <aside
+        role="dialog" aria-label="Filter Kontrak"
+        className="drawer-in absolute left-3 top-3 bottom-3 w-[min(430px,calc(100vw-1.5rem))] bg-slate-900 rounded-[28px] flex flex-col overflow-hidden"
+        style={{ boxShadow: "var(--shadow-soft)" }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 pt-5 pb-4 flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-lg font-bold text-slate-100">Filter Kontrak</h2>
+            <p className="text-xs text-slate-400 mt-1 leading-relaxed">Cari data lebih spesifik berdasarkan informasi yang tersedia di tabel.</p>
+          </div>
+          <button onClick={onClose} aria-label="Tutup" className="w-9 h-9 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 text-lg leading-none cursor-pointer shrink-0">×</button>
+        </div>
+        <div className="px-6 pb-2 overflow-y-auto flex-1">
+          <DrawerSection title="Identitas kontrak">
+            <div className="grid grid-cols-2 gap-2.5">
+              <div><label className={label}>Judul / Nama Kontrak</label><input className={input} value={draft.title} onChange={(e) => set("title", e.target.value)} placeholder="Contoh: Perjanjian Vendor" /></div>
+              <div><label className={label}>Nomor Kontrak</label><input className={input} value={draft.number} onChange={(e) => set("number", e.target.value)} placeholder="Contoh: 001/PKS/VII/2026" /></div>
+              <div>
+                <label className={label}>Kategori</label>
+                <select className={input} value={draft.category} onChange={(e) => set("category", e.target.value)}>
+                  <option value="Semua">Semua Kategori</option>
+                  {categories.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div><label className={label}>Pihak Kedua</label><input className={input} value={draft.party} onChange={(e) => set("party", e.target.value)} placeholder="Nama perusahaan / orang" /></div>
+            </div>
+          </DrawerSection>
+
+          <DrawerSection title="Periode kontrak">
+            <label className={label}>Tanggal Mulai</label>
+            <div className="flex items-center gap-2 mb-3">
+              <input type="date" className={input} value={draft.startFrom} onChange={(e) => set("startFrom", e.target.value)} />
+              <span className="text-[11px] text-slate-500">s/d</span>
+              <input type="date" className={input} value={draft.startTo} onChange={(e) => set("startTo", e.target.value)} />
+            </div>
+            <label className={label}>Tanggal Berakhir</label>
+            <div className="flex items-center gap-2">
+              <input type="date" className={input} value={draft.endFrom} onChange={(e) => set("endFrom", e.target.value)} />
+              <span className="text-[11px] text-slate-500">s/d</span>
+              <input type="date" className={input} value={draft.endTo} onChange={(e) => set("endTo", e.target.value)} />
+            </div>
+          </DrawerSection>
+
+          <DrawerSection title="Sisa waktu kontrak">
+            <div className="flex flex-wrap gap-2">
+              {([["expired", "Sudah lewat"], ["critical", "≤ 30 hari"], ["warning", "31–90 hari"], ["healthy", "> 90 hari"]] as [MonitorHealthKey, string][]).map(([k, t]) => (
+                <button key={k} type="button" className={pill(draft.health === k)} onClick={() => set("health", draft.health === k ? "" : k)}>{t}</button>
+              ))}
+            </div>
+          </DrawerSection>
+
+          <DrawerSection title="Status & aktivitas">
+            <label className={label}>Status Kontrak</label>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1 mb-4">
+              {statusOptions.map((o) => <DrawerCheck key={o.value} on={draft.statuses.includes(o.value)} text={o.label} onClick={() => toggle("statuses", o.value)} />)}
+            </div>
+            <label className={label}>Status Aktivasi</label>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className={pill(draft.scope === "aktif")} onClick={() => set("scope", draft.scope === "aktif" ? "all" : "aktif")}>Aktif</button>
+              <button type="button" className={pill(draft.scope === "nonaktif")} onClick={() => set("scope", draft.scope === "nonaktif" ? "all" : "nonaktif")}>Tidak Aktif</button>
+            </div>
+          </DrawerSection>
+
+          <DrawerSection title="Dokumen">
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1">
+              <DrawerCheck on={draft.docKinds.includes("PDF")} text="PDF" onClick={() => toggle("docKinds", "PDF")} />
+              <DrawerCheck on={draft.docKinds.includes("Word")} text="Word (.doc / .docx)" onClick={() => toggle("docKinds", "Word")} />
+              <DrawerCheck on={draft.docKinds.includes("Gambar")} text="Gambar / scan" onClick={() => toggle("docKinds", "Gambar")} />
+              <DrawerCheck on={draft.docKinds.includes("Digital")} text="Digital (disusun di sistem)" onClick={() => toggle("docKinds", "Digital")} />
+            </div>
+          </DrawerSection>
+
+          <DrawerSection title="Pencarian berdasarkan kolom lain" last>
+            <div className="grid grid-cols-2 gap-2.5">
+              <div><label className={label}>Pihak Pertama</label><input className={input} value={draft.party1} onChange={(e) => set("party1", e.target.value)} placeholder="Nama pihak pertama" /></div>
+              <div>
+                <label className={label}>Jenis Dokumen</label>
+                <select className={input} value={draft.docType} onChange={(e) => set("docType", e.target.value)}>
+                  <option value="">Semua Jenis</option>
+                  {docTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={label}>Tipe Pihak Kedua</label>
+                <select className={input} value={draft.party2Type} onChange={(e) => set("party2Type", e.target.value)}>
+                  <option value="">Semua Tipe</option>
+                  {party2Types.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+              <div />
+              <div><label className={label}>Nilai kontrak min (Rp)</label><input type="number" min="0" className={input} value={draft.minVal} onChange={(e) => set("minVal", e.target.value)} placeholder="0" /></div>
+              <div><label className={label}>Nilai kontrak maks (Rp)</label><input type="number" min="0" className={input} value={draft.maxVal} onChange={(e) => set("maxVal", e.target.value)} placeholder="Tanpa batas" /></div>
+            </div>
+          </DrawerSection>
+        </div>
+        <div className="px-6 py-4 flex gap-3 bg-slate-900">
+          <button onClick={onReset} className="h-11 w-28 rounded-full bg-slate-950 text-slate-300 text-xs font-bold hover:text-slate-100 cursor-pointer">Reset Filter</button>
+          <button onClick={onApply} className="h-11 flex-1 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold cursor-pointer">Terapkan Filter</button>
+        </div>
+      </aside>
     </div>
   );
 }
@@ -3338,6 +4299,29 @@ export default function App() {
   }, [theme]);
 
   const toggleTheme = () => setTheme((t) => (t === "dark" ? "light" : "dark"));
+  // Popup notifikasi (ikon lonceng di navbar) + tab Semua/Belum dibaca.
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifTab, setNotifTab] = useState<"all" | "unread">("all");
+  // Halaman daftar di kartu dashboard (10 item per halaman).
+  const [apprPage, setApprPage] = useState(1);
+  const isDesktop = useMediaQuery("(min-width: 768px)");
+  // Skala UI seragam: tampilan di layar/zoom berapa pun SAMA dengan tampilan
+  // di lebar acuan 1517px (≈ layar 1366 pada zoom 90%). Di bawah lebar itu
+  // seluruh UI diperkecil proporsional (bukan di-reflow), di atasnya normal.
+  useEffect(() => {
+    const REF = 1517;
+    const apply = () => {
+      const w = window.innerWidth;
+      const z = w >= 1024 && w < REF ? Math.max(0.67, w / REF) : 1;
+      const root = document.documentElement;
+      root.style.setProperty("zoom", z === 1 ? "" : String(z));
+      root.style.setProperty("--ui-zoom", String(z));
+    };
+    apply();
+    window.addEventListener("resize", apply);
+    return () => { window.removeEventListener("resize", apply); document.documentElement.style.removeProperty("zoom"); };
+  }, []);
+  const [expPage, setExpPage] = useState(1);
 
   // Sidebar bisa disembunyikan/dimunculkan lewat tombol di navbar.
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -3533,6 +4517,19 @@ export default function App() {
   const [allTenants, setAllTenants] = useState<any[]>([]);
   const [userForm, setUserForm] = useState<any>(null);
   const [tenantForm, setTenantForm] = useState<any>(null);
+  // Platform kerja sama milik perusahaan yang sedang login (tenant.platforms,
+  // diatur di Kelola Perusahaan) — isi dropdown "Kerjasama Platform" di wizard.
+  const [tenantPlatforms, setTenantPlatforms] = useState<string[]>([]);
+  const fetchTenantPlatforms = async () => {
+    try {
+      const res = await fetch("/api/tenant-platforms");
+      if (res.ok) setTenantPlatforms((await res.json()).platforms || []);
+    } catch {
+      setTenantPlatforms([]);
+    }
+  };
+  // Input ketik untuk menambah platform di form Tambah/Edit Perusahaan.
+  const [tenantPlatformInput, setTenantPlatformInput] = useState("");
   const [backups, setBackups] = useState<any[]>([]);
   const [isRunningBackup, setIsRunningBackup] = useState(false);
   const [emailConfigured, setEmailConfigured] = useState<boolean | null>(null);
@@ -3604,6 +4601,11 @@ export default function App() {
 
   // PDF Export State
   const [isExportingPdf, setIsExportingPdf] = useState(false);
+  // Pop-up pilihan format (Word/PDF) utk tombol "Download Dokumen" pada
+  // kontrak hasil Upload Dokumen — lihat handleExportPdf & DocumentDownloadModal.
+  const [docDownloadPicker, setDocDownloadPicker] = useState<{
+    contractId: string; sourceFormat: SourceDocFormat; officeToPdfAvailable: boolean;
+  } | null>(null);
   // Lihat file input "Berkas Dokumen/Template Kontrak" di wizard mode Upload
   // — true selagi /api/master-contracts/extract-text lagi baca & memecah
   // teks berkas jadi pasal-pasal.
@@ -3633,7 +4635,12 @@ export default function App() {
   // Filter cepat via klik kartu ringkasan (Lewat/≤30/31-90/Aman) — "" = semua.
   const [monitorHealth, setMonitorHealth] = useState<"" | "expired" | "critical" | "warning" | "healthy">("");
   const [monitorPage, setMonitorPage] = useState(1);
-  const [contractSort, setContractSort] = useState<SortState>({ key: "sisa", dir: "asc" });
+  // Filter lanjutan (drawer): terapan = monitorExtra; draft = salinan sementara saat drawer terbuka.
+  const [monitorExtra, setMonitorExtra] = useState<MonitorExtra>(EMPTY_MONITOR_EXTRA);
+  const [monitorFilterOpen, setMonitorFilterOpen] = useState(false);
+  const [monitorSortOpen, setMonitorSortOpen] = useState(false);
+  const [monitorDraft, setMonitorDraft] = useState<MonitorDraft>({ ...EMPTY_MONITOR_EXTRA, keyword: "", category: "Semua", health: "", scope: "all" });
+  const [contractSort, setContractSort] = useState<SortState>({ key: "dibuat", dir: "desc" });
   // Audit trail table — search + sortable columns.
   const [auditSearch, setAuditSearch] = useState("");
   const [auditPage, setAuditPage] = useState(1);
@@ -3827,6 +4834,11 @@ export default function App() {
   // konsep yang serupa. Dua state terpisah (bukan satu) supaya user bisa
   // sedang lihat Format Nomor Kontrak sambil Margin masih di mode DCS, dst.
   const [numberFormatModule, setNumberFormatModule] = useState<"dcs" | "kontrak">("dcs");
+  // Pop-up penjelasan 1 token (dibuka dgn klik tag "Klik Tag Untuk Menyisipkan
+  // Variabel") — UI-only, cuma tampilan. Token baru benar2 disisipkan ke pola
+  // lewat tombol "Tambahkan" di pop-up ini, yg memanggil insertToken yg sama
+  // persis seperti sebelumnya (klik tag langsung insert, tanpa pop-up).
+  const [tokenInfoModal, setTokenInfoModal] = useState<{ t: string; l: string; d: string; go?: { label: string; tab?: string; anchor?: string; superOnly?: boolean } } | null>(null);
   const [marginModule, setMarginModule] = useState<"dcs" | "kontrak">("dcs");
   // Rule override milik SATU jenis dokumen yang sedang dibuka di form edit
   // (dcsDocTypeForm) — state TERPISAH dari dcsNumberingRule di atas (bukan
@@ -3918,7 +4930,7 @@ export default function App() {
     currencies: (appSettings.masterData?.currencies || ["IDR", "USD"]) as string[],
     categoryPrefixes: (appSettings.masterData?.categoryPrefixes || {}) as Record<string, string>,
     defaultNumberPrefix: (appSettings.masterData?.defaultNumberPrefix || "GA-AGR") as string,
-    defaultNumberMask: (appSettings.masterData?.defaultNumberMask || "{Sequence:3}/{DocTypeCode}/{Codes}/{MonthRoman}/{Year}") as string,
+    defaultNumberMask: (appSettings.masterData?.defaultNumberMask || "{Sequence:3}/{DocTypeCode}/{Platform}/{Codes}/{MonthRoman}/{Year}") as string,
     copyStatuses: (appSettings.masterData?.copyStatuses || ["Disimpan", "Dikirim", "Di-assign", "Diarsipkan"]) as string[],
     departments: (appSettings.masterData?.departments || []) as string[],
     categoryOpeningParagraphs: (appSettings.masterData?.categoryOpeningParagraphs || {}) as Record<string, string>,
@@ -4059,6 +5071,10 @@ export default function App() {
   // Pratinjau nomor — cerminan renderMask di server (numbering-utils.ts):
   // {Sequence} → contoh "1", {MonthRoman} → bulan romawi, token kosong ""
   // dibuang & pemisah dirapikan, token belum diisi tampil literal {Name}.
+  // Cerminan platformCode() di server.ts — nama platform → segmen {Platform}.
+  const platformCode = (name: string | undefined): string =>
+    String(name || "").trim().toUpperCase().replace(/[\s/]+/g, "-").replace(/[^A-Z0-9-]/g, "");
+
   const previewNumberMask = (mask: string, tokens: Record<string, string>): string => {
     const roman = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"];
     try {
@@ -4400,6 +5416,8 @@ export default function App() {
     title: "",
     category: "Vendor" as any,
     docType: "" as string,
+    // Platform kerja sama (opsional) — lihat tenantPlatforms (Kelola Perusahaan).
+    platform: "" as string,
     creationMode: "smart" as "smart" | "upload",
     parties: [
       { role: "Pihak Pertama", name: appSettings.companyName || "[Nama perusahaan belum diisi]", type: "Company" },
@@ -4629,9 +5647,17 @@ export default function App() {
   const [pendingAnchor, setPendingAnchor] = useState<{ clauseId: string; clauseTitle: string; quote: string; start: number; end: number; kind: "comment" | "strike" } | null>(null);
   // Mode Tinjau gaya Word: dokumen penuh + kartu komentar di margin kanan.
   const [reviewModeOpen, setReviewModeOpen] = useState(false);
+  // Komentar umum (tanpa sorotan kalimat) di Mode Tinjau kontrak "Upload Dokumen".
+  const [docCommentText, setDocCommentText] = useState("");
+  // Markup dokumen upload (.docx): usulan yg sedang ditulis + pemicu muat-ulang dokumen.
+  const [docMarkupDraft, setDocMarkupDraft] = useState<MarkupSeed | null>(null);
+  const [docMarkupText, setDocMarkupText] = useState("");
+  const [docMarkupReplacement, setDocMarkupReplacement] = useState("");
+  const [docReloadKey, setDocReloadKey] = useState(0);
   const [activeMarginId, setActiveMarginId] = useState<string | null>(null);
   const [marginDraft, setMarginDraft] = useState<(MarginDraftSeed & { start: number; end: number }) | null>(null);
   const [marginDraftText, setMarginDraftText] = useState("");
+  const [marginDraftReplacement, setMarginDraftReplacement] = useState(""); // teks pengganti (usulan "Ganti" pada pasal)
   const [marginReplyText, setMarginReplyText] = useState("");
   const [marginBusy, setMarginBusy] = useState(false);
   // Saat terisi: sorotan BERIKUTNYA yang dipilih user akan MENGGANTI anchor
@@ -4730,10 +5756,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if ((showCommentPanel || showApproverPicker || dcsSelectedVersionId || dcsCreateOpen || isManagingCategories) && mentionableUsers.length === 0) {
+    if ((showCommentPanel || showApproverPicker || dcsSelectedVersionId || dcsCreateOpen || isManagingCategories || !!selectedContract) && mentionableUsers.length === 0) {
       fetchMentionableUsers();
     }
-  }, [showCommentPanel, showApproverPicker, dcsSelectedVersionId, dcsCreateOpen, isManagingCategories]);
+  }, [showCommentPanel, showApproverPicker, dcsSelectedVersionId, dcsCreateOpen, isManagingCategories, !!selectedContract]);
 
   // Prefill approverPickerIds dari Matriks Approval Default kategori kontrak
   // ini, begitu picker dibuka DAN mentionableUsers sudah termuat. Dipisah dari
@@ -5036,6 +6062,13 @@ export default function App() {
       const data = await res.json();
       if (!data.success) { showToast(data.error || "Gagal membuat link review eksternal", "warning"); setShareLinkModal((m) => (m ? { ...m, busy: false } : m)); return; }
       setShareLinkModal((m) => (m ? { ...m, url: data.url, busy: false } : m));
+      // Sinkronkan state kontrak di client: tanpa ini polling komentar eksternal
+      // & tombol "Buka Akses Kembali" baru aktif setelah halaman di-refresh.
+      if (shareLinkModal.kind === "contract") {
+        const patch = { externalReviewToken: data.token, externalReviewExpiresAt: data.expiresAt ?? null };
+        setContracts((prev) => prev.map((c) => c.id === shareLinkModal.targetId ? { ...c, ...patch } : c));
+        setSelectedContract((prev: any) => prev && prev.id === shareLinkModal.targetId ? { ...prev, ...patch } : prev);
+      }
       try {
         await navigator.clipboard.writeText(data.url);
         showToast(`Link review eksternal disalin ke clipboard (berlaku ${days} hari).`, "success");
@@ -5132,6 +6165,7 @@ export default function App() {
 
     setMarginDraft({ ...seed, ...anchorPayload });
     setMarginDraftText("");
+    setMarginDraftReplacement("");
     setActiveMarginId("__draft__");
   };
 
@@ -5155,7 +6189,14 @@ export default function App() {
   };
 
   const submitMarginComment = async () => {
-    if (!selectedContract || !marginDraft || !marginDraftText.trim()) return;
+    if (!selectedContract || !marginDraft) return;
+    // Sama seperti markup dokumen upload: alasan opsional untuk Coret/Ganti,
+    // wajib hanya untuk komentar biasa.
+    const repl = marginDraftReplacement.replace(/[\r\n]+/g, " ").trim();
+    if (marginDraft.kind === "replace" && !repl) { showToast("Isi teks pengganti.", "warning"); return; }
+    const reason = marginDraftText.trim();
+    const text = reason || (marginDraft.kind === "replace" ? `Usul ganti: "${marginDraft.quote}" → "${repl}"` : marginDraft.kind === "strike" ? `Usul hapus: "${marginDraft.quote}"` : "");
+    if (!text) return;
     setMarginBusy(true);
     try {
       const res = await fetch(`/api/contracts/${selectedContract.id}/comments`, {
@@ -5164,20 +6205,178 @@ export default function App() {
         body: JSON.stringify({
           clauseId: marginDraft.clauseId,
           clauseTitle: marginDraft.clauseTitle,
-          text: marginDraftText.trim(),
+          text,
           kind: marginDraft.kind,
           anchor: { start: marginDraft.start, end: marginDraft.end, quote: marginDraft.quote },
+          ...(marginDraft.kind !== "comment" ? { clauseMarkup: true } : {}),
+          ...(marginDraft.kind === "replace" ? { replacement: repl } : {}),
         }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        showToast(err.error || "Gagal menambahkan komentar", "warning");
+        return;
+      }
+      const data = await res.json();
+      setClauseComments((prev) => [...prev, data.comment]);
+      const kindDone = marginDraft.kind;
+      setMarginDraft(null);
+      setMarginDraftText("");
+      setMarginDraftReplacement("");
+      setActiveMarginId(data.comment.id);
+      showToast(kindDone === "replace" ? "Usulan ganti ditambahkan" : kindDone === "strike" ? "Usulan coret ditambahkan" : "Komentar ditambahkan", "success");
+    } catch {
+      showToast("Gagal menambahkan komentar", "warning");
+    } finally {
+      setMarginBusy(false);
+    }
+  };
+
+  // Kontrak upload: berkas tampil apa adanya (baca-saja), jadi komentarnya
+  // komentar UMUM untuk dokumen (clauseId "__document__", tanpa anchor).
+  const submitDocumentComment = async () => {
+    if (!selectedContract || !docCommentText.trim()) return;
+    setMarginBusy(true);
+    try {
+      const res = await fetch(`/api/contracts/${selectedContract.id}/comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clauseId: "__document__", clauseTitle: "Dokumen", text: docCommentText.trim(), kind: "comment" }),
       });
       if (!res.ok) { showToast("Gagal menambahkan komentar", "warning"); return; }
       const data = await res.json();
       setClauseComments((prev) => [...prev, data.comment]);
-      setMarginDraft(null);
-      setMarginDraftText("");
-      setActiveMarginId(data.comment.id);
-      showToast(marginDraft.kind === "strike" ? "Usulan coret ditambahkan" : "Komentar ditambahkan", "success");
+      setDocCommentText("");
+      showToast("Komentar ditambahkan", "success");
     } catch {
       showToast("Gagal menambahkan komentar", "warning");
+    } finally {
+      setMarginBusy(false);
+    }
+  };
+
+  // Kirim markup (komentar / coret / ganti) pada teks yang disorot di dokumen .docx.
+  const submitDocMarkup = async () => {
+    if (!selectedContract || !docMarkupDraft) return;
+    const d = docMarkupDraft;
+    const repl = docMarkupReplacement.replace(/[\r\n]+/g, " ").trim();
+    if (d.kind === "replace" && !repl) { showToast("Isi teks pengganti.", "warning"); return; }
+    const reason = docMarkupText.trim();
+    const text = reason || (d.kind === "replace" ? `Usul ganti: "${d.quote}" → "${repl}"` : d.kind === "strike" ? `Usul hapus: "${d.quote}"` : "");
+    if (!text) { showToast("Tulis komentarnya.", "warning"); return; }
+    setMarginBusy(true);
+    try {
+      const res = await fetch(`/api/contracts/${selectedContract.id}/comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clauseId: "__document__", clauseTitle: "Dokumen", text, kind: d.kind,
+          anchor: { start: d.start, end: d.end, quote: d.quote },
+          docAnchor: { paraIndex: d.paraIndex },
+          ...(d.kind === "replace" ? { replacement: repl } : {}),
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { showToast(data.error || "Gagal menambahkan markup", "warning"); return; }
+      setClauseComments((prev) => [...prev, data.comment]);
+      setDocMarkupDraft(null); setDocMarkupText(""); setDocMarkupReplacement("");
+      setActiveMarginId(data.comment.id);
+      showToast(d.kind === "comment" ? "Komentar ditambahkan" : "Usulan ditambahkan", "success");
+    } catch {
+      showToast("Gagal menambahkan markup", "warning");
+    } finally {
+      setMarginBusy(false);
+    }
+  };
+
+  const putMarkupStatus = async (cmt: ClauseComment, status: "accepted" | "rejected") => {
+    if (!selectedContract) return false;
+    const res = await fetch(`/api/contracts/${selectedContract.id}/comments/${cmt.id}`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { showToast(data.error || "Gagal menyimpan status usulan", "warning"); return false; }
+    setClauseComments((prev) => prev.map((c) => (c.id === cmt.id ? { ...c, ...data.comment } : c)));
+    return true;
+  };
+
+  // Terima usulan: terapkan ke berkas .docx sebagai VERSI BARU, lalu tandai diterima.
+  const handleAcceptMarkup = async (cmt: ClauseComment) => {
+    if (!selectedContract || !cmt.docAnchor || !cmt.anchor) return;
+    setMarginBusy(true);
+    try {
+      const note = cmt.kind === "replace"
+        ? `Terima usulan ${cmt.userName}: "${cmt.anchor.quote}" → "${cmt.replacement || ""}"`
+        : `Terima usulan hapus dari ${cmt.userName}: "${cmt.anchor.quote}"`;
+      const r = await acceptDocxMarkup(selectedContract.id, {
+        paraIndex: cmt.docAnchor.paraIndex, quote: cmt.anchor.quote, start: cmt.anchor.start,
+        replacement: cmt.kind === "replace" ? (cmt.replacement || "") : "",
+      }, note.slice(0, 480));
+      setDocReloadKey((k) => k + 1);
+      const saved = await putMarkupStatus(cmt, "accepted");
+      fetchInitialData();
+      showToast(saved ? `Usulan diterima — tersimpan sebagai Versi ${r.version}.` : `Dokumen sudah diperbarui (Versi ${r.version}), tetapi status usulan gagal disimpan.`, saved ? "success" : "warning");
+    } catch (e: any) {
+      showToast(e?.message || "Gagal menerapkan usulan", "warning");
+    } finally {
+      setMarginBusy(false);
+    }
+  };
+
+  // Terima usulan Coret/Ganti pada PASAL template: terapkan ke teks pasal dan
+  // simpan sebagai versi baru draf (riwayat versi tetap utuh), lalu tandai
+  // diterima. Kutipan dicari di isi pasal MENTAH (bukan teks tampil), jadi
+  // bila kutipannya melintasi {{variabel}} atau format tebal/miring, usulan
+  // tidak diterapkan otomatis — pengguna diminta mengubah manual di Editor Pasal.
+  const handleAcceptClauseMarkup = async (cmt: ClauseComment) => {
+    if (!selectedContract || !cmt.anchor?.quote) return;
+    const quote = cmt.anchor.quote;
+    const idx = selectedContract.clauses.findIndex((x, i) => (x.id || String(i)) === cmt.clauseId);
+    if (idx < 0) { showToast("Pasal untuk usulan ini tidak ditemukan lagi.", "warning"); return; }
+    const raw = String(selectedContract.clauses[idx].content || "");
+    const display = stripHtmlOnly(substituteVars(raw, selectedContract.variables));
+    // Kemunculan ke-n kutipan (n dihitung dari teks tampil sebelum posisi sorotan)
+    // dipakai untuk memilih kemunculan yang sama di teks mentah.
+    let nth = 0;
+    for (let from = display.indexOf(quote); from >= 0 && from < cmt.anchor.start; from = display.indexOf(quote, from + 1)) nth++;
+    let at = -1;
+    for (let i = 0, from = 0; i <= nth; i++) {
+      at = raw.indexOf(quote, from);
+      if (at < 0) break;
+      from = at + 1;
+    }
+    if (at < 0) {
+      showToast("Kutipan tidak ditemukan utuh di isi pasal (mungkin melintasi {{variabel}} atau format tebal/miring). Ubah manual lewat Editor Pasal, lalu tolak usulan ini.", "warning");
+      return;
+    }
+    const isRich = /<\/?[a-z][^>]*>/i.test(raw);
+    const insert = cmt.kind === "replace" ? (isRich ? escapeHtml(cmt.replacement || "") : (cmt.replacement || "")) : "";
+    const before = raw.slice(0, at);
+    let after = raw.slice(at + quote.length);
+    // Coret: rapikan spasi ganda yang tersisa di bekas potongan.
+    if (!insert && before.endsWith(" ") && after.startsWith(" ")) after = after.slice(1);
+    const updated: Contract = {
+      ...selectedContract,
+      clauses: selectedContract.clauses.map((c, i) => (i === idx ? { ...c, content: before + insert + after } : c)),
+    };
+    setMarginBusy(true);
+    try {
+      const note = cmt.kind === "replace"
+        ? `Terima usulan ${cmt.userName}: "${quote}" → "${cmt.replacement || ""}"`
+        : `Terima usulan hapus dari ${cmt.userName}: "${quote}"`;
+      const saved = await handleUpdateContractDraft(note.slice(0, 480), updated);
+      if (!saved) return; // galat sudah ditampilkan oleh handleUpdateContractDraft
+      const marked = await putMarkupStatus(cmt, "accepted");
+      if (!marked) showToast("Pasal sudah diperbarui, tetapi status usulan gagal disimpan.", "warning");
+    } finally {
+      setMarginBusy(false);
+    }
+  };
+
+  const handleRejectMarkup = async (cmt: ClauseComment) => {
+    setMarginBusy(true);
+    try {
+      if (await putMarkupStatus(cmt, "rejected")) showToast("Usulan ditolak — dokumen tidak berubah.", "info");
     } finally {
       setMarginBusy(false);
     }
@@ -5369,6 +6568,7 @@ export default function App() {
     if (isCreating && newContractForm.category && newContractForm.creationMode === "smart") {
       const params = new URLSearchParams({ category: newContractForm.category });
       if (newContractForm.docType) params.set("docType", newContractForm.docType);
+      if (newContractForm.platform) params.set("platform", newContractForm.platform);
       fetch(`/api/contracts/generate-number?${params.toString()}`)
         .then(r => r.json())
         .then(data => {
@@ -5378,7 +6578,7 @@ export default function App() {
         })
         .catch(err => console.error("Error fetching contract number:", err));
     }
-  }, [isCreating, newContractForm.category, newContractForm.docType, newContractForm.creationMode]);
+  }, [isCreating, newContractForm.category, newContractForm.docType, newContractForm.platform, newContractForm.creationMode]);
 
   // CATATAN: form Pendaftaran Dokumen (arsip) & mode Upload di wizard = murni
   // unggah PDF, jadi nomornya DIISI BEBAS oleh user (nomor dari vendor/dokumen
@@ -5396,11 +6596,12 @@ export default function App() {
     }
     const params = new URLSearchParams({ category: newContractForm.category });
     if (newContractForm.docType) params.set("docType", newContractForm.docType);
+    if (newContractForm.platform) params.set("platform", newContractForm.platform);
     fetch(`/api/contracts/generate-number?${params.toString()}`)
       .then((r) => r.json())
       .then((data) => setUploadNumberPreview(data.contractNumber || ""))
       .catch((err) => console.error("Error fetching upload number preview:", err));
-  }, [isCreating, newContractForm.creationMode, newContractForm.category, newContractForm.docType]);
+  }, [isCreating, newContractForm.creationMode, newContractForm.category, newContractForm.docType, newContractForm.platform]);
 
   const [docRegNumberPreview, setDocRegNumberPreview] = useState("");
   useEffect(() => {
@@ -5422,6 +6623,7 @@ export default function App() {
     if (!renewSource) return;
     const params = new URLSearchParams({ category: renewSource.category });
     if (renewSource.docType) params.set("docType", renewSource.docType);
+    if (renewSource.platform) params.set("platform", renewSource.platform);
     fetch(`/api/contracts/generate-number?${params.toString()}`)
       .then(r => r.json())
       .then(data => {
@@ -5436,6 +6638,7 @@ export default function App() {
   useEffect(() => {
     if (!addendumSource) return;
     const params = new URLSearchParams({ category: addendumSource.category, docType: "Addendum / Amandemen" });
+    if (addendumSource.platform) params.set("platform", addendumSource.platform);
     fetch(`/api/contracts/generate-number?${params.toString()}`)
       .then(r => r.json())
       .then(data => {
@@ -5489,6 +6692,7 @@ export default function App() {
       setNotifications(resNotifications);
       if (resSettings) setAppSettings(resSettings);
       setSubFolders(resSubFolders || []);
+      fetchTenantPlatforms();
       fetchDcsDocs();
       fetchDcsDocTypes();
       fetchDcsNumberingRule();
@@ -5868,7 +7072,7 @@ export default function App() {
       return;
     }
     if (newContractForm.creationMode === "upload" && !newContractForm.masterPdfFile) {
-      showToast("Harap unggah master kontrak PDF", "warning");
+      showToast("Harap unggah berkas kontrak (PDF atau Word)", "warning");
       return;
     }
 
@@ -5962,6 +7166,7 @@ export default function App() {
           title: "",
           category: "Vendor",
           docType: "",
+          platform: "",
           creationMode: "smart",
           parties: [
             { role: "Pihak Pertama", name: appSettings.companyName || "[Nama perusahaan belum diisi]", type: "Company" },
@@ -6130,7 +7335,7 @@ export default function App() {
     // berubah), lalu respons lama itu menimpa balik update optimistis di
     // layar — persis gejala "toast tersimpan, tapi tampilan gak berubah".
     const target = contractOverride || selectedContract;
-    if (!target) return;
+    if (!target) return false;
 
     try {
       const res = await fetch(`/api/contracts/${target.id}`, {
@@ -6154,14 +7359,17 @@ export default function App() {
         const versions = await resVersions.json();
         setContractVersions(versions);
         fetchInitialData();
+        return true;
       } else {
         // dulu tidak ada else → penolakan validasi server (success:false) senyap,
         // user tak tahu simpanannya gagal. Sekarang selalu munculkan pop-up.
         showToast(data.error || "Gagal menyimpan perubahan", "warning");
+        return false;
       }
     } catch (err) {
       console.error(err);
       showToast("Gagal menyimpan perubahan", "warning");
+      return false;
     }
   };
 
@@ -6895,10 +8103,32 @@ export default function App() {
       showToast("Dokumen belum bisa diunduh — selesaikan approval matriks terlebih dahulu.", "warning");
       return;
     }
-    // Dokumen Upload: yang diekspor adalah BERKAS dokumen versi aktif apa
-    // adanya (layout asli), bukan screenshot preview template.
+    // Dokumen Upload: tanyakan dulu format unduhan (Word atau PDF) lewat
+    // pop-up — isi yang diunduh tetap BERKAS versi aktif apa adanya (layout
+    // asli), bukan screenshot preview template.
     if (isUploadedDocument(selectedContract)) {
-      window.location.href = `/api/contracts/${selectedContract.id}/document?version=current&download=1`;
+      const sourceFormat = selectedContract.currentDocument?.format as SourceDocFormat;
+      // Gambar/format lain tidak punya opsi Word maupun PDF sama sekali (tidak
+      // ada konversi yang berlaku) — pop-up di kasus ini hanya akan menampilkan
+      // dua tombol nonaktif tanpa jalan keluar. Unduh langsung saja seperti
+      // sebelumnya, sama seperti tombol "Download" di kartu dokumen.
+      if (sourceFormat !== "docx" && sourceFormat !== "pdf" && sourceFormat !== "doc") {
+        window.location.href = `/api/contracts/${selectedContract.id}/document?version=current&download=1`;
+        return;
+      }
+      // PDF dari .docx SELALU bisa diunduh (LibreOffice kalau ada, atau
+      // fallback mammoth+pdf-lib yg 100% gratis/open source kalau tidak) —
+      // officeToPdfExact hanya menentukan pesan info di pop-up, bukan
+      // mengaktifkan/menonaktifkan tombolnya.
+      let officeToPdfExact = false;
+      try {
+        const r = await fetch(`/api/contracts/${selectedContract.id}/document-versions`);
+        if (r.ok) officeToPdfExact = !!(await r.json()).capabilities?.officeToPdfExact;
+      } catch {
+        // Biarkan false — pop-up tetap menampilkan opsi PDF (fallback selalu
+        // tersedia utk .docx), hanya catatan "tata letak sederhana" yg tampil.
+      }
+      setDocDownloadPicker({ contractId: selectedContract.id, sourceFormat, officeToPdfAvailable: officeToPdfExact });
       return;
     }
     try {
@@ -7105,6 +8335,38 @@ export default function App() {
   // Nyala/matikan kotak placeholder "Meterai Rp10.000" di ruang TTD. Beda
   // dari toggle kop di atas: default-nya OFF (opt-in), bukan ON — lihat
   // komentar showMeteraiPlaceholder di types.ts.
+  const [releaseSaving, setReleaseSaving] = useState(false);
+  const [releaseModalOpen, setReleaseModalOpen] = useState(false);
+  // Kirim pengumuman rilis (penerima per NAMA + keterangan) — hanya utk kontrak Aktif.
+  const handleAnnounceRelease = async (ids: string[], note: string) => {
+    if (!selectedContract) return;
+    setReleaseSaving(true);
+    try {
+      const res = await fetch(`/api/contracts/${selectedContract.id}/announce-release`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ userIds: ids, note }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // 404 tanpa pesan JSON = rute belum ada di server (server.ts lama / belum di-restart).
+        showToast(data.error || (res.status === 404
+          ? "Server belum mendukung fitur ini — pasang server.ts terbaru lalu restart server (npm run dev)."
+          : `Gagal mengirim pengumuman rilis (HTTP ${res.status}).`), "warning");
+        return;
+      }
+      const next = { ...selectedContract, releaseAnnouncements: data.contract?.releaseAnnouncements || selectedContract.releaseAnnouncements };
+      // Jangan sampai ini membuat "Simpan Draft" mengira ada perubahan isi yang belum tersimpan.
+      if (JSON.stringify(selectedContract) === draftSavedSnapshot) setDraftSavedSnapshot(JSON.stringify(next));
+      setSelectedContract(next);
+      setContracts((prev) => prev.map((c) => (c.id === next.id ? { ...c, releaseAnnouncements: next.releaseAnnouncements } : c)));
+      setReleaseModalOpen(false);
+      showToast(`Pengumuman rilis terkirim ke ${ids.length} orang.`, "success");
+    } catch {
+      showToast("Gagal mengirim pengumuman rilis.", "warning");
+    } finally {
+      setReleaseSaving(false);
+    }
+  };
+
   const handleToggleMeteraiPlaceholder = async () => {
     if (!selectedContract) return;
     const next = !selectedContract.showMeteraiPlaceholder;
@@ -8999,6 +10261,8 @@ export default function App() {
       const data = await res.json();
       if (data.success) {
         setTenantForm(null);
+        setTenantPlatformInput("");
+        fetchTenantPlatforms();
         showToast(isEdit ? "Perusahaan diperbarui" : `Perusahaan "${data.tenant.name}" dibuat dengan admin ${data.admin?.email}`, "success");
         fetchAllTenants();
       } else {
@@ -10662,7 +11926,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
+    <div className="min-h-screen text-slate-100 flex flex-col font-sans">
       {/* Kontrol gambar mengambang ala Canva — global, lepas dari alur
           dokumen manapun (lihat komentar di definisi komponennya). */}
       <ImageSelectionOverlay />
@@ -10682,7 +11946,7 @@ export default function App() {
             ? { icon: <Bell className="text-indigo-500 w-4 h-4 shrink-0" />, ring: "border-indigo-500/40", bar: "bg-indigo-500" }
             : { icon: <CheckCircle className="text-emerald-500 w-4 h-4 shrink-0" />, ring: "border-emerald-500/40", bar: "bg-emerald-500" };
         return (
-          <div className={`fixed top-5 right-5 z-[100] animate-fadeIn shadow-2xl flex items-center gap-2.5 pl-3.5 pr-4 py-3 rounded-lg border bg-white text-slate-100 ${style.ring} overflow-hidden max-w-sm`} role="status" aria-live="polite">
+          <div className={`fixed top-5 right-5 z-[100] animate-fadeIn shadow-2xl flex items-center gap-2.5 pl-3.5 pr-4 py-3 rounded-lg border bg-slate-900 text-slate-100 ${style.ring} overflow-hidden max-w-sm`} role="status" aria-live="polite">
             <span className={`absolute left-0 top-0 bottom-0 w-1 ${style.bar}`} />
             {style.icon}
             <p className="text-[13px] font-semibold leading-snug">{toast.message}</p>
@@ -10690,50 +11954,623 @@ export default function App() {
         );
       })()}
 
-      {/* Top Header */}
-      <header className="border-b border-white/5 bg-slate-950/40 backdrop-blur-xl px-6 py-4 flex items-center justify-between sticky top-0 z-40">
-        <div className="flex items-center gap-3 min-w-0">
-          {/* Fallback toggle buat mobile — di desktop dipindah jadi handle
-              di pembatas sidebar (lihat dekat <aside>). */}
-          <button
-            onClick={() => setSidebarOpen((o) => !o)}
-            className="md:hidden p-2 rounded-lg hover:bg-slate-800/40 transition cursor-pointer text-slate-400 hover:text-slate-100 shrink-0"
-            title={sidebarOpen ? "Sembunyikan sidebar" : "Tampilkan sidebar"}
-            aria-label="Tampilkan/sembunyikan sidebar"
-          >
-            {sidebarOpen ? <PanelLeftClose className="w-[18px] h-[18px]" /> : <PanelLeftOpen className="w-[18px] h-[18px]" />}
-          </button>
 
-          <div className="w-9 h-9 rounded-lg bg-indigo-500/10 border border-indigo-500/25 flex items-center justify-center shrink-0">
-            <FileText className="text-indigo-400 w-[18px] h-[18px]" strokeWidth={2.25} />
-          </div>
-          <div className="hidden sm:block shrink-0">
-            <h1 className="font-semibold text-[15px] leading-tight text-slate-100 tracking-tight">
-              Smart CLM Enterprise
-            </h1>
-            <p className="text-[11px] text-slate-500">
-              General Affair &amp; Legal · {currentTenant?.name || "…"}
-            </p>
-          </div>
-
-          {/* Ucapan selamat datang — cuma tampil di Dashboard, ilang di tab lain. */}
-          {activeTab === "dashboard" && (
-            <div className="hidden lg:flex items-center gap-2 pl-4 ml-1 border-l border-slate-800 min-w-0 animate-fadeIn">
-              <span className="text-base leading-none shrink-0">👋</span>
-              <p className="text-[13px] text-slate-300 truncate">
-                Selamat datang kembali, <span className="font-semibold text-slate-100">{currentUser.name}</span>
-              </p>
+      {/* Main Body */}
+      <div className="flex-1 flex flex-col md:flex-row">
+        {sidebarOpen && (
+        <aside
+          className="w-auto md:w-64 px-5 py-6 shrink-0 flex flex-col gap-4 rounded-[28px] bg-slate-900 card-soft"
+          style={isDesktop ? { position: "sticky", top: 16, alignSelf: "flex-start", height: "calc(100vh / var(--ui-zoom, 1) - 2rem)", maxHeight: "calc(100vh / var(--ui-zoom, 1) - 2rem)", overflow: "hidden", margin: "16px 0 16px 16px" } : { margin: 16 }}
+        >
+          <div className="flex flex-col flex-1 min-h-0 gap-2">
+            <div className="flex items-center gap-2.5 px-1 pb-3 shrink-0">
+              <div className="w-9 h-9 rounded-full bg-soft-blue flex items-center justify-center shrink-0">
+                <FileText className="text-white w-[18px] h-[18px]" strokeWidth={2.25} />
+              </div>
+              <div className="min-w-0">
+                <h1 className="font-medium text-[18px] leading-tight text-slate-100 truncate">Smart CLM</h1>
+                <p className="text-[10px] text-slate-500 truncate">{currentTenant?.name || "Enterprise"}</p>
+              </div>
+              <button
+                onClick={() => setSidebarOpen(false)}
+                className="hidden md:flex ml-auto w-9 h-9 items-center justify-center rounded-full bg-slate-950 hover:bg-slate-850 text-slate-400 hover:text-slate-100 transition cursor-pointer shrink-0"
+                title="Ciutkan sidebar"
+                aria-label="Ciutkan sidebar"
+              >
+                <PanelLeftClose className="w-4 h-4" />
+              </button>
             </div>
-          )}
-        </div>
 
-        <div className="flex items-center gap-3">
-          {/* Search bar — ikon di ujung kanan, dalam tombol berwarna (aksen indigo).
-              Dropdown-nya nyari 2 hal sekaligus: fitur/halaman (MENU_ITEMS) dan
-              kontrak yang cocok — supaya bener-bener "search semua fitur", bukan
-              cuma tabel dokumen. */}
+            <FadeScroll className="space-y-4 -mx-1 pl-1 pr-2">
+            <div>
+              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-3 mb-2">
+                MENU UTAMA
+              </p>
+
+              {canSee("dashboard") && (
+              <button
+                onClick={() => {
+                  setActiveTab("dashboard");
+                  setSelectedContract(null);
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "dashboard"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <LayoutDashboard className="w-4 h-4" />
+                Dashboard
+              </button>
+              )}
+
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-3 mt-5 mb-1.5">
+                Legal
+              </p>
+              {canSee("dashboard-legal") && (
+              <button
+                onClick={() => { setActiveTab("dashboard-legal"); setSelectedContract(null); }}
+                className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "dashboard-legal"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <LayoutDashboard className="w-4 h-4" />
+                Dashboard Legal
+              </button>
+              )}
+              {canSee("pekerjaan-legal") && (
+              <button
+                onClick={() => { setActiveTab("pekerjaan-legal"); setSelectedContract(null); }}
+                className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "pekerjaan-legal"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <ClipboardList className="w-4 h-4" />
+                Pekerjaan Legal
+              </button>
+              )}
+
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-3 mt-5 mb-1.5" title="Perjanjian dengan pihak kedua — disetujui lewat matriks approval, ditandatangani manual (TTD basah) di luar sistem, meterai opsional.">
+                Dokumen Eksternal &middot; Kontrak
+              </p>
+              {canSee("monitoring") && (
+              <button
+                onClick={() => {
+                  setActiveTab("monitoring");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center justify-between px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "monitoring"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Bell className="w-4 h-4" />
+                  <span>Monitoring Kontrak</span>
+                </div>
+                {(() => {
+                  const now = new Date();
+                  const isEmp = (c: Contract) => c.party2Type === "Karyawan" || c.party2Type === "Employee";
+                  const expiringCount = contracts.filter((c) => {
+                    if (isEmp(c) || c.status === "Terminated" || c.status === "Archived") return false;
+                    const days = Math.ceil((new Date(c.endDate).getTime() - now.getTime()) / 86400000);
+                    return days <= (c.reminderDaysBefore || 30) && days > -3650;
+                  }).length;
+                  return expiringCount > 0 ? (
+                    <span className="bg-amber-500/20 text-amber-400 text-[10px] px-2 py-0.5 rounded-full font-bold">
+                      {expiringCount}
+                    </span>
+                  ) : null;
+                })()}
+              </button>
+              )}
+
+              {canSee("kontrak-karyawan") && (
+              <button
+                onClick={() => {
+                  setActiveTab("kontrak-karyawan");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center justify-between px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "kontrak-karyawan"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Users className="w-4 h-4" />
+                  <span>Kontrak Karyawan</span>
+                </div>
+                {(() => {
+                  const isEmp = (c: Contract) => c.party2Type === "Karyawan" || c.party2Type === "Employee";
+                  const cnt = contracts.filter(isEmp).length;
+                  return cnt > 0 ? (
+                    <span className="bg-emerald-500/20 text-emerald-400 text-[10px] px-2 py-0.5 rounded-full font-bold">{cnt}</span>
+                  ) : null;
+                })()}
+              </button>
+              )}
+
+              {canSee("clauses") && (
+              <button
+                onClick={() => {
+                  setActiveTab("clauses");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "clauses"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Sliders className="w-4 h-4" />
+                Library Klausul & Tpl
+              </button>
+              )}
+
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-3 mt-5 mb-1.5" title="SOP, Instruksi Kerja, Memo, Kebijakan — tidak ada Pihak Kedua, ditandatangani digital di dalam sistem, tidak perlu meterai.">
+                Dokumen Internal &middot; DCS
+              </p>
+              {canSee("internal-docs") && (
+              <button
+                onClick={() => {
+                  setActiveTab("internal-docs");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "internal-docs"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Workflow className="w-4 h-4" />
+                Dokumen Internal (DCS)
+              </button>
+              )}
+
+              <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider px-3 mt-5 mb-1.5" title="Gabungan dokumen dari kedua jalur — menampilkan kontrak eksternal maupun dokumen DCS bersama-sama.">
+                Arsip &amp; Daftar &middot; Gabungan
+              </p>
+              {canSee("arsip") && (
+              <button
+                onClick={() => {
+                  setActiveTab("arsip");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "arsip"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+                title="Dokumen tersusun per folder & subfolder — untuk menelusuri berdasarkan pengelompokan."
+              >
+                <FolderOpen className="w-4 h-4" />
+                Arsip per Folder
+              </button>
+              )}
+
+              {canSee("all-docs") && (
+              <button
+                onClick={() => {
+                  setActiveTab("all-docs");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "all-docs"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+                title="Satu tabel datar berisi semua kontrak & dokumen DCS — untuk aksi massal, penyaringan, dan ekspor CSV."
+              >
+                <CheckSquare className="w-4 h-4" />
+                Tabel Semua Dokumen
+              </button>
+              )}
+
+              {canSee("konfigurasi") && (
+              <button
+                onClick={() => {
+                  setActiveTab("konfigurasi");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "konfigurasi"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Sliders className="w-4 h-4" />
+                Konfigurasi & Master Data
+              </button>
+              )}
+
+              {canSee("audits") && (
+              <button
+                onClick={() => {
+                  setActiveTab("audits");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "audits"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Settings className="w-4 h-4" />
+                Audit Trail
+              </button>
+              )}
+
+              {canSee("audit-kontrak-dcs") && (
+              <button
+                onClick={() => {
+                  setActiveTab("audit-kontrak-dcs");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "audit-kontrak-dcs"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+                title="Audit Trail yang sama, disaring khusus Kontrak Eksternal, Kontrak Karyawan, dan Dokumen DCS."
+              >
+                <Layers className="w-4 h-4" />
+                Audit Kontrak &amp; DCS
+              </button>
+              )}
+
+              {canSee("kalender-legal") && (
+              <button
+                onClick={() => {
+                  setActiveTab("kalender-legal");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "kalender-legal"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <CalendarDays className="w-4 h-4" />
+                Kalender Legal
+              </button>
+              )}
+
+              {canSee("retensi-arsip") && (
+              <button
+                onClick={() => {
+                  setActiveTab("retensi-arsip");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "retensi-arsip"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Archive className="w-4 h-4" />
+                Retensi Arsip
+              </button>
+              )}
+
+              {canSee("performa-vendor") && (
+              <button
+                onClick={() => {
+                  setActiveTab("performa-vendor");
+                  setSelectedContract(null);
+                }}
+                className={`w-full mt-1 flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                  activeTab === "performa-vendor"
+                    ? "bg-soft-blue text-white"
+                    : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                }`}
+              >
+                <Star className="w-4 h-4" />
+                Performa Vendor
+              </button>
+              )}
+
+            </div>
+
+            {canSee("ai-tools") && (
+            <div className="pt-2">
+              <button
+                onClick={() => setShowToolsMenu(!showToolsMenu)}
+                className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-[10px] font-bold text-slate-500 uppercase tracking-widest hover:text-slate-300 transition cursor-pointer"
+              >
+                <span>AI Tools Hukum</span>
+                <ChevronRight
+                  className={`w-3.5 h-3.5 transition-transform ${showToolsMenu ? "rotate-90" : ""}`}
+                />
+              </button>
+
+              {showToolsMenu && (
+                <div className="space-y-1 animate-fadeIn">
+                  <button
+                    onClick={() => {
+                      setActiveTab("pusat-peraturan");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "pusat-peraturan"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <Scale className="w-4 h-4" />
+                    Pusat Peraturan
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("putusan-pengadilan");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "putusan-pengadilan"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <FolderOpen className="w-4 h-4" />
+                    Putusan Pengadilan
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("opini-hukum");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "opini-hukum"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <MessageSquare className="w-4 h-4" />
+                    Opini Hukum
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("terjemah-dokumen");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "terjemah-dokumen"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <Languages className="w-4 h-4" />
+                    Terjemah Teks Lepas
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("review-dokumen");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "review-dokumen"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <Search className="w-4 h-4" />
+                    Audit Risiko Naskah
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("bandingkan-dokumen");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "bandingkan-dokumen"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <ArrowLeftRight className="w-4 h-4" />
+                    Bandingkan 2 Dokumen
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("buat-draft-ai");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "buat-draft-ai"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    Buat Naskah Draft AI
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("tabular");
+                      setSelectedContract(null);
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "tabular"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <LayoutDashboard className="w-4 h-4" />
+                    Analisis Tabular
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setActiveTab("analytics");
+                      setSelectedContract(null);
+                      fetchAnalytics();
+                    }}
+                    className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-full text-[13px] font-medium text-left transition cursor-pointer ${
+                      activeTab === "analytics"
+                        ? "bg-soft-blue text-white"
+                        : "text-slate-400 hover:bg-slate-950 hover:text-slate-100"
+                    }`}
+                  >
+                    <LineChart className="w-4 h-4" />
+                    Analytics & Risk
+                  </button>
+                </div>
+              )}
+            </div>
+            )}
+            </FadeScroll>
+          </div>
+
+          <div className="space-y-3 pt-3 shrink-0 border-t border-slate-800">
+            <div className="relative group px-1">
+            <button className="w-full flex items-center gap-3 py-1 transition cursor-pointer">
+              <div className="w-11 h-11 rounded-full bg-indigo-600 flex items-center justify-center text-white font-semibold text-sm shrink-0">
+                {(currentUser.name || "U").trim().charAt(0).toUpperCase()}
+              </div>
+              <div className="text-left leading-tight flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-100 truncate">{currentUser.name}</p>
+                <p className="text-[10.5px] text-slate-500">
+                  {({ super_admin: "Super Admin", admin: "Admin", legal: "Legal", manager: "Manager", staff: "Staff", viewer: "Viewer" } as any)[currentUser.role] || currentUser.role}
+                </p>
+              </div>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+            </button>
+            <div className="absolute left-0 bottom-[calc(100%-6px)] w-full min-w-[13rem] bg-slate-900 card-soft rounded-[20px] py-1.5 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition z-50">
+              <button
+                onClick={() => setIsChangingPassword(true)}
+                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+              >
+                <Settings className="w-3.5 h-3.5" /> Ganti Kata Sandi
+              </button>
+              {/* Diletakkan di menu akun, bukan di Konfigurasi: orang yang mau
+                  cuti harus bisa menunjuk penggantinya sendiri tanpa menunggu
+                  admin — itu inti masalah "approver cuti, dokumen mandek". */}
+              <button
+                onClick={() => setShowDelegationModal(true)}
+                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+              >
+                <Users className="w-3.5 h-3.5" /> Delegasi Persetujuan
+                {myDelegation?.active && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/25 text-violet-800 font-bold">AKTIF</span>}
+              </button>
+              <button
+                onClick={() => { setTwoFaPhase("status"); setTwoFaError(""); setShow2faModal(true); }}
+                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+              >
+                <ShieldAlert className="w-3.5 h-3.5" /> Verifikasi Dua Langkah (2FA)
+                {currentUser?.totpEnabled && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-500/25 text-emerald-800 font-bold">AKTIF</span>}
+              </button>
+              <button
+                onClick={handleLogout}
+                className="w-full text-left px-3 py-2 text-xs text-rose-400 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
+              >
+                <ExternalLink className="w-3.5 h-3.5" /> Keluar
+              </button>
+            </div>
+            </div>
+          </div>
+                </aside>
+        )}
+        {/* Sidebar tersembunyi → tersisa rel ikon sempit (logo + ikon menu), bukan hilang total. */}
+        {!sidebarOpen && (
+          <aside
+            className="hidden md:flex flex-col items-center w-[76px] shrink-0 rounded-[28px] bg-slate-900 card-soft py-6 gap-2"
+            style={{ position: "sticky", top: 16, alignSelf: "flex-start", height: "calc(100vh / var(--ui-zoom, 1) - 2rem)", maxHeight: "calc(100vh / var(--ui-zoom, 1) - 2rem)", overflow: "hidden", margin: "16px 0 16px 16px" }}
+          >
+            <div className="w-10 h-10 rounded-full bg-soft-blue flex items-center justify-center shrink-0" title="Smart CLM">
+              <FileText className="text-white w-[18px] h-[18px]" strokeWidth={2.25} />
+            </div>
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="w-11 h-11 rounded-[14px] flex items-center justify-center text-slate-400 hover:text-slate-100 hover:bg-slate-950 transition cursor-pointer shrink-0"
+              title="Perluas sidebar"
+              aria-label="Perluas sidebar"
+            >
+              <PanelLeftOpen className="w-[18px] h-[18px]" />
+            </button>
+            <div className="w-8 h-px bg-slate-800 shrink-0" />
+            <nav className="flex-1 min-h-0 w-full overflow-y-auto no-scrollbar flex flex-col items-center gap-1.5 py-1">
+              {MENU_ITEMS.filter((m) => canSee(m.id)).map((m) => {
+                const RailIcon: any = ({
+                  dashboard: LayoutDashboard, "dashboard-legal": Scale, "pekerjaan-legal": ClipboardList, monitoring: FileCheck,
+                  "kontrak-karyawan": Users, clauses: Layers, "internal-docs": FileText, arsip: FolderOpen, "all-docs": Rows3,
+                  konfigurasi: Sliders, audits: History, "audit-kontrak-dcs": ScanText, "kalender-legal": CalendarDays,
+                  "retensi-arsip": Archive, "performa-vendor": Building2, "ai-tools": Sparkles,
+                } as Record<string, any>)[m.id] || FileText;
+                const active = activeTab === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    onClick={() => goToNavbarFeature(m.id)}
+                    className={`w-11 h-11 rounded-[14px] flex items-center justify-center transition cursor-pointer shrink-0 ${active ? "bg-soft-blue text-white" : "text-slate-400 hover:text-slate-100 hover:bg-slate-950"}`}
+                    title={m.label}
+                    aria-label={m.label}
+                  >
+                    <RailIcon className="w-[18px] h-[18px]" />
+                  </button>
+                );
+              })}
+            </nav>
+            <div className="w-8 h-px bg-slate-800 shrink-0" />
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="w-10 h-10 rounded-full bg-indigo-600 flex items-center justify-center text-white font-semibold text-sm shrink-0 cursor-pointer"
+              title={currentUser.name}
+              aria-label="Buka sidebar"
+            >
+              {(currentUser.name || "U").trim().charAt(0).toUpperCase()}
+            </button>
+          </aside>
+        )}
+
+        {/* Center Dynamic Content Area */}
+        <div className="flex-1 min-w-0 flex flex-col">
+        <header className="px-6 md:px-8 pt-6 pb-2 flex items-start justify-between gap-4 flex-wrap md:flex-nowrap">
+          <div className="flex items-start gap-3 min-w-0">
+            <button
+              onClick={() => setSidebarOpen((o) => !o)}
+              className="md:hidden w-11 h-11 flex items-center justify-center rounded-full bg-slate-900 card-soft text-slate-400 hover:text-slate-100 transition cursor-pointer shrink-0"
+              title={sidebarOpen ? "Sembunyikan sidebar" : "Tampilkan sidebar"}
+              aria-label="Tampilkan/sembunyikan sidebar"
+            >
+              {sidebarOpen ? <PanelLeftClose className="w-[18px] h-[18px]" /> : <PanelLeftOpen className="w-[18px] h-[18px]" />}
+            </button>
+            {activeTab === "dashboard" && !selectedContract && (
+              <div className="min-w-0">
+                <h2 className="text-[26px] leading-tight font-medium text-slate-100 truncate">
+                  Selamat datang kembali, {(currentUser.name || "").split(" ")[0]}!
+                </h2>
+                <p className="text-[11px] text-slate-500">
+                  {criticalExpiryContracts.length > 0
+                    ? `Ada ${criticalExpiryContracts.length} kontrak yang segera berakhir.`
+                    : "Tidak ada kontrak yang mendekati masa berakhir."}
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 shrink-0">
           <div className="relative hidden md:block">
-            <div className="flex items-center gap-1.5 bg-slate-900/50 border border-slate-800 rounded-full pl-4 pr-1.5 py-1.5 w-56 lg:w-80 focus-within:border-indigo-500/50 transition">
+            <div className="flex items-center gap-2 bg-slate-900 card-soft rounded-full pl-4 pr-5 py-3 w-56 lg:w-72 transition">
+              <button
+                onClick={submitNavbarSearch}
+                className="shrink-0 text-slate-500 hover:text-slate-100 transition cursor-pointer"
+                title="Cari"
+                aria-label="Cari"
+              >
+                <Search className="w-4 h-4" />
+              </button>
               <input
                 type="text"
                 value={navbarSearch}
@@ -10750,18 +12587,10 @@ export default function App() {
                 placeholder="Cari fitur, kontrak & dokumen…"
                 className="bg-transparent border-none outline-none text-xs text-slate-200 placeholder:text-slate-500 w-full"
               />
-              <button
-                onClick={submitNavbarSearch}
-                className="shrink-0 w-7 h-7 rounded-full bg-indigo-500 hover:bg-indigo-400 flex items-center justify-center transition cursor-pointer"
-                title="Cari"
-                aria-label="Cari"
-              >
-                <Search className="w-3.5 h-3.5 text-white" />
-              </button>
             </div>
 
             {navbarSearchFocused && navbarSearch.trim().length > 0 && (
-              <div className="absolute left-0 right-0 top-full mt-2 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl py-2 max-h-96 overflow-y-auto z-50">
+              <div className="absolute left-0 right-0 top-full mt-2 bg-slate-900 card-soft rounded-[20px] py-2 max-h-96 overflow-y-auto z-50">
                 {navbarFeatureResults.length > 0 && (
                   <div className="px-2 pb-1.5">
                     <p className="px-2.5 py-1 text-[10px] font-bold text-slate-500 uppercase tracking-wide">Fitur &amp; Halaman</p>
@@ -10818,558 +12647,173 @@ export default function App() {
             )}
           </div>
 
-          {/* Dark / light theme toggle */}
+          {/* Mode terang/gelap — tombol bulat, sama bentuknya dengan lonceng. */}
           <button
             onClick={toggleTheme}
-            className="p-2 rounded-lg bg-slate-900/60 border border-slate-800 hover:bg-slate-800 transition cursor-pointer shrink-0"
+            className="w-11 h-11 flex items-center justify-center rounded-full bg-slate-900 card-soft hover:bg-slate-850 transition cursor-pointer shrink-0"
             title={theme === "dark" ? "Ganti ke mode terang" : "Ganti ke mode gelap"}
             aria-label="Ganti tema"
           >
-            {theme === "dark" ? (
-              <Sun className="w-4 h-4 text-amber-400" />
-            ) : (
-              <Moon className="w-4 h-4 text-slate-400" />
-            )}
+            {theme === "dark" ? <Sun className="w-[18px] h-[18px] text-amber-400" /> : <Moon className="w-[18px] h-[18px] text-slate-400" />}
           </button>
 
-          {/* Notifikasi — badge menumpuk di sudut ikon, gaya bulat. */}
-          <div className="relative group">
+          {/* Notifikasi — klik lonceng membuka popup (bukan lagi kartu di dashboard). */}
+          <div className="relative">
             <button
-              onClick={handleMarkNotificationsRead}
-              className="relative p-2.5 rounded-full hover:bg-slate-800/40 transition cursor-pointer"
-              title="Tandai semua telah dibaca"
+              onClick={() => setNotifOpen((o) => !o)}
+              className="relative w-11 h-11 flex items-center justify-center rounded-full bg-slate-900 card-soft hover:bg-slate-850 transition cursor-pointer"
+              title="Notifikasi"
+              aria-label="Notifikasi"
+              aria-expanded={notifOpen}
             >
-              <Bell className="w-5 h-5 text-slate-300" />
+              <Bell className="w-[18px] h-[18px] text-slate-300" />
               {notifications.filter((n) => !n.read).length > 0 && (
-                <span className="absolute top-0.5 right-0.5 bg-rose-500 text-white text-[9px] min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full font-bold ring-2 ring-slate-950">
+                <span className="absolute -top-0.5 -right-0.5 bg-brand-orange text-white text-[9px] min-w-[16px] h-4 px-1 flex items-center justify-center rounded-full font-bold">
                   {notifications.filter((n) => !n.read).length}
                 </span>
               )}
             </button>
+
+            {notifOpen && (() => {
+              const unreadCount = notifications.filter((n) => !n.read).length;
+              const list = notifTab === "unread" ? notifications.filter((n) => !n.read) : notifications;
+              const ago = (iso: string) => {
+                const m = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
+                if (!Number.isFinite(m)) return "";
+                if (m < 1) return "baru saja";
+                if (m < 60) return `${m} mnt lalu`;
+                const h = Math.floor(m / 60);
+                if (h < 24) return `${h} jam lalu`;
+                return `${Math.floor(h / 24)} hari lalu`;
+              };
+              const openNotif = (n: any) => {
+                if (n.contractId) {
+                  const c = contracts.find((con) => con.id === n.contractId);
+                  if (c) { setNotifOpen(false); handleOpenWorkspace(c); }
+                } else if (n.dcsDocumentId) {
+                  const d = dcsDocs.find((doc) => doc.id === n.dcsDocumentId);
+                  if (d) {
+                    setNotifOpen(false);
+                    setActiveTab("internal-docs");
+                    setDcsSelectedId(d.id);
+                    setDcsSelectedVersionId(d.versions[0]?.id || null);
+                  }
+                }
+              };
+              return (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setNotifOpen(false)} />
+                  <div className="absolute right-0 top-[calc(100%+12px)] w-[400px] max-w-[92vw] bg-slate-900 card-soft rounded-[28px] overflow-hidden z-50 animate-fadeIn">
+                    <div className="flex items-center justify-between gap-3 px-6 pt-5 pb-4">
+                      <h3 className="text-[17px] font-semibold text-slate-100">Notifikasi</h3>
+                      <div className="flex items-center gap-1 p-1 rounded-full bg-slate-950">
+                        {([["all", "Semua"], ["unread", `Belum dibaca${unreadCount ? ` (${unreadCount})` : ""}`]] as const).map(([k, label]) => (
+                          <button
+                            key={k}
+                            onClick={() => setNotifTab(k)}
+                            className={`px-3 py-1.5 rounded-full text-xs font-medium transition cursor-pointer ${notifTab === k ? "bg-slate-900 card-soft text-slate-100" : "text-slate-500 hover:text-slate-100"}`}
+                          >
+                            {label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <FadeScroll maxHeight="60vh" className="border-t border-slate-800">
+                      {list.length === 0 ? (
+                        <p className="text-[13px] text-slate-500 text-center py-12">
+                          {notifTab === "unread" ? "Semua notifikasi sudah dibaca." : "Tidak ada notifikasi sistem."}
+                        </p>
+                      ) : (
+                        list.slice(0, 20).map((n) => {
+                          const tone = n.type === "success" ? "bg-mist" : n.type === "danger" ? "bg-peach" : "bg-slate-950";
+                          const BadgeIcon = n.type === "success" ? CheckCircle : n.type === "danger" ? ShieldAlert : Bell;
+                          const badgeTone = n.type === "success" ? "bg-soft-blue" : n.type === "danger" ? "bg-brand-orange" : "bg-slate-500";
+                          return (
+                            <button
+                              key={n.id}
+                              onClick={() => openNotif(n)}
+                              className="w-full text-left flex items-start gap-3.5 px-6 py-4 border-b border-slate-800 last:border-0 hover:bg-slate-950 transition cursor-pointer"
+                            >
+                              <span className="relative shrink-0">
+                                <span className={`w-11 h-11 rounded-full flex items-center justify-center ${tone}`}>
+                                  <Bell className="w-[18px] h-[18px] text-slate-100" />
+                                </span>
+                                <span className={`absolute -bottom-0.5 -right-0.5 w-[18px] h-[18px] rounded-full flex items-center justify-center ring-2 ring-slate-900 ${badgeTone}`}>
+                                  <BadgeIcon className="w-2.5 h-2.5 text-white" />
+                                </span>
+                              </span>
+                              <span className="min-w-0 flex-1">
+                                <span className="flex items-baseline gap-2">
+                                  <span className="text-[13px] font-semibold text-slate-100 truncate">{n.title}</span>
+                                  <span className="text-[11px] text-slate-500 shrink-0">{ago(n.createdAt)}</span>
+                                </span>
+                                <span className="block text-[12px] text-slate-500 leading-snug mt-0.5 line-clamp-2">{n.message}</span>
+                              </span>
+                              {!n.read && <span className="w-2 h-2 rounded-full bg-soft-blue shrink-0 mt-2" />}
+                            </button>
+                          );
+                        })
+                      )}
+                    </FadeScroll>
+                    <div className="px-6 py-3 border-t border-slate-800 flex items-center justify-between">
+                      <span className="text-[11px] text-slate-500">{unreadCount} belum dibaca</span>
+                      <button
+                        onClick={handleMarkNotificationsRead}
+                        disabled={unreadCount === 0}
+                        className="px-4 py-2 rounded-full bg-slate-950 hover:bg-slate-850 text-xs font-medium text-slate-200 transition cursor-pointer disabled:opacity-40 disabled:cursor-default"
+                      >
+                        Tandai semua dibaca
+                      </button>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
           </div>
 
-          <div className="relative group">
-            <button className="flex items-center gap-2.5 pl-1 pr-2 py-1 rounded-full hover:bg-slate-800/40 transition cursor-pointer">
-              <div className="w-8 h-8 rounded-full bg-indigo-500 flex items-center justify-center text-white font-bold text-xs shrink-0">
-                {(currentUser.name || "U").trim().charAt(0).toUpperCase()}
-              </div>
-              <div className="hidden sm:block text-left leading-tight">
-                <p className="text-xs font-bold text-slate-100">{currentUser.name}</p>
-                <p className="text-[10.5px] text-slate-500">
-                  {({ super_admin: "Super Admin", admin: "Admin", legal: "Legal", manager: "Manager", staff: "Staff", viewer: "Viewer" } as any)[currentUser.role] || currentUser.role}
-                </p>
-              </div>
-              <ChevronDown className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-            </button>
-            <div className="absolute right-0 top-full mt-1 w-48 bg-slate-950 border border-slate-800 rounded-xl shadow-2xl py-1.5 opacity-0 invisible group-hover:opacity-100 group-hover:visible transition z-50">
-              <button
-                onClick={() => setIsChangingPassword(true)}
-                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
-              >
-                <Settings className="w-3.5 h-3.5" /> Ganti Kata Sandi
-              </button>
-              {/* Diletakkan di menu akun, bukan di Konfigurasi: orang yang mau
-                  cuti harus bisa menunjuk penggantinya sendiri tanpa menunggu
-                  admin — itu inti masalah "approver cuti, dokumen mandek". */}
-              <button
-                onClick={() => setShowDelegationModal(true)}
-                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
-              >
-                <Users className="w-3.5 h-3.5" /> Delegasi Persetujuan
-                {myDelegation?.active && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/25 text-violet-800 font-bold">AKTIF</span>}
-              </button>
-              <button
-                onClick={() => { setTwoFaPhase("status"); setTwoFaError(""); setShow2faModal(true); }}
-                className="w-full text-left px-3 py-2 text-xs text-slate-300 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
-              >
-                <ShieldAlert className="w-3.5 h-3.5" /> Verifikasi Dua Langkah (2FA)
-                {currentUser?.totpEnabled && <span className="ml-auto text-[9px] px-1.5 py-0.5 rounded-full bg-emerald-500/25 text-emerald-800 font-bold">AKTIF</span>}
-              </button>
-              <button
-                onClick={handleLogout}
-                className="w-full text-left px-3 py-2 text-xs text-rose-400 hover:bg-slate-900 transition flex items-center gap-2 cursor-pointer"
-              >
-                <ExternalLink className="w-3.5 h-3.5" /> Keluar
-              </button>
-            </div>
-          </div>
-        </div>
-      </header>
-
-      {/* Main Body */}
-      <div className="flex-1 flex flex-col md:flex-row">
-        {/* Handle pembatas sidebar — nempel di garis batas sidebar/konten,
-            posisi fixed di tengah layar biar tetap kelihatan walau discroll.
-            Cuma di desktop (mobile tetap pakai tombol di navbar). */}
-        <button
-          onClick={() => setSidebarOpen((o) => !o)}
-          className={`hidden md:flex items-center justify-center fixed top-1/2 -translate-y-1/2 z-30 w-5 h-14 rounded-r-lg bg-slate-900/90 border border-l-0 border-slate-800 hover:bg-slate-800 hover:w-6 transition-all cursor-pointer text-slate-400 hover:text-slate-100 ${
-            sidebarOpen ? "left-64" : "left-0"
-          }`}
-          title={sidebarOpen ? "Sembunyikan sidebar" : "Tampilkan sidebar"}
-          aria-label="Tampilkan/sembunyikan sidebar"
-        >
-          {sidebarOpen ? <ChevronLeft className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-        </button>
-
-        {sidebarOpen && (
-        <aside className="w-full md:w-64 bg-slate-950/30 backdrop-blur-xl border-r border-white/5 p-4 space-y-4 shrink-0 flex flex-col justify-between animate-fadeIn">
-          <div className="space-y-4">
-            <div>
-              <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest px-3 mb-2">
-                MENU UTAMA
-              </p>
-
-              {canSee("dashboard") && (
-              <button
-                onClick={() => {
-                  setActiveTab("dashboard");
-                  setSelectedContract(null);
-                }}
-                className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "dashboard"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <LayoutDashboard className="w-4 h-4" />
-                Dashboard
-              </button>
-              )}
-
-              <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wide px-3 mt-4 mb-1.5">
-                Legal
-              </p>
-              {canSee("dashboard-legal") && (
-              <button
-                onClick={() => { setActiveTab("dashboard-legal"); setSelectedContract(null); }}
-                className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "dashboard-legal"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <LayoutDashboard className="w-4 h-4" />
-                Dashboard Legal
-              </button>
-              )}
-              {canSee("pekerjaan-legal") && (
-              <button
-                onClick={() => { setActiveTab("pekerjaan-legal"); setSelectedContract(null); }}
-                className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "pekerjaan-legal"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <ClipboardList className="w-4 h-4" />
-                Pekerjaan Legal
-              </button>
-              )}
-
-              <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wide px-3 mt-4 mb-1.5" title="Perjanjian dengan pihak kedua — disetujui lewat matriks approval, ditandatangani manual (TTD basah) di luar sistem, meterai opsional.">
-                Dokumen Eksternal &middot; Kontrak
-              </p>
-              {canSee("monitoring") && (
-              <button
-                onClick={() => {
-                  setActiveTab("monitoring");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "monitoring"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <Bell className="w-4 h-4" />
-                  <span>Monitoring Kontrak</span>
-                </div>
-                {(() => {
-                  const now = new Date();
-                  const isEmp = (c: Contract) => c.party2Type === "Karyawan" || c.party2Type === "Employee";
-                  const expiringCount = contracts.filter((c) => {
-                    if (isEmp(c) || c.status === "Terminated" || c.status === "Archived") return false;
-                    const days = Math.ceil((new Date(c.endDate).getTime() - now.getTime()) / 86400000);
-                    return days <= (c.reminderDaysBefore || 30) && days > -3650;
-                  }).length;
-                  return expiringCount > 0 ? (
-                    <span className="bg-amber-500/20 text-amber-400 text-[10px] px-2 py-0.5 rounded-full font-bold">
-                      {expiringCount}
-                    </span>
-                  ) : null;
-                })()}
-              </button>
-              )}
-
-              {canSee("kontrak-karyawan") && (
-              <button
-                onClick={() => {
-                  setActiveTab("kontrak-karyawan");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center justify-between px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "kontrak-karyawan"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <Users className="w-4 h-4" />
-                  <span>Kontrak Karyawan</span>
-                </div>
-                {(() => {
-                  const isEmp = (c: Contract) => c.party2Type === "Karyawan" || c.party2Type === "Employee";
-                  const cnt = contracts.filter(isEmp).length;
-                  return cnt > 0 ? (
-                    <span className="bg-emerald-500/20 text-emerald-400 text-[10px] px-2 py-0.5 rounded-full font-bold">{cnt}</span>
-                  ) : null;
-                })()}
-              </button>
-              )}
-
-              {canSee("clauses") && (
-              <button
-                onClick={() => {
-                  setActiveTab("clauses");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "clauses"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Sliders className="w-4 h-4" />
-                Library Klausul & Tpl
-              </button>
-              )}
-
-              <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wide px-3 mt-4 mb-1.5" title="SOP, Instruksi Kerja, Memo, Kebijakan — tidak ada Pihak Kedua, ditandatangani digital di dalam sistem, tidak perlu meterai.">
-                Dokumen Internal &middot; DCS
-              </p>
-              {canSee("internal-docs") && (
-              <button
-                onClick={() => {
-                  setActiveTab("internal-docs");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "internal-docs"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Workflow className="w-4 h-4" />
-                Dokumen Internal (DCS)
-              </button>
-              )}
-
-              <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wide px-3 mt-4 mb-1.5" title="Gabungan dokumen dari kedua jalur — menampilkan kontrak eksternal maupun dokumen DCS bersama-sama.">
-                Arsip &amp; Daftar &middot; Gabungan
-              </p>
-              {canSee("arsip") && (
-              <button
-                onClick={() => {
-                  setActiveTab("arsip");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "arsip"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-                title="Dokumen tersusun per folder & subfolder — untuk menelusuri berdasarkan pengelompokan."
-              >
-                <FolderOpen className="w-4 h-4" />
-                Arsip per Folder
-              </button>
-              )}
-
-              {canSee("all-docs") && (
-              <button
-                onClick={() => {
-                  setActiveTab("all-docs");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "all-docs"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-                title="Satu tabel datar berisi semua kontrak & dokumen DCS — untuk aksi massal, penyaringan, dan ekspor CSV."
-              >
-                <CheckSquare className="w-4 h-4" />
-                Tabel Semua Dokumen
-              </button>
-              )}
-
-              {canSee("konfigurasi") && (
-              <button
-                onClick={() => {
-                  setActiveTab("konfigurasi");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "konfigurasi"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Sliders className="w-4 h-4" />
-                Konfigurasi & Master Data
-              </button>
-              )}
-
-              {canSee("audits") && (
-              <button
-                onClick={() => {
-                  setActiveTab("audits");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "audits"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Settings className="w-4 h-4" />
-                Audit Trail
-              </button>
-              )}
-
-              {canSee("audit-kontrak-dcs") && (
-              <button
-                onClick={() => {
-                  setActiveTab("audit-kontrak-dcs");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "audit-kontrak-dcs"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-                title="Audit Trail yang sama, disaring khusus Kontrak Eksternal, Kontrak Karyawan, dan Dokumen DCS."
-              >
-                <Layers className="w-4 h-4" />
-                Audit Kontrak &amp; DCS
-              </button>
-              )}
-
-              {canSee("kalender-legal") && (
-              <button
-                onClick={() => {
-                  setActiveTab("kalender-legal");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "kalender-legal"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <CalendarDays className="w-4 h-4" />
-                Kalender Legal
-              </button>
-              )}
-
-              {canSee("retensi-arsip") && (
-              <button
-                onClick={() => {
-                  setActiveTab("retensi-arsip");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "retensi-arsip"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Archive className="w-4 h-4" />
-                Retensi Arsip
-              </button>
-              )}
-
-              {canSee("performa-vendor") && (
-              <button
-                onClick={() => {
-                  setActiveTab("performa-vendor");
-                  setSelectedContract(null);
-                }}
-                className={`w-full mt-1 flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                  activeTab === "performa-vendor"
-                    ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                    : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                }`}
-              >
-                <Star className="w-4 h-4" />
-                Performa Vendor
-              </button>
-              )}
-
-            </div>
-
-            {canSee("ai-tools") && (
-            <div className="pt-2">
-              <button
-                onClick={() => setShowToolsMenu(!showToolsMenu)}
-                className="w-full flex items-center justify-between px-3 py-2 rounded-xl text-[10px] font-bold text-slate-500 uppercase tracking-widest hover:text-slate-300 transition cursor-pointer"
-              >
-                <span>AI Tools Hukum</span>
-                <ChevronRight
-                  className={`w-3.5 h-3.5 transition-transform ${showToolsMenu ? "rotate-90" : ""}`}
-                />
-              </button>
-
-              {showToolsMenu && (
-                <div className="space-y-1 animate-fadeIn">
+            {activeTab === "dashboard" && !selectedContract && (
+              <>
+                <button
+                  onClick={() => { setActiveTab("analytics"); fetchAnalytics(); }}
+                  className="w-11 h-11 flex items-center justify-center rounded-full bg-slate-900 card-soft hover:bg-slate-850 transition cursor-pointer text-slate-300"
+                  title="Analytics & Risk"
+                  aria-label="Analytics & Risk"
+                >
+                  <LineChart className="w-[18px] h-[18px]" />
+                </button>
+                <button
+                  onClick={() => { setIsCreating(true); setActiveTab("monitoring"); }}
+                  className="hidden sm:flex items-center gap-2 px-5 h-11 bg-soft-blue hover:opacity-90 text-white rounded-full text-[13px] font-medium transition cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                  Request kontrak baru
+                </button>
+              </>
+            )}
+            {activeTab === "clauses" && (
                   <button
                     onClick={() => {
-                      setActiveTab("pusat-peraturan");
-                      setSelectedContract(null);
+                      setIsAddingClause(true);
+                      setEditingClauseId(null);
+                      setNewClauseForm({
+                        title: "",
+                        content: "",
+                        category: "General",
+                        tags: "",
+                        isMandatory: false,
+                        isProtected: false,
+                      });
                     }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "pusat-peraturan"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
+                    className="flex items-center gap-2 px-5 h-11 bg-soft-blue hover:opacity-90 text-white rounded-full text-[13px] font-medium transition cursor-pointer"
                   >
-                    <Scale className="w-4 h-4" />
-                    Pusat Peraturan
+                    <Plus className="w-4 h-4" />
+                    Tambah Klausul Master
                   </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("putusan-pengadilan");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "putusan-pengadilan"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <FolderOpen className="w-4 h-4" />
-                    Putusan Pengadilan
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("opini-hukum");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "opini-hukum"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <MessageSquare className="w-4 h-4" />
-                    Opini Hukum
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("terjemah-dokumen");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "terjemah-dokumen"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <Languages className="w-4 h-4" />
-                    Terjemah Teks Lepas
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("review-dokumen");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "review-dokumen"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <Search className="w-4 h-4" />
-                    Audit Risiko Naskah
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("bandingkan-dokumen");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "bandingkan-dokumen"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <ArrowLeftRight className="w-4 h-4" />
-                    Bandingkan 2 Dokumen
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("buat-draft-ai");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "buat-draft-ai"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    Buat Naskah Draft AI
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("tabular");
-                      setSelectedContract(null);
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "tabular"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <LayoutDashboard className="w-4 h-4" />
-                    Analisis Tabular
-                  </button>
-
-                  <button
-                    onClick={() => {
-                      setActiveTab("analytics");
-                      setSelectedContract(null);
-                      fetchAnalytics();
-                    }}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-xs font-semibold transition cursor-pointer ${
-                      activeTab === "analytics"
-                        ? "bg-indigo-600/20 text-indigo-400 border border-indigo-500/30"
-                        : "text-slate-400 hover:bg-slate-800/40 hover:text-slate-100"
-                    }`}
-                  >
-                    <LineChart className="w-4 h-4" />
-                    Analytics & Risk
-                  </button>
-                </div>
-              )}
-            </div>
             )}
           </div>
+        </header>
 
-        </aside>
-        )}
-
-        {/* Center Dynamic Content Area */}
-        <main className="flex-1 p-6 overflow-y-auto">
+        <main className="flex-1 px-6 md:px-8 pb-8 pt-4 overflow-y-auto">
           {/* VIEW: PUSAT PERATURAN */}
           {activeTab === "pusat-peraturan" && !selectedContract && (
             <div className="space-y-6 max-w-6xl mx-auto animate-fadeIn text-xs">
@@ -12884,461 +14328,460 @@ export default function App() {
           )}
 
           {/* VIEW: DASHBOARD */}
-          {activeTab === "dashboard" && !selectedContract && (
-            <div className="space-y-6">
-              {/* Header */}
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                <div className="space-y-1">
-                  <h2 className="text-xl font-semibold text-slate-100 tracking-tight">Beranda</h2>
-                  <p className="text-[13px] text-slate-500 max-w-xl">
-                    Manajemen kontrak digital General Affair — Clause Library terpusat &amp; kepatuhan hukum terintegrasi.
-                  </p>
+          {activeTab === "dashboard" && !selectedContract && (() => {
+          // Data ringkas untuk grafik mini — semuanya dari data kontrak nyata.
+          const parseD = (v: any) => { const t = new Date(v); return isNaN(t.getTime()) ? null : t; };
+          const monthKeys = Array.from({ length: 6 }, (_, i) => {
+            const t = new Date(today.getFullYear(), today.getMonth() - (5 - i), 1);
+            return { y: t.getFullYear(), m: t.getMonth() };
+          });
+          const monthLabels = monthKeys.map((k) => new Date(k.y, k.m, 1).toLocaleDateString("id-ID", { month: "short" }));
+          const perMonth = (list: any[], val: (c: any) => number) =>
+            monthKeys.map((k) => list.reduce((sum, c) => {
+              const t = parseD(c.startDate);
+              return t && t.getFullYear() === k.y && t.getMonth() === k.m ? sum + val(c) : sum;
+            }, 0));
+          const aktifList = contracts.filter((c) => c.status === "Aktif");
+          const draftList = contracts.filter((c) => c.status === "Draft");
+          const weeklyExpiry = [0, 1, 2, 3].map((w) =>
+            aktifList.filter((c) => { const dl = getDaysRemaining(c.endDate); return dl >= w * 7 && dl < (w + 1) * 7 + (w === 3 ? 2 : 0); }).length);
+          const otherCount = Math.max(0, contracts.length - aktifList.length - draftList.length);
+          const aktifPct = contracts.length ? Math.round((aktifList.length / contracts.length) * 100) : 0;
+          const nextExp = aktifList
+            .filter((c) => c.endDate && getDaysRemaining(c.endDate) >= 0)
+            .sort((x, y) => getDaysRemaining(x.endDate) - getDaysRemaining(y.endDate))[0];
+          const nextProgress = (() => {
+            if (!nextExp) return 0;
+            const st = parseD(nextExp.startDate), en = parseD(nextExp.endDate);
+            if (!st || !en || en <= st) return 0;
+            return Math.min(100, Math.max(0, Math.round(((today.getTime() - st.getTime()) / (en.getTime() - st.getTime())) * 100)));
+          })();
+          const recent = [...contracts]
+            .sort((x: any, y: any) => String(y.updatedAt || y.createdAt || y.startDate || "").localeCompare(String(x.updatedAt || x.createdAt || x.startDate || "")))
+            .slice(0, 4);
+          const valueFull = `Rp ${totalValueActive.toLocaleString("id-ID")}`;
+          // Ringkas agar muat sejajar dengan grafik: 3,6 M / 877 jt (nilai lengkap di tooltip).
+          const valueText = totalValueActive >= 1e12
+            ? `Rp ${(totalValueActive / 1e12).toLocaleString("id-ID", { maximumFractionDigits: 1 })} T`
+            : totalValueActive >= 1e9
+              ? `Rp ${(totalValueActive / 1e9).toLocaleString("id-ID", { maximumFractionDigits: 1 })} M`
+              : totalValueActive >= 1e6
+                ? `Rp ${Math.round(totalValueActive / 1e6).toLocaleString("id-ID")} jt`
+                : valueFull;
+          const CARD = "rounded-[28px] bg-slate-900 card-soft p-5";
+
+
+          const hasAppr = myApprovalQueue.length > 0;
+          const catLabel = (cat: string) => cat === "Employment" ? "Karyawan / PKWT" : cat === "Vendor" ? "Vendor / Supplier Jasa" : cat;
+          const PAGE = 10;
+          const apprPages = Math.max(1, Math.ceil(myApprovalQueue.length / PAGE));
+          const apprPg = Math.min(apprPage, apprPages);
+          const apprItems = myApprovalQueue.slice((apprPg - 1) * PAGE, apprPg * PAGE);
+          const expPages = Math.max(1, Math.ceil(criticalExpiryContracts.length / PAGE));
+          const expPg = Math.min(expPage, expPages);
+          const expItems = criticalExpiryContracts.slice((expPg - 1) * PAGE, expPg * PAGE);
+
+          const apprCard = (
+            <div className={`${CARD} flex flex-col gap-3`} style={{ height: 340, overflow: "hidden" }}>
+              <DashCardHeader
+                Icon={UserCheck}
+                title="Perlu Persetujuan Saya"
+                subtitle="Berjalan berurutan — hanya giliran teratas yang bisa diputuskan."
+                right={myApprovalCount > 0 ? <span className="text-[11px] font-semibold px-3 py-1 rounded-full bg-peach text-brand-orange tabular-nums">{myApprovalCount}</span> : null}
+              />
+              {slaBreachCount > 0 && (
+                <p className="text-[11px] text-rose-500 font-medium">{slaBreachCount} sudah lewat batas {slaDays} hari.</p>
+              )}
+              {apprItems.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center border-t border-slate-800 text-center">
+                  <CheckCircle className="w-6 h-6 text-indigo-400 mb-2" />
+                  <p className="text-[13px] text-slate-500">Tidak ada dokumen yang menunggu persetujuan Anda.</p>
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    onClick={() => { setActiveTab("analytics"); fetchAnalytics(); }}
-                    className="flex items-center gap-2 px-3.5 py-2 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 rounded-lg text-[13px] font-semibold transition cursor-pointer"
-                  >
-                    <LineChart className="w-4 h-4" />
-                    Analytics &amp; Risk
-                  </button>
-                  <button
-                    onClick={() => {
-                      setIsCreating(true);
-                      setActiveTab("monitoring");
-                    }}
-                    className="flex items-center gap-2 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[13px] font-semibold transition cursor-pointer"
-                  >
-                    <Plus className="w-4 h-4" />
-                    Request kontrak baru
-                  </button>
+              ) : (
+              <FadeScroll className="border-t border-slate-800 pr-1">
+                {apprItems.map(({ contract: c, step, isMine, asDelegate, totalSteps, waitingSince }) => {
+                  const hari = Math.max(0, Math.floor((Date.now() - new Date(waitingSince).getTime()) / 86400000));
+                  const lama = Number.isFinite(hari) ? (hari === 0 ? "hari ini" : `${hari} hari`) : "—";
+                  const lewatSla = slaDays > 0 && hari >= slaDays;
+                  return (
+                    <button
+                      key={c.id}
+                      onClick={() => handleOpenWorkspace(c)}
+                      className="w-full text-left flex items-center gap-3 py-3 border-b border-slate-800 last:border-0 hover:bg-slate-950 transition cursor-pointer"
+                    >
+                      <span className="w-9 h-9 rounded-full bg-mist flex items-center justify-center shrink-0">
+                        <UserCheck className="w-4 h-4 text-slate-100" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[13px] font-medium text-slate-100 truncate">{c.title}</p>
+                        <p className="text-[11px] text-slate-500 truncate">
+                          <span className="font-mono">{c.contractNumber}</span>
+                          {" · "}langkah {step.order} dari {totalSteps}
+                          {c.approvalSubmittedByName ? ` · diajukan ${c.approvalSubmittedByName}` : ""}
+                        </p>
+                      </div>
+                      <div className="shrink-0 text-right">
+                        {isMine ? (
+                          <span className="text-[9px] font-bold px-2.5 py-0.5 rounded-full bg-peach text-brand-orange uppercase">Giliran Anda</span>
+                        ) : asDelegate ? (
+                          <span className="text-[9px] font-bold px-2.5 py-0.5 rounded-full bg-violet-500/25 text-violet-800 uppercase" title={`${step.approverName} sedang berhalangan dan menunjuk Anda sebagai pengganti. Keputusan tetap tercatat atas nama ${step.approverName}.`}>
+                            Pengganti · {step.approverName}
+                          </span>
+                        ) : (
+                          <span className="text-[9px] font-bold px-2.5 py-0.5 rounded-full bg-slate-700/40 text-slate-300 uppercase" title={`Giliran ${step.approverName} — Anda bisa memutuskan sebagai override admin.`}>
+                            Override · {step.approverName}
+                          </span>
+                        )}
+                        <p className={`text-[10px] mt-1 tabular-nums ${lewatSla ? "text-rose-500 font-semibold" : "text-slate-500"}`}
+                           title={slaDays > 0 ? `Batas wajar ${slaDays} hari per langkah (diatur di Konfigurasi).` : undefined}>
+                          {hari === 0 ? "masuk hari ini" : `menunggu ${lama}`}
+                          {lewatSla ? ` · lewat batas ${slaDays}h` : ""}
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </FadeScroll>
+              )}
+              <DashPager page={apprPg} total={myApprovalQueue.length} pageSize={PAGE} onChange={setApprPage} />
+              {myApprovalQueue.length > PAGE && (
+                <button onClick={() => { setActiveTab("monitoring"); setMonitorStatus("OnReview"); }} className="text-[11px] text-indigo-400 hover:underline font-medium cursor-pointer text-left">
+                  Buka semua di Monitoring →
+                </button>
+              )}
+            </div>
+          );
+
+          const expiryCard = (
+            <div className={`${CARD} flex flex-col gap-3`} style={{ height: 400, overflow: "hidden" }}>
+              <DashCardHeader
+                Icon={ShieldAlert}
+                title="Peringatan Kadaluwarsa Kontrak & Mesin Perpanjangan"
+                subtitle="Kontrak aktif yang mendekati masa berakhir"
+                right={<span className="text-[11px] font-semibold px-3 py-1 rounded-full bg-peach text-brand-orange tabular-nums whitespace-nowrap">{criticalExpiryContracts.length} kontrak</span>}
+              />
+              {criticalExpiryContracts.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center border-t border-slate-800 text-center">
+                  <CheckCircle className="w-6 h-6 text-indigo-400 mb-2" />
+                  <p className="text-[13px] text-slate-500">Tidak ada kontrak yang akan kedaluwarsa dalam waktu dekat.</p>
+                </div>
+              ) : (
+                <FadeScroll className="border-t border-slate-800 pr-1">
+                  {expItems.map((c) => {
+                    const daysLeft = getDaysRemaining(c.endDate);
+                    return (
+                      <div key={c.id} className="flex items-center gap-3 py-3 border-b border-slate-800 last:border-0">
+                        <span className="w-9 h-9 rounded-full bg-peach flex items-center justify-center shrink-0">
+                          <Calendar className="w-4 h-4 text-brand-orange" />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-[13px] font-medium text-slate-100 truncate">{c.title}</p>
+                          <p className="text-[11px] text-slate-500 truncate">
+                            <span className="font-mono">{c.contractNumber}</span> · {c.category} · {c.party2Name}
+                          </p>
+                          <p className="text-[11px] text-brand-orange font-medium">Berakhir {c.endDate} ({daysLeft} hari lagi)</p>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button onClick={() => handleOpenWorkspace(c)} className="px-3.5 py-1.5 rounded-full bg-slate-950 hover:bg-slate-850 text-xs font-medium text-slate-200 transition cursor-pointer">Tinjau</button>
+                          <button onClick={() => handleOpenRenewModal(c)} className="px-3.5 py-1.5 rounded-full bg-soft-blue hover:opacity-90 text-xs font-medium text-white transition cursor-pointer flex items-center gap-1">
+                            <RefreshCw className="w-3 h-3" /> Perpanjang
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </FadeScroll>
+              )}
+              <DashPager page={expPg} total={criticalExpiryContracts.length} pageSize={PAGE} onChange={setExpPage} />
+            </div>
+          );
+
+          const nominalByMonth = perMonth(aktifList, (c: any) =>
+            (c.sharingFeeItems || []).filter((it: any) => it.feeType === "nominal").reduce((sm: number, it: any) => sm + (Number(it.value) || 0), 0));
+          const pctShare = aktifList.length ? Math.round((sharingFeeStats.pctContracts / aktifList.length) * 100) : 0;
+          const shareCard = sharingFeeStats.hasAny ? (
+            <div className={`${CARD} flex flex-col gap-4`} style={{ height: 400, overflow: "hidden" }}>
+              <DashCardHeader
+                Icon={Percent}
+                title="Sharing Fee Kontrak Aktif"
+                subtitle="Nominal & persentase dipisah — satuannya berbeda"
+              />
+              <div className="border-t border-slate-800 pt-4 flex-1 min-h-0 flex flex-col">
+                <p className="text-[12px] text-slate-500">Nominal (pasti)</p>
+                <p className="text-[26px] leading-tight font-medium text-slate-100 tabular mt-0.5">Rp {sharingFeeStats.nominalSum.toLocaleString("id-ID")}</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  {sharingFeeStats.nominalContracts > 0 ? `dari ${sharingFeeStats.nominalContracts} kontrak · per bulan mulai kontrak` : "belum ada fee nominal"}
+                </p>
+                <div className="mt-auto pt-3">
+                  <WideBars values={nominalByMonth} labels={monthLabels} />
                 </div>
               </div>
+              <div className="border-t border-slate-800 pt-4 shrink-0">
+                <div className="flex items-end justify-between gap-3">
+                  <div>
+                    <p className="text-[12px] text-slate-500">Berbasis Persentase (terpisah)</p>
+                    <p className="text-[26px] leading-tight font-medium text-slate-100 tabular mt-0.5">
+                      {sharingFeeStats.pctContracts} <span className="text-sm font-normal text-slate-500">kontrak</span>
+                    </p>
+                  </div>
+                  <span className="text-[11px] font-semibold px-3 py-1 rounded-full bg-peach text-brand-orange tabular-nums">{pctShare}% kontrak aktif</span>
+                </div>
+                <div className="mt-3 h-2.5 rounded-full bg-slate-950 overflow-hidden">
+                  <div className="h-full rounded-full bg-peach-strong" style={{ width: `${pctShare}%` }} />
+                </div>
+                <p className="text-[11px] text-slate-500 mt-2 flex items-start gap-1.5">
+                  <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                  Persentase tidak dijumlahkan ke total rupiah — hanya jumlah kontrak.
+                </p>
+              </div>
+            </div>
+          ) : null;
 
-              {/* Stat cards */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          const catCard = (
+            <div className={`${CARD} h-full flex flex-col gap-4`}>
+              <DashCardHeader Icon={Layers} title="Distribusi Kontrak Berdasarkan Kategori" subtitle={`${contracts.length} kontrak total`} />
+              <div className="flex-1 flex flex-col justify-around gap-3">
+                {["Employment", "Vendor", "NDA", "MOU", "Rental"].map((cat) => {
+                  const count = contracts.filter((c) => c.category === cat).length;
+                  const percentage = contracts.length ? Math.round((count / contracts.length) * 100) : 0;
+                  return (
+                    <div key={cat} className="space-y-1.5">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-slate-300 font-medium">{catLabel(cat)}</span>
+                        <span className="text-slate-500 tabular">{count} kontrak · {percentage}%</span>
+                      </div>
+                      <div className="w-full bg-slate-950 rounded-full h-2.5">
+                        <div
+                          className={`h-2.5 rounded-full ${cat === "Employment" ? "bg-soft-blue" : cat === "Vendor" ? "bg-peach-strong" : cat === "NDA" ? "bg-mist-strong" : "bg-slate-650"}`}
+                          style={{ width: `${percentage}%` }}
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+
+          const auditCard = (
+            <div className={`${CARD} flex flex-col gap-3`} style={{ height: 340, overflow: "hidden" }}>
+              <DashCardHeader Icon={History} title="Produktivitas Pengguna & Log Audit Aktivitas" subtitle="10 aktivitas terbaru" />
+              <FadeScroll className="border-t border-slate-800 pr-1">
+                {audits.length === 0 && <p className="text-[13px] text-slate-500 text-center py-6">Belum ada aktivitas.</p>}
+                {audits.slice(0, 10).map((audit) => (
+                  <div key={audit.id} className="flex items-start gap-3 py-3 border-b border-slate-800 last:border-0">
+                    <span className="w-9 h-9 rounded-full bg-mist flex items-center justify-center text-xs font-semibold text-slate-100 shrink-0">
+                      {(audit.userName || "?").trim().charAt(0).toUpperCase()}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-baseline justify-between gap-2">
+                        <p className="text-[13px] font-semibold text-slate-100 truncate">{audit.userName} <span className="text-[10px] font-normal text-indigo-400">{audit.userRole}</span></p>
+                        <span className="text-[10px] text-slate-500 shrink-0">{new Date(audit.timestamp).toLocaleDateString()}</span>
+                      </div>
+                      <p className="text-[12px] text-slate-500 leading-snug line-clamp-2">
+                        {audit.action} • {audit.details}
+                        {audit.contractNumber ? <span className="font-mono text-[10px]"> · {audit.contractNumber}</span> : null}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </FadeScroll>
+              <button
+                onClick={() => setActiveTab("audits")}
+                className="w-full py-2.5 bg-slate-950 hover:bg-slate-850 rounded-full text-xs font-medium flex items-center justify-center gap-1 text-indigo-400 transition cursor-pointer"
+              >
+                Buka Seluruh Audit Trail <ChevronRight className="w-3 h-3" />
+              </button>
+            </div>
+          );
+
+          return (
+            <div className="space-y-5">
+              {/* Kartu statistik + grafik mini */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
                 {[
-                  { label: "Kontrak Aktif", value: `${contracts.filter((c) => c.status === "Aktif").length}`, unit: "kontrak", sub: "Masa berlaku valid", Icon: CheckCircle, tone: "text-emerald-400" },
-                  { label: "Draft Kontrak", value: `${draftContractsCount}`, unit: "draft", sub: "Belum diaktifkan", Icon: Clock, tone: "text-amber-400" },
-                  { label: "Segera Berakhir · 30 hari", value: `${criticalExpiryContracts.length}`, unit: "kontrak", sub: "Butuh keputusan perpanjangan", Icon: ShieldAlert, tone: "text-rose-400" },
-                  { label: "Portfolio Value (GA)", value: `Rp ${totalValueActive.toLocaleString("id-ID")}`, unit: "", sub: "Kontrak aktif enterprise", Icon: Building2, tone: "text-indigo-400" },
-                ].map((s, i) => (
-                  <div key={i} className="rounded-xl border border-slate-800/80 bg-slate-900/30 p-4 space-y-3 hover:border-slate-700 transition">
-                    <div className="flex items-center justify-between">
-                      <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide">{s.label}</p>
-                      <s.Icon className={`w-4 h-4 ${s.tone}`} />
+                  { label: "Kontrak Aktif", value: `${aktifList.length}`, unit: "kontrak", Icon: CheckCircle, chart: <MiniBars values={perMonth(aktifList, () => 1)} labels={monthLabels} mixed /> },
+                  { label: "Draft Kontrak", value: `${draftContractsCount}`, unit: "draft", Icon: Clock, chart: <MiniBars values={perMonth(draftList, () => 1)} labels={monthLabels} /> },
+                  { label: "Segera Berakhir · 30 hari", value: `${criticalExpiryContracts.length}`, unit: "kontrak", Icon: ShieldAlert, chart: <MiniLine values={weeklyExpiry} labels={["M1", "M2", "M3", "M4"]} /> },
+                  { label: "Portfolio Value (GA)", value: valueText, full: valueFull, unit: "", Icon: Building2, chart: <MiniLine values={perMonth(aktifList, (c) => Number(c.contractValue) || 0)} labels={monthLabels} /> },
+                ].map((sc, i) => (
+                  <div key={i} className={CARD}>
+                    <p className="text-[15px] text-slate-100">{sc.label}</p>
+                    <div className="flex items-end justify-between gap-3 mt-4">
+                      <div className="flex items-center gap-3">
+                        <span className="w-11 h-11 rounded-full bg-peach-strong flex items-center justify-center shrink-0">
+                          <sc.Icon className="w-[18px] h-[18px] text-slate-100" />
+                        </span>
+                        <div className="min-w-0">
+                          <p className={`${sc.value.length > 6 ? "text-[20px]" : "text-[34px]"} leading-none font-medium tabular text-slate-100 whitespace-nowrap`} title={(sc as any).full}>{sc.value}</p>
+                          {sc.unit && <p className="text-[11px] text-slate-500 mt-1">{sc.unit}</p>}
+                        </div>
+                      </div>
+                      {sc.chart}
                     </div>
-                    <div className="flex items-baseline gap-1.5">
-                      <p className="text-[26px] leading-none font-semibold tabular tracking-tight text-slate-100">{s.value}</p>
-                      {s.unit && <span className="text-xs text-slate-500 font-medium">{s.unit}</span>}
-                    </div>
-                    <p className="text-[11px] text-slate-500">{s.sub}</p>
                   </div>
                 ))}
               </div>
 
-              {/* Antrean keputusan SAYA — hanya muncul kalau memang ada.
-                  Sebelum ini approver tak punya satu pun tempat untuk melihat
-                  giliran dirinya; harus menyisir Monitoring manual. */}
-              {myApprovalQueue.length > 0 && (
-                <div className="rounded-xl border border-amber-500/30 bg-amber-500/[0.07] p-4 space-y-3">
-                  <div className="flex items-center justify-between gap-3 flex-wrap">
-                    <p className="text-[11px] font-bold text-amber-700 uppercase tracking-wide flex items-center gap-1.5">
-                      <ShieldAlert className="w-3.5 h-3.5" />
-                      Perlu Persetujuan Saya
-                      {/* amber-200/300 nyaris tak terbaca di tema terang —
-                          pakai amber tua untuk teks di atas latar amber pucat. */}
-                      {myApprovalCount > 0 && (
-                        <span className="ml-1 px-2 py-0.5 rounded-full bg-amber-500/25 text-amber-800 text-[10px] font-bold tabular-nums">{myApprovalCount}</span>
-                      )}
-                    </p>
-                    <span className="text-[10px] text-slate-500">
-                      {slaBreachCount > 0
-                        ? <span className="text-rose-600 font-semibold">{slaBreachCount} sudah lewat batas {slaDays} hari.{" "}</span>
-                        : null}
-                      Persetujuan berjalan berurutan — hanya giliran teratas yang bisa diputuskan.
-                    </span>
-                  </div>
-                  <div className="space-y-1.5">
-                    {myApprovalQueue.slice(0, 6).map(({ contract: c, step, isMine, asDelegate, totalSteps, waitingSince }) => {
-                      const hari = Math.max(0, Math.floor((Date.now() - new Date(waitingSince).getTime()) / 86400000));
-                      const lama = Number.isFinite(hari) ? (hari === 0 ? "hari ini" : `${hari} hari`) : "—";
-                      const lewatSla = slaDays > 0 && hari >= slaDays;
-                      return (
-                        <button
-                          key={c.id}
-                          onClick={() => handleOpenWorkspace(c)}
-                          className="w-full text-left p-2.5 rounded-xl border bg-slate-950/40 border-slate-800 hover:border-amber-500/40 transition cursor-pointer flex items-center gap-3"
-                        >
-                          <div className="min-w-0 flex-1">
-                            <p className="text-[13px] font-semibold text-slate-100 truncate">{c.title}</p>
-                            <p className="text-[11px] text-slate-500 truncate">
-                              <span className="font-mono">{c.contractNumber}</span>
-                              {" · "}langkah {step.order} dari {totalSteps}
-                              {c.approvalSubmittedByName ? ` · diajukan ${c.approvalSubmittedByName}` : ""}
-                            </p>
-                          </div>
-                          <div className="shrink-0 text-right">
-                            {isMine ? (
-                              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-amber-500/25 text-amber-800 uppercase">Giliran Anda</span>
-                            ) : asDelegate ? (
-                              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-violet-500/25 text-violet-800 uppercase" title={`${step.approverName} sedang berhalangan dan menunjuk Anda sebagai pengganti. Keputusan tetap tercatat atas nama ${step.approverName}.`}>
-                                Pengganti · {step.approverName}
-                              </span>
-                            ) : (
-                              <span className="text-[9px] font-bold px-2 py-0.5 rounded-full bg-slate-700/40 text-slate-300 uppercase" title={`Giliran ${step.approverName} — Anda bisa memutuskan sebagai override admin.`}>
-                                Override · {step.approverName}
-                              </span>
-                            )}
-                            <p className={`text-[10px] mt-1 tabular-nums ${lewatSla ? "text-rose-500 font-semibold" : "text-slate-500"}`}
-                               title={slaDays > 0 ? `Batas wajar ${slaDays} hari per langkah (diatur di Konfigurasi).` : undefined}>
-                              {hari === 0 ? "masuk hari ini" : `menunggu ${lama}`}
-                              {lewatSla ? ` · lewat batas ${slaDays}h` : ""}
-                            </p>
-                          </div>
-                        </button>
-                      );
-                    })}
-                  </div>
-                  {myApprovalQueue.length > 6 && (
-                    <button onClick={() => { setActiveTab("monitoring"); setMonitorStatus("OnReview"); }} className="text-[11px] text-amber-300 hover:underline font-semibold cursor-pointer">
-                      Lihat semua {myApprovalQueue.length} dokumen di Monitoring →
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {/* Kartu Sharing Fee — nominal (rupiah pasti) DIPISAH dari persentase
-                  (tidak dijumlah sbg rupiah; hanya estimasi utk yg nilai kontraknya
-                  diketahui). Muncul hanya kalau ada kontrak ber-sharing-fee. */}
-              {sharingFeeStats.hasAny && (
-                <div className="rounded-xl border border-slate-800/80 bg-slate-900/30 p-4 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <p className="text-[11px] font-medium text-slate-500 uppercase tracking-wide flex items-center gap-1.5">
-                      <Percent className="w-3.5 h-3.5 text-indigo-400" /> Sharing Fee Kontrak Aktif
-                    </p>
-                    <span className="text-[10px] text-slate-600" title="Persentase tidak dijumlah bersama rupiah karena satuannya beda — ditampilkan terpisah.">Nominal & persentase dipisah</span>
-                  </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {/* Nominal — rupiah pasti, boleh dijumlah */}
-                    <div className="p-3 bg-slate-950/60 border border-emerald-500/20 rounded-xl">
-                      <p className="text-[10px] font-bold text-emerald-400/90 uppercase tracking-wide">Nominal (pasti)</p>
-                      <p className="text-[22px] leading-tight font-semibold text-slate-100 tabular-nums mt-1">
-                        Rp {sharingFeeStats.nominalSum.toLocaleString("id-ID")}
-                      </p>
-                      <p className="text-[11px] text-slate-500 mt-0.5">
-                        {sharingFeeStats.nominalContracts > 0 ? `dari ${sharingFeeStats.nominalContracts} kontrak` : "belum ada fee nominal"}
-                      </p>
-                    </div>
-                    {/* Persentase — TIDAK dijumlah sbg rupiah; estimasi terpisah */}
-                    <div className="p-3 bg-slate-950/60 border border-amber-500/20 rounded-xl">
-                      <p className="text-[10px] font-bold text-amber-400/90 uppercase tracking-wide">Berbasis Persentase (terpisah)</p>
-                      <p className="text-[22px] leading-tight font-semibold text-slate-100 tabular-nums mt-1">
-                        {sharingFeeStats.pctContracts} <span className="text-sm font-medium text-slate-400">kontrak</span>
-                      </p>
-                      <p className="text-[11px] text-slate-500 mt-0.5">
-                        {sharingFeeStats.pctContracts > 0 ? "kontrak aktif dengan fee persentase" : "belum ada fee persentase"}
-                      </p>
-                    </div>
-                  </div>
-                  <p className="text-[10px] text-slate-600 flex items-start gap-1.5">
-                    <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5 text-slate-500" />
-                    Fee persentase tidak dijumlahkan ke dalam total rupiah — satuannya berbeda, sehingga hanya ditampilkan sebagai jumlah kontrak.
-                  </p>
-                </div>
-              )}
-
-              {/* Middle Section: Urgent Alerts and Productivity Heatmap */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                {/* Left: Urgent Renewal & Expiry Alerts */}
-                <div className="lg:col-span-2 bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-4">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-bold text-sm tracking-wide flex items-center gap-2">
-                      <ShieldAlert className="text-rose-500 w-4 h-4" />
-                      Peringatan Kadaluwarsa Kontrak & Mesin Perpanjangan
-                    </h3>
-                    <span className="text-xs text-rose-400 font-semibold bg-rose-500/10 px-2.5 py-0.5 rounded-full border border-rose-500/20 animate-pulse">
-                      Critical
-                    </span>
-                  </div>
-
-                  <div className="space-y-3">
-                    {criticalExpiryContracts.length === 0 ? (
-                      <div className="p-8 text-center text-slate-500 bg-slate-950/20 border border-slate-800 rounded-xl">
-                        Tidak ada kontrak yang akan kedaluwarsa dalam waktu
-                        dekat.
-                      </div>
+              {/* Baris 1: detail · info · kategori (tinggi sama) */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+                <div className="lg:col-span-3">
+                  <div className={`${CARD} h-full flex flex-col gap-4`}>
+                    <DashCardHeader Icon={FileText} title="Detail Kontrak" subtitle={nextExp ? `${nextExp.category} · berakhir berikutnya` : "Belum ada kontrak aktif"} />
+                    {!nextExp ? (
+                      <p className="text-sm text-slate-500 py-6 text-center">Tidak ada kontrak aktif yang akan berakhir.</p>
                     ) : (
-                      criticalExpiryContracts.map((c) => {
-                        const daysLeft = getDaysRemaining(c.endDate);
-                        return (
-                          <div
-                            key={c.id}
-                            className="p-4 bg-slate-900 border border-slate-800 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
-                          >
-                            <div className="space-y-1">
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs font-bold text-indigo-400">
-                                  {c.contractNumber}
-                                </span>
-                                <span className="text-[10px] bg-slate-800 px-2 py-0.5 rounded text-slate-400 font-semibold uppercase">
-                                  {c.category}
-                                </span>
-                              </div>
-                              <h4 className="font-bold text-sm text-slate-100">
-                                {c.title}
-                              </h4>
-                              <p className="text-xs text-slate-400 flex items-center gap-1.5">
-                                <Users className="w-3.5 h-3.5" />
-                                Pihak Kedua:{" "}
-                                <strong className="text-slate-300">
-                                  {c.party2Name}
-                                </strong>
-                              </p>
-                              <p className="text-xs text-rose-400 font-semibold flex items-center gap-1">
-                                <Calendar className="w-3.5 h-3.5" />
-                                Berakhir {c.endDate} ({daysLeft} hari lagi)
-                              </p>
+                      <>
+                        <div className="grid grid-cols-3 gap-2">
+                          {[
+                            { v: `${getDaysRemaining(nextExp.endDate)} hr`, l: "sisa" },
+                            { v: nextExp.contractValue > 0 ? `${(nextExp.contractValue / 1_000_000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} jt` : "—", l: "nilai" },
+                            { v: `${nextProgress}%`, l: "berjalan" },
+                          ].map((t) => (
+                            <div key={t.l} className="rounded-[16px] bg-slate-950 px-2 py-2.5 text-center min-w-0">
+                              <p className="text-[12px] font-semibold text-slate-100 truncate tabular">{t.v}</p>
+                              <p className="text-[9px] text-slate-500">{t.l}</p>
                             </div>
-
-                            <div className="flex items-center gap-2">
-                              <button
-                                onClick={() => handleOpenWorkspace(c)}
-                                className="px-3 py-1.5 bg-slate-800 text-xs font-semibold rounded hover:bg-slate-750 text-slate-200 transition"
-                              >
-                                Tinjau
-                              </button>
-                              <button
-                                onClick={() => handleOpenRenewModal(c)}
-                                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-xs font-bold text-white rounded transition flex items-center gap-1 shadow-md"
-                              >
-                                <RefreshCw className="w-3 h-3" />
-                                Perpanjang
-                              </button>
+                          ))}
+                        </div>
+                        <div>
+                          <p className="text-[12px] text-slate-500 mb-2">Pihak kedua</p>
+                          <div className="flex items-center gap-3">
+                            <span className="w-11 h-11 rounded-full bg-mist flex items-center justify-center text-sm font-semibold text-slate-100 shrink-0">
+                              {(nextExp.party2Name || "?").trim().charAt(0).toUpperCase()}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-[13px] font-medium text-slate-100 truncate">{nextExp.party2Name || "—"}</p>
+                              <p className="text-[11px] text-slate-500 truncate">{nextExp.contractNumber}</p>
                             </div>
+                            <button
+                              onClick={() => handleOpenWorkspace(nextExp)}
+                              className="w-10 h-10 rounded-full bg-soft-blue text-white flex items-center justify-center shrink-0 hover:opacity-90 transition cursor-pointer"
+                              title="Tinjau kontrak"
+                              aria-label="Tinjau kontrak"
+                            >
+                              <ArrowRight className="w-4 h-4" />
+                            </button>
                           </div>
-                        );
-                      })
+                        </div>
+                        <div className="mt-auto">
+                          <div className="flex justify-between text-[11px] text-slate-500 mb-2"><span>Masa berlaku</span><span className="tabular">{nextProgress}%</span></div>
+                          <div className="h-2.5 rounded-full bg-slate-950 overflow-hidden"><div className="h-full rounded-full bg-peach-strong" style={{ width: `${nextProgress}%` }} /></div>
+                          <div className="flex justify-between text-[10px] text-slate-500 mt-1.5 tabular"><span>{nextExp.startDate}</span><span>{nextExp.endDate}</span></div>
+                        </div>
+                      </>
                     )}
                   </div>
                 </div>
-
-                {/* Right: Notifications Feed */}
-                <div className="bg-slate-950/40 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between">
-                  <div>
-                    <div className="flex items-center justify-between mb-4 pb-2 border-b border-slate-800">
-                      <h3 className="font-bold text-sm flex items-center gap-2">
-                        <Bell className="text-amber-400 w-4 h-4 animate-swing" />
-                        Log Notifikasi Real-time
-                      </h3>
-                      <button
-                        onClick={handleMarkNotificationsRead}
-                        className="text-xs text-indigo-400 hover:underline"
-                      >
-                        Tandai dibaca
-                      </button>
+                <div className="lg:col-span-5">
+                  <div className="rounded-[28px] card-sky card-soft p-5 space-y-4 h-full">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-[20px] font-medium text-slate-100">Info Kontrak</h3>
+                      <button onClick={() => { setActiveTab("monitoring"); setSelectedContract(null); }} className="text-[12px] text-slate-500 hover:text-slate-100 cursor-pointer">Lihat semua &gt;</button>
                     </div>
-
-                    <div className="space-y-3 max-h-64 overflow-y-auto pr-1">
-                      {notifications.length === 0 ? (
-                        <p className="text-xs text-slate-500 text-center py-6">
-                          Tidak ada notifikasi sistem.
-                        </p>
-                      ) : (
-                        notifications.slice(0, 5).map((n) => (
-                          <div
-                            key={n.id}
-                            onClick={() => {
-                              if (n.contractId) {
-                                const c = contracts.find(
-                                  (con) => con.id === n.contractId,
-                                );
-                                if (c) handleOpenWorkspace(c);
-                              } else if (n.dcsDocumentId) {
-                                const d = dcsDocs.find((doc) => doc.id === n.dcsDocumentId);
-                                if (d) {
-                                  setActiveTab("internal-docs");
-                                  setDcsSelectedId(d.id);
-                                  setDcsSelectedVersionId(d.versions[0]?.id || null);
-                                }
-                              }
-                            }}
-                            className={`p-2.5 rounded-xl border transition cursor-pointer text-xs ${
-                              n.read
-                                ? "bg-slate-950/20 border-slate-850/40 text-slate-400"
-                                : "bg-indigo-900/10 border-indigo-800/30 text-indigo-100"
-                            }`}
-                          >
-                            <div className="flex items-center justify-between mb-1">
-                              <span
-                                className={`font-semibold px-1.5 py-0.5 rounded text-[9px] uppercase ${
-                                  n.type === "success"
-                                    ? "bg-emerald-500/15 text-emerald-400"
-                                    : n.type === "danger"
-                                      ? "bg-rose-500/15 text-rose-400"
-                                      : "bg-amber-500/15 text-amber-400"
-                                }`}
-                              >
-                                {n.type}
-                              </span>
-                              <span className="text-[10px] text-slate-500">
-                                {new Date(n.createdAt).toLocaleTimeString()}
-                              </span>
-                            </div>
-                            <p className="font-semibold text-slate-200">
-                              {n.title}
-                            </p>
-                            <p className="text-slate-400 leading-normal mt-0.5">
-                              {n.message}
-                            </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="rounded-[22px] bg-mist-strong p-4 flex flex-col justify-between min-h-[170px]">
+                        <div className="flex items-start justify-between gap-2 text-[15px] font-medium text-slate-100">
+                          <span className="truncate max-w-[45%]">{nextExp ? (nextExp.party1Name || "Pihak 1") : "—"}</span>
+                          <span className="truncate max-w-[45%] text-right">{nextExp ? (nextExp.party2Name || "Pihak 2") : "—"}</span>
+                        </div>
+                        <div className="flex justify-center my-2"><FileText className="w-9 h-9 text-slate-100/80" strokeWidth={1.5} /></div>
+                        <div>
+                          <div className="relative h-1 rounded-full bg-white/60">
+                            <span className="absolute top-1/2 -translate-y-1/2 w-3 h-3 rounded-full bg-white" style={{ left: `calc(${nextProgress}% - 6px)` }} />
                           </div>
-                        ))
+                          <div className="flex justify-between text-[10px] text-slate-500 mt-2 tabular">
+                            <span>{nextExp?.startDate || "—"}</span>
+                            <span>{nextExp?.endDate || "—"}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="rounded-[22px] bg-slate-900/70 p-4 space-y-2.5">
+                        <p className="text-[17px] font-medium text-slate-100 truncate">{nextExp ? `#${nextExp.contractNumber}` : "Kontrak Terbaru"}</p>
+                        {recent.length === 0 ? (
+                          <p className="text-[12px] text-slate-500">Belum ada kontrak.</p>
+                        ) : recent.map((c, i) => (
+                          <button key={c.id} onClick={() => handleOpenWorkspace(c)} className="w-full flex items-center gap-2 text-left cursor-pointer group">
+                            <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${i === 0 ? "bg-soft-blue" : "border border-slate-650"}`} />
+                            <span className={`text-[11px] truncate flex-1 ${i === 0 ? "text-slate-100 font-medium" : "text-slate-500"} group-hover:text-slate-100`}>{c.title}</span>
+                            <span className="text-[10px] text-slate-500 tabular shrink-0">{String(c.updatedAt || c.createdAt || c.startDate || "").slice(5, 10)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="rounded-full bg-slate-900 px-4 py-3 flex items-center gap-3 text-[13px]">
+                      <span className="w-5 h-5 rounded-full border-[3px] border-mist border-t-soft-blue shrink-0" />
+                      <span className="text-slate-100">{aktifPct}% Kontrak Aktif</span>
+                      <span className="w-px h-4 bg-slate-800" />
+                      <span className="text-slate-500 flex-1">{criticalExpiryContracts.length} segera berakhir</span>
+                      {nextExp && (
+                        <button onClick={() => handleOpenRenewModal(nextExp)} className="text-[12px] font-semibold text-indigo-400 hover:underline cursor-pointer flex items-center gap-1">
+                          <RefreshCw className="w-3 h-3" /> Perpanjang
+                        </button>
                       )}
                     </div>
                   </div>
-
-                  <div className="pt-4 border-t border-slate-800 mt-4 text-center">
-                    <p className="text-[10px] text-slate-500">
-                      Real-time status synced via server webhooks
-                    </p>
-                  </div>
+                </div>
+                <div className="lg:col-span-4">
+                  {catCard}
                 </div>
               </div>
 
-              {/* Analytics Section */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {/* Contract Category Chart Simulator */}
-                <div className="bg-slate-950/40 border border-slate-800 rounded-2xl p-5">
-                  <h3 className="font-bold text-sm mb-4">
-                    Distribusi Kontrak Berdasarkan Kategori
-                  </h3>
-
-                  <div className="space-y-4">
-                    {["Employment", "Vendor", "NDA", "MOU", "Rental"].map(
-                      (cat) => {
-                        const count = contracts.filter(
-                          (c) => c.category === cat,
-                        ).length;
-                        const percentage = contracts.length
-                          ? Math.round((count / contracts.length) * 100)
-                          : 0;
-                        return (
-                          <div key={cat} className="space-y-1">
-                            <div className="flex justify-between text-xs font-semibold">
-                              <span>
-                                {cat === "Employment"
-                                  ? "Karyawan / PKWT"
-                                  : cat === "Vendor"
-                                    ? "Vendor / Supplier Jasa"
-                                    : cat}
-                              </span>
-                              <span className="text-indigo-400">
-                                {count} Kontrak ({percentage}%)
-                              </span>
-                            </div>
-                            <div className="w-full bg-slate-900 rounded-full h-2">
-                              <div
-                                className={`h-2 rounded-full ${
-                                  cat === "Employment"
-                                    ? "bg-emerald-500"
-                                    : cat === "Vendor"
-                                      ? "bg-indigo-500"
-                                      : cat === "NDA"
-                                        ? "bg-amber-500"
-                                        : "bg-rose-500"
-                                }`}
-                                style={{ width: `${percentage}%` }}
-                              ></div>
-                            </div>
-                          </div>
-                        );
-                      },
-                    )}
+              {/* Baris 2: status · persetujuan · audit (semua tinggi tetap) */}
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+                <div className="lg:col-span-3">
+                  <div className={`${CARD} flex flex-col`} style={{ height: 340, overflow: "hidden" }}>
+                    <DashCardHeader Icon={PieChart} title="Status Kontrak" subtitle={`${contracts.length} kontrak total`} />
+                    <div className="flex items-center justify-center py-3 flex-1">
+                      <StatusRing
+                        segments={[
+                          { value: aktifList.length, color: "var(--color-soft-blue)" },
+                          { value: draftList.length, color: "var(--color-peach-strong)" },
+                          { value: otherCount, color: "var(--color-slate-700)" },
+                        ]}
+                        center={`${aktifPct}%`}
+                        sub="kontrak aktif"
+                      />
+                    </div>
+                    <div className="flex items-center justify-center gap-4 text-[11px] text-slate-500 flex-wrap">
+                      <span className="flex items-center gap-1.5"><i className="w-2 h-2 rounded-full bg-soft-blue" />Aktif {aktifList.length}</span>
+                      <span className="flex items-center gap-1.5"><i className="w-2 h-2 rounded-full bg-peach-strong" />Draft {draftList.length}</span>
+                      <span className="flex items-center gap-1.5"><i className="w-2 h-2 rounded-full bg-slate-700" />Lainnya {otherCount}</span>
+                    </div>
                   </div>
                 </div>
+                <div className="lg:col-span-5">{apprCard}</div>
+                <div className="lg:col-span-4">{auditCard}</div>
+              </div>
 
-                {/* User Productivity and Audit Trail Summary */}
-                <div className="bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-4">
-                  <h3 className="font-bold text-sm">
-                    Produktivitas Pengguna & Log Audit Aktivitas
-                  </h3>
-
-                  <div className="space-y-3 max-h-56 overflow-y-auto">
-                    {audits.slice(0, 4).map((audit) => (
-                      <div
-                        key={audit.id}
-                        className="p-3 bg-slate-900/60 rounded-xl border border-slate-800 text-xs flex items-start gap-3"
-                      >
-                        <div className="p-1.5 rounded-lg bg-slate-850 text-indigo-400">
-                          <User className="w-3.5 h-3.5" />
-                        </div>
-                        <div className="flex-1 space-y-0.5">
-                          <div className="flex items-center justify-between">
-                            <strong className="text-slate-200">
-                              {audit.userName}
-                            </strong>
-                            <span className="text-[10px] text-slate-500">
-                              {new Date(audit.timestamp).toLocaleDateString()}
-                            </span>
-                          </div>
-                          <p className="text-[10px] text-indigo-400 font-semibold">
-                            {audit.userRole}
-                          </p>
-                          <p className="text-slate-300 font-medium">
-                            {audit.action} • {audit.details}
-                          </p>
-                          {audit.contractNumber && (
-                            <span className="inline-block mt-1 bg-slate-800 px-1.5 py-0.5 rounded font-mono text-[9px] text-slate-400">
-                              {audit.contractNumber}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-
-                  <button
-                    onClick={() => setActiveTab("audits")}
-                    className="w-full py-2 bg-slate-900 hover:bg-slate-850 rounded-xl border border-slate-800 text-xs font-semibold flex items-center justify-center gap-1 text-indigo-400 transition cursor-pointer"
-                  >
-                    Buka Seluruh Audit Trail{" "}
-                    <ChevronRight className="w-3 h-3" />
-                  </button>
-                </div>
+              {/* Baris 3: kadaluwarsa · sharing fee (tinggi tetap) */}
+              <div className={`grid grid-cols-1 gap-5 items-start ${shareCard ? "lg:grid-cols-2" : ""}`}>
+                {expiryCard}
+                {shareCard}
               </div>
             </div>
-          )}
+          );
+        })()}
 
           {/* VIEW: KONFIGURASI & MASTER DATA */}
           {activeTab === "konfigurasi" && !selectedContract && (
             <div className="space-y-6">
-              <div>
-                <h2 className="text-xl font-bold flex items-center gap-2">
-                  <Sliders className="w-5 h-5 text-indigo-400" />
-                  Konfigurasi & Master Data
-                </h2>
-                <p className="text-sm text-slate-400 mt-1">
-                  Mulai dari <b>Beranda Konfigurasi</b> — cari pengaturan apa pun atau ikuti langkah penyiapan. Semua bisa diubah dinamis: judul bagian dokumen, folder, vendor & karyawan, identitas perusahaan, dan e-Meterai.
-                </p>
+              {/* Header halaman */}
+              <div className="card-grad card-soft bg-slate-900 rounded-[28px] px-6 py-5 flex items-center gap-4 relative overflow-hidden">
+                <Settings aria-hidden className="pointer-events-none absolute -right-4 -top-8 w-40 h-40 text-soft-blue opacity-[0.12]" strokeWidth={1.2} />
+                <Sliders aria-hidden className="pointer-events-none absolute right-40 -bottom-6 w-24 h-24 text-peach-strong opacity-30 -rotate-12" strokeWidth={1.2} />
+                <FileCheck aria-hidden className="pointer-events-none absolute right-80 -top-3 w-16 h-16 text-soft-blue opacity-[0.12] rotate-6" strokeWidth={1.2} />
+                <span className="w-12 h-12 rounded-full bg-peach flex items-center justify-center shrink-0 relative"><Sliders className="w-5 h-5 text-slate-300" /></span>
+                <div className="min-w-0 relative">
+                  <h2 className="text-[22px] leading-tight font-medium text-slate-100">Konfigurasi & Master Data</h2>
+                  <p className="text-xs text-slate-500">Atur jenis dokumen, format nomor, klausul, folder, master data, perusahaan, dan hak akses.</p>
+                </div>
               </div>
 
-              {/* Navigasi Konfigurasi berkelompok — Beranda berpandu + 3 grup
-                  jelas (Dokumen & Template / Master Data / Perusahaan & Sistem)
-                  menggantikan 9 tab datar yang dulu bikin bingung. Semua tab
-                  lama tetap ada, cuma dikelompokkan. Navigasi lewat goConfig
-                  (satu sumber kebenaran, lihat definisinya di atas). */}
-              <div className="space-y-3 border-b border-slate-800 pb-4">
-                <button
-                  onClick={() => setConfigTab("beranda")}
-                  className={`px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
-                    configTab === "beranda"
-                      ? "bg-indigo-600 text-white"
-                      : "bg-slate-900 text-slate-300 border border-slate-800 hover:text-slate-100"
-                  }`}
-                >
-                  <LayoutDashboard className="w-3.5 h-3.5" /> Beranda Konfigurasi
-                </button>
-                {([
+              <div className="space-y-3">
+              {(() => {
+                const CFG_ICON: Record<string, any> = { beranda: LayoutDashboard, dokumen: FileText, master: Users, sistem: Settings, dcsdoctypes: FileText, masterdata: Hash, dcsclauses: FileCheck, clauses: Sliders, folder: Briefcase, vendor: Building2, karyawan: Users, app: Settings, pengguna: User, hakakses: ShieldAlert, perusahaan: Building2 };
+                const GROUPS = [
                   // Label dulu menyesatkan: penomoran KONTRAK ada di tab
                   // bernama "Dropdown Form" (tak ada petunjuk sama sekali),
                   // sementara "Jenis Dokumen" ternyata khusus DCS. Orang yang
@@ -13366,28 +14809,89 @@ export default function App() {
                     ...(currentUser.role === "admin" || currentUser.role === "super_admin" ? [{ k: "hakakses", label: "Hak Akses (RBAC)" }] : []),
                     ...(currentUser.role === "super_admin" ? [{ k: "perusahaan", label: "Kelola Perusahaan" }] : []),
                   ] },
-                ] as { group: string; items: { k: string; label: string; main?: string }[] }[]).map((grp) => (
-                  <div key={grp.group} className="space-y-1.5">
-                    <p className="text-[9.5px] font-bold text-slate-600 uppercase tracking-wider">{grp.group}</p>
-                    <div className="flex flex-wrap gap-2">
-                      {grp.items.map((t) => (
-                        <button
-                          key={t.k}
-                          onClick={() => goConfig(t.k, t.main)}
-                          className={`px-4 py-2 rounded-xl text-xs font-semibold transition cursor-pointer flex items-center gap-1 ${
-                            !t.main && configTab === t.k
-                              ? "bg-indigo-600 text-white"
-                              : "bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-100"
-                          }`}
-                        >
-                          {t.label}
-                          {t.main && <ExternalLink className="w-3 h-3 opacity-60" />}
-                        </button>
-                      ))}
-                    </div>
+                ] as { group: string; items: { k: string; label: string; main?: string }[] }[];
+                // 3 kategori utama (+ Beranda); sub-menu tiap kategori tampil horizontal di bawahnya.
+                const CATS: { id: string; label: string; title: string; sections: { label: string; items: { k: string; label: string; main?: string }[] }[] }[] = [
+                  { id: "dokumen", label: "Dokumen & Template", title: "Menu Dokumen", sections: [{ label: "Dokumen & Template", items: GROUPS[0].items }] },
+                  { id: "master", label: "Master Data", title: "Menu Master Data", sections: [{ label: "Master Data", items: GROUPS[1].items }] },
+                  { id: "sistem", label: "Perusahaan & Sistem", title: "Menu Perusahaan & Sistem", sections: [{ label: "Perusahaan & Sistem", items: GROUPS[2].items }] },
+                ];
+                const activeCat = configTab === "beranda" ? "beranda" : (CATS.find((c) => c.sections.some((sec) => sec.items.some((i) => !i.main && i.k === configTab)))?.id || "dokumen");
+                const cur = CATS.find((c) => c.id === activeCat);
+                const tabBtn = (id: string, label: string, onClick: () => void) => {
+                  const Icon = CFG_ICON[id] || Settings;
+                  const active = activeCat === id;
+                  return (
+                    <button
+                      key={id}
+                      onClick={onClick}
+                      className={`relative min-h-[48px] rounded-[16px] flex items-center justify-center gap-2.5 text-[12.5px] font-bold transition cursor-pointer ${
+                        active ? "bg-soft-blue/20 text-[#3a7fa8] ring-1 ring-soft-blue/40" : "text-slate-500 hover:bg-slate-800/50 hover:text-slate-200"
+                      }`}
+                    >
+                      <span className={`w-8 h-8 rounded-[11px] flex items-center justify-center ${active ? "btn-grad-primary text-white" : "bg-slate-800/70 text-slate-500"}`}><Icon className="w-4 h-4" /></span>
+                      <span>{label}</span>
+                    </button>
+                  );
+                };
+                return (
+                  <>
+                    <nav aria-label="Kategori konfigurasi" className="card-soft bg-slate-900 rounded-[22px] p-1.5 grid grid-cols-2 md:grid-cols-4 gap-1.5">
+                      {tabBtn("beranda", "Beranda", () => setConfigTab("beranda"))}
+                      {CATS.map((c) => tabBtn(c.id, c.label, () => goConfig(c.sections[0].items[0].k, c.sections[0].items[0].main)))}
+                    </nav>
+                    {cur && (
+                      <div className="card-soft bg-slate-900/80 rounded-[20px] px-3 py-2.5 flex items-center gap-3 relative overflow-hidden">
+                        <Scale aria-hidden className="pointer-events-none absolute -right-3 -bottom-6 w-24 h-24 text-peach-strong opacity-20 -rotate-12" strokeWidth={1.2} />
+                        <span className="shrink-0 h-9 px-4 rounded-[12px] bg-soft-blue/20 text-[#3a7fa8] text-[11px] font-extrabold flex items-center relative">{cur.title}</span>
+                        <div className="flex items-center gap-1 overflow-x-auto no-scrollbar min-w-0 relative">
+                          {cur.sections.map((sec) => sec.items.map((t) => {
+                            const Icon = CFG_ICON[t.k] || Settings;
+                            const active = !t.main && configTab === t.k;
+                            return (
+                              <button
+                                key={t.k}
+                                onClick={() => goConfig(t.k, t.main)}
+                                className={`shrink-0 whitespace-nowrap px-3.5 py-2 rounded-full flex items-center gap-1.5 text-[12px] transition cursor-pointer ${
+                                  active ? "btn-grad-primary text-white font-bold" : "text-slate-400 hover:bg-slate-800/60 hover:text-slate-100"
+                                }`}
+                              >
+                                <Icon className="w-3.5 h-3.5" />
+                                {t.label}
+                                {t.main && <ExternalLink className="w-3 h-3 opacity-60" />}
+                              </button>
+                            );
+                          }))}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
+
+              <div className="cfg-content min-w-0 space-y-5 rounded-[28px] bg-slate-900/50 border border-white/70 p-5">
+              {configTab !== "beranda" && (() => {
+                const META: Record<string, [string, string]> = {
+                  dcsdoctypes: ["Jenis Dokumen (Semua Modul)", "Satu tempat untuk jenis dokumen DCS, Kontrak Eksternal, dan Kontrak Karyawan."],
+                  masterdata: ["Format Nomor Default & Dropdown", "Daftar pilihan di form kontrak, format nomor dokumen, dan margin halaman."],
+                  dcsclauses: ["Klausul DCS", "Blok isi yang bisa dipakai ulang saat menyusun SOP, IK, Memo, atau Kebijakan."],
+                  folder: ["Folder Dokumen", "Struktur arsip — muncul otomatis saat membuat kontrak & mendaftarkan dokumen."],
+                  vendor: ["Data Vendor", "Data pihak kedua: PIC, email, NPWP, dan alamat."],
+                  karyawan: ["Data Karyawan", "Jabatan, departemen, gaji, dan tanggal mulai kerja."],
+                  app: ["Perusahaan & e-Meterai", "Identitas perusahaan (kop dokumen), watermark PDF, dan e-Meterai."],
+                  pengguna: ["Kelola Pengguna", "Akun, kata sandi, dan peran akses."],
+                  hakakses: ["Hak Akses (RBAC)", "Menu dan folder arsip yang boleh dibuka tiap role."],
+                  perusahaan: ["Kelola Perusahaan", "Daftar perusahaan (tenant) yang memakai aplikasi ini."],
+                };
+                const m = META[configTab];
+                if (!m) return null;
+                return (
+                  <div>
+                    <h3 className="text-[17px] font-semibold text-slate-100">{m[0]}</h3>
+                    <p className="text-xs text-slate-500 mt-0.5">{m[1]}</p>
                   </div>
-                ))}
-              </div>
+                );
+              })()}
 
               {/* BERANDA KONFIGURASI BERPANDU — pencarian pengaturan + checklist
                   setup dengan status nyata dari data yang sudah dimuat. Semua
@@ -13459,8 +14963,9 @@ export default function App() {
                             <button
                               key={i}
                               onClick={() => goConfig(s.tab, s.main)}
-                              className="text-left p-4 bg-slate-950/60 hover:bg-slate-900 border border-slate-800 hover:border-indigo-500/40 rounded-xl transition cursor-pointer flex items-start gap-3 group"
+                              className="text-left p-4 card-grad card-soft bg-slate-900 hover:brightness-[1.02] rounded-[22px] transition cursor-pointer flex items-start gap-3 group relative overflow-hidden"
                             >
+                              {(() => { const OI = ({ app: Building2, dcsdoctypes: FileText, clauses: Scale, folder: Briefcase, vendor: Users } as Record<string, any>)[s.tab] || Gavel; return <OI aria-hidden className="pointer-events-none absolute -right-2 -bottom-3 w-16 h-16 text-peach-strong opacity-30 -rotate-12" strokeWidth={1.2} />; })()}
                               {s.done ? (
                                 <CheckCircle className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" />
                               ) : (
@@ -13480,7 +14985,7 @@ export default function App() {
                           ))}
                         </div>
                         <p className="text-[11px] text-slate-500 pt-1">
-                          Butuh pengaturan lain? Pakai kotak pencarian di atas, atau pilih grup tab di atas (Dokumen &amp; Template · Master Data · Perusahaan &amp; Sistem).
+                          Butuh pengaturan lain? Pakai kotak pencarian di atas, atau pilih kategori di tab atas.
                         </p>
                       </div>
                     )}
@@ -13510,7 +15015,7 @@ export default function App() {
                         handleAddFolder(el.value);
                         el.value = "";
                       }}
-                      className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold flex items-center gap-1 cursor-pointer"
+                      className="px-4 py-2.5 btn-grad-primary text-white rounded-full text-sm font-semibold flex items-center gap-1 cursor-pointer"
                     >
                       <Plus className="w-4 h-4" /> Tambah Folder
                     </button>
@@ -13522,7 +15027,7 @@ export default function App() {
                     {clauseCategories.map((cat) => {
                       const count = contracts.filter((c) => c.category === cat).length;
                       return (
-                        <div key={cat} className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between">
+                        <div key={cat} className="p-4 bg-slate-900 card-soft rounded-[22px] flex items-center justify-between">
                           {renameFolder?.old === cat ? (
                             <div className="flex-1 flex gap-2">
                               <input
@@ -13588,7 +15093,7 @@ export default function App() {
 
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                     {/* Jenis Kontrak / Dokumen — kini dikelola di tab "Jenis Dokumen" (hub terpadu) */}
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-2 lg:col-span-2">
+                    <div className="p-4 bg-slate-900 card-soft rounded-[22px] space-y-2 lg:col-span-2">
                       <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
                         <ClipboardList className="w-4 h-4 text-indigo-400" /> Jenis Kontrak / Dokumen
                       </h4>
@@ -13612,15 +15117,98 @@ export default function App() {
                       <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Format Nomor &amp; Margin Halaman</p>
                     </div>
 
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
-                      <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                        <FileDigit className="w-4 h-4 text-violet-400" /> Penomoran Terintegrasi per Jenis Dokumen
-                      </h4>
-                      <p className="text-[11px] text-slate-400 leading-relaxed">
-                        Penomoran dokumen disatukan berpatokan pada <strong className="text-slate-200">Jenis Dokumen</strong> (seperti *Perjanjian, MOU, Addendum*). Setiap jenis dokumen memiliki Kode Singkatan dan Format Nomor tersendiri di panel Jenis Kontrak / Dokumen di atas, serta memiliki nomor urut independen yang dimulai dari <code>001</code> tiap tahunnya.
-                      </p>
+                    <div className="p-4 bg-slate-900 border border-slate-800 rounded-xl shadow-sm lg:col-span-2 flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-3 min-w-0">
+                        <div className="p-2.5 bg-indigo-500/10 text-indigo-400 rounded-lg shrink-0">
+                          <FileDigit className="w-5 h-5" />
+                        </div>
+                        <div className="min-w-0">
+                          <h4 className="text-sm font-bold text-slate-100">Penomoran Terintegrasi per Jenis Dokumen</h4>
+                          <p className="text-xs text-slate-500 leading-relaxed mt-0.5">
+                            Penomoran dokumen disatukan berpatokan pada <strong className="text-slate-300">Jenis Dokumen</strong> (seperti Perjanjian, MOU, Addendum). Setiap jenis dokumen memiliki Kode Singkatan dan Format Nomor tersendiri di panel Jenis Kontrak / Dokumen di atas, serta memiliki nomor urut independen yang dimulai dari <code className="font-mono text-indigo-400">001</code> tiap tahunnya.
+                          </p>
+                        </div>
+                      </div>
+                      <span className="hidden sm:inline text-xs font-semibold px-2.5 py-1 bg-slate-950 text-slate-400 rounded-md border border-slate-800 shrink-0">GA &amp; Legal</span>
                     </div>
 
+                    {(() => {
+                      // Tampilan saja — state, handler simpan & preview TETAP
+                      // yang sama seperti sebelumnya (DCS: dcsNumberingMaskDraft
+                      // + handleSaveDcsNumberingRule; Kontrak: masterData
+                      // .defaultNumberMask/.defaultNumberPrefix + handleSaveSettings).
+                      const isDcs = numberFormatModule === "dcs";
+                      const mask = isDcs ? dcsNumberingMaskDraft : masterData.defaultNumberMask;
+                      const setMask = (v: string) => {
+                        if (isDcs) setDcsNumberingMaskDraft(v);
+                        else setAppSettings({ ...appSettings, masterData: { ...appSettings.masterData, defaultNumberMask: v } });
+                      };
+                      // Sisipkan dengan pemisah "/" otomatis, kalau tidak hasilnya
+                      // menempel jadi {Year}{Year} (perilaku lama dipertahankan).
+                      const insertToken = (t: string) => {
+                        const cur = mask || "";
+                        const needsSep = cur.length > 0 && !/[/.\-_]$/.test(cur);
+                        setMask(cur + (needsSep ? "/" : "") + t);
+                      };
+                      // go = ke mana pengguna harus pergi untuk MENGISI data token ini (token otomatis
+      // seperti Nomor urut/Tahun tidak punya go). tab = tab Konfigurasi lain,
+      // anchor = elemen di halaman ini (digulir + disorot).
+      type TokGo = { label: string; tab?: string; anchor?: string; superOnly?: boolean };
+      type Tok = { t: string; l: string; d: string; go?: TokGo };
+                      const groups: { title: string; tokens: Tok[] }[] = isDcs
+                        ? [
+                            { title: "1. Urutan & Jenis", tokens: [
+                              { t: "{Sequence:4}", l: "Nomor urut", d: "0001, 0002, 0003 — dihitung per jenis dokumen per tahun. Angka 4 = jumlah digit." },
+                              { t: "{DocType}", l: "Jenis dokumen", d: "Kode singkat jenis dokumen, mis. SOP, IK, MEMO", go: { label: "Atur kode di Jenis Dokumen", tab: "dcsdoctypes" } },
+                            ] },
+                            { title: "2. Waktu & Tanggal", tokens: [
+                              { t: "{Year}", l: "Tahun", d: "Tahun, mis. 2026" },
+                              { t: "{MonthRoman}", l: "Bulan Romawi", d: "Bulan angka Romawi, I … XII" },
+                              { t: "{Month}", l: "Bulan angka", d: "Bulan angka, 1 … 12" },
+                              { t: "{Day}", l: "Tanggal", d: "Tanggal, 1 … 31" },
+                            ] },
+                            { title: "3. Atribut Tambahan", tokens: [
+                              { t: "{Department}", l: "Departemen", d: "Kode departemen penyusun, mis. HED", go: { label: "Atur daftar Departemen", anchor: "cfg-departments" } },
+                            ] },
+                          ]
+                        : [
+                            { title: "1. Urutan & Jenis", tokens: [
+                              { t: "{Sequence:3}", l: "Nomor urut", d: "001, 002, 003 — dihitung per jenis dokumen per tahun. Angka 3 = jumlah digit." },
+                              { t: "{DocTypeCode}", l: "Kode jenis", d: "Kode singkat jenis dokumen, mis. PKS", go: { label: "Isi Kode di Jenis Dokumen", tab: "dcsdoctypes" } },
+                              { t: "{DocType}", l: "Nama jenis", d: "Nama lengkap jenis dokumen", go: { label: "Atur nama di Jenis Dokumen", tab: "dcsdoctypes" } },
+                            ] },
+                            { title: "2. Waktu & Tanggal", tokens: [
+                              { t: "{Year}", l: "Tahun", d: "Tahun, mis. 2026" },
+                              { t: "{MonthRoman}", l: "Bulan Romawi", d: "Bulan dalam angka Romawi, I … XII" },
+                              { t: "{Month}", l: "Bulan angka", d: "Bulan angka, 1 … 12" },
+                              { t: "{Day}", l: "Tanggal", d: "Tanggal, 1 … 31 (token sama juga tersedia di format nomor Dokumen Internal/DCS)" },
+                            ] },
+                            { title: "3. Atribut Tambahan", tokens: [
+                              { t: "{Prefix}", l: "Prefix", d: "Prefix kategori, atau Prefix Default bila kategori tak punya prefix sendiri", go: { label: "Isi Prefix Default", anchor: "cfg-prefix-default" } },
+                              { t: "{Category}", l: "Kategori", d: "Nama kategori, mis. Vendor", go: { label: "Atur kategori di Folder Dokumen", tab: "folder" } },
+                              { t: "{Codes}", l: "Kode tambahan", d: "Kode tambahan jenis dokumen bila diisi, mis. TBK", go: { label: "Isi Kode Tambahan di Jenis Dokumen", tab: "dcsdoctypes" } },
+                              { t: "{Platform}", l: "Platform", d: "Platform kerja sama yang dipilih di form buat kontrak, mis. ASMAT / TIKETUX. Daftar platform tiap perusahaan diatur di Kelola Perusahaan. Tidak dipilih = segmen ini hilang otomatis. Nomor urut tetap satu urutan untuk semua platform." , go: { label: "Atur platform di Kelola Perusahaan", tab: "perusahaan", superOnly: true } },
+                            ] },
+                          ];
+                      const preview = isDcs
+                        ? previewNumberMask(dcsNumberingMaskDraft, { DocType: "SOP", Department: "HED", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1).padStart(2, "0"), Day: String(new Date().getDate()).padStart(2, "0") })
+                        : previewNumberMask(masterData.defaultNumberMask, { Prefix: masterData.defaultNumberPrefix, Category: "Vendor", DocType: "", Platform: platformCode(tenantPlatforms[0]), Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1), Day: String(new Date().getDate()) });
+                      const saveDisabled = isDcs && (dcsBusy || dcsNumberingMaskDraft === dcsNumberingRule?.mask);
+                      const goTo = (go: TokGo) => {
+                        if (go.anchor) {
+                          const el = document.getElementById(go.anchor);
+                          if (el) {
+                            el.scrollIntoView({ behavior: "smooth", block: "center" });
+                            el.classList.add("cfg-flash");
+                            setTimeout(() => el.classList.remove("cfg-flash"), 1800);
+                          }
+                        } else if (go.tab) goConfig(go.tab);
+                      };
+                      const canGo = (go: TokGo) => !go.superOnly || currentUser?.role === "super_admin";
+                      const segBtn = (active: boolean) =>
+                        `px-4 py-1.5 rounded-lg text-xs transition-all cursor-pointer ${active ? "bg-slate-900 text-indigo-400 shadow-sm font-bold" : "text-slate-400 hover:text-slate-200 font-semibold"}`;
+                      return (
+                    <>
                     {/* ==== Format Nomor Dokumen — SATU kartu, dua mode ====
                         Sebelumnya 2 kartu terpisah ("Format Nomor Dokumen DCS"
                         & "Format Nomor Dokumen Kontrak") dengan mekanisme
@@ -13628,202 +15216,187 @@ export default function App() {
                         sendiri di Postgres (disimpan lewat tombol "Simpan"
                         khusus di sini → handleSaveDcsNumberingRule), Kontrak
                         cuma field JSON di appSettings.masterData (ikut
-                        tersimpan lewat tombol "Simpan Master Data" di atas
-                        halaman). Digabung jadi 1 kartu dengan toggle supaya
-                        orang awam tidak bingung ada 2 kartu mirip — tapi
-                        state & endpoint di baliknya TETAP terpisah persis
-                        seperti sebelumnya, cuma switch tampilan saja. */}
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
-                      <div className="flex items-center justify-between flex-wrap gap-2">
-                        <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                          <FileDigit className="w-4 h-4 text-violet-400" /> Format Nomor Dokumen
-                        </h4>
-                        <div className="flex bg-slate-900 border border-slate-800 rounded-lg p-0.5">
-                          <button
-                            type="button"
-                            onClick={() => setNumberFormatModule("dcs")}
-                            className={`px-3 py-1 rounded-md text-[10px] font-bold cursor-pointer transition ${numberFormatModule === "dcs" ? "bg-violet-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
-                          >
-                            DCS
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setNumberFormatModule("kontrak")}
-                            className={`px-3 py-1 rounded-md text-[10px] font-bold cursor-pointer transition ${numberFormatModule === "kontrak" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-slate-200"}`}
-                          >
-                            Kontrak
-                          </button>
+                        tersimpan lewat handleSaveSettings). Digabung jadi 1
+                        kartu dengan toggle supaya orang awam tidak bingung
+                        ada 2 kartu mirip — tapi state & endpoint di baliknya
+                        TETAP terpisah persis seperti sebelumnya. */}
+                    <div className="bg-slate-900 border border-slate-800 rounded-2xl shadow-sm overflow-hidden lg:col-span-2">
+                      {/* Header + tab switcher */}
+                      <div className="p-5 border-b border-slate-800 bg-slate-950/50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                        <div className="flex items-center gap-2.5">
+                          <div className="p-2 bg-indigo-600 text-white rounded-lg shadow-sm shadow-indigo-500/20">
+                            <Hash className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h4 className="text-sm font-bold text-slate-100">Format Nomor Dokumen</h4>
+                            <p className="text-xs text-slate-500">Konfigurasi token urutan dan atribut penomoran</p>
+                          </div>
+                        </div>
+                        <div className="inline-flex p-1 bg-slate-800 rounded-xl self-start sm:self-auto">
+                          <button type="button" onClick={() => setNumberFormatModule("dcs")} className={segBtn(isDcs)}>DCS</button>
+                          <button type="button" onClick={() => setNumberFormatModule("kontrak")} className={segBtn(!isDcs)}>Kontrak</button>
                         </div>
                       </div>
 
-                      {numberFormatModule === "dcs" ? (
-                        <>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg space-y-2">
-                            <p className="text-[11px] text-slate-300 font-semibold">Cara kerja penomoran (DCS)</p>
-                            <ol className="text-[11px] text-slate-400 space-y-1 list-decimal list-inside leading-relaxed">
-                              <li>Format bawaan untuk jenis dokumen <b className="text-violet-300">DCS</b> (SOP/IK/Memo/Kebijakan) yang belum punya format khusus sendiri.</li>
-                              <li>Tiap jenis dokumen bisa di-override lewat tombol "Edit template"-nya masing-masing di tab <b>Jenis Dokumen (Semua Modul)</b>.</li>
-                              <li>Nomor urut dihitung <b>terpisah per Jenis Dokumen dan per tahun</b> — tiap ganti tahun urutan mulai lagi dari 1.</li>
-                            </ol>
-                          </div>
-                          <div className="space-y-1.5">
-                            <p className="text-[10px] text-slate-500">Klik untuk menyisipkan ke format di bawah:</p>
-                            <div className="flex flex-wrap gap-1.5">
-                              {[
-                                { t: "{DocType}", l: "Jenis dokumen", d: "Kode singkat jenis dokumen, mis. SOP, IK, MEMO" },
-                                { t: "{Department}", l: "Departemen", d: "Kode departemen penyusun, mis. HED" },
-                                { t: "{Year}", l: "Tahun", d: "2026" },
-                                { t: "{Month}", l: "Bulan angka", d: "1 … 12" },
-                                { t: "{MonthRoman}", l: "Bulan Romawi", d: "I, II, III … XII" },
-                                { t: "{Day}", l: "Tanggal", d: "1 … 31" },
-                                { t: "{Sequence:4}", l: "Nomor urut", d: "0001, 0002, 0003 — dihitung per jenis dokumen per tahun. Angka 4 = jumlah digit." },
-                              ].map((tok) => (
-                                <button
-                                  key={tok.t}
-                                  type="button"
-                                  title={`${tok.t} — ${tok.d}`}
-                                  onClick={() => {
-                                    // Sisipkan dengan pemisah "/" otomatis, kalau
-                                    // tidak hasilnya menempel jadi {Year}{Year}.
-                                    const cur = dcsNumberingMaskDraft || "";
-                                    const needsSep = cur.length > 0 && !/[/.\-_]$/.test(cur);
-                                    setDcsNumberingMaskDraft(cur + (needsSep ? "/" : "") + tok.t);
-                                  }}
-                                  className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-violet-500/50 rounded-lg text-[10px] text-slate-300 cursor-pointer transition"
-                                >
-                                  + {tok.l}
-                                </button>
-                              ))}
-                            </div>
-                            {/* Penjelasan tiap token ditampilkan langsung di sini (tidak
-                                hanya lewat hover/title) supaya terlihat tanpa perlu
-                                mengarahkan kursor satu-satu ke tiap chip. */}
-                            <ul className="text-[10px] text-slate-500 space-y-0.5 list-disc list-inside leading-relaxed">
-                              <li><code className="text-slate-400">{"{DocType}"}</code> — Kode singkat jenis dokumen, mis. SOP, IK, MEMO</li>
-                              <li><code className="text-slate-400">{"{Department}"}</code> — Kode departemen penyusun, mis. HED</li>
-                              <li><code className="text-slate-400">{"{Year}"}</code> — Tahun, mis. 2026</li>
-                              <li><code className="text-slate-400">{"{Month}"}</code> — Bulan angka, 1 … 12</li>
-                              <li><code className="text-slate-400">{"{MonthRoman}"}</code> — Bulan angka Romawi, I … XII</li>
-                              <li><code className="text-slate-400">{"{Day}"}</code> — Tanggal, 1 … 31</li>
-                              <li><code className="text-slate-400">{"{Sequence:4}"}</code> — Nomor urut per jenis dokumen per tahun. Angka menentukan jumlah digit, mis. {"{Sequence:4}"} → 0001</li>
-                            </ul>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <input
-                              type="text"
-                              value={dcsNumberingMaskDraft}
-                              onChange={(e) => setDcsNumberingMaskDraft(e.target.value)}
-                              placeholder="{DocType}/{Department}/{Year}/{Sequence:4}"
-                              className="flex-1 px-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
-                            />
-                            <button
-                              onClick={handleSaveDcsNumberingRule}
-                              disabled={dcsBusy || dcsNumberingMaskDraft === dcsNumberingRule?.mask}
-                              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg cursor-pointer"
-                            >
-                              Simpan
-                            </button>
-                          </div>
-                          {/* Preview diperbesar (sebelumnya text-[10px] abu-abu gelap,
-                              nyaris tak terlihat) supaya jelas terbaca. */}
-                          <div className="px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg">
-                            <p className="text-[10px] text-slate-500 mb-0.5">Preview</p>
-                            <p className="text-sm font-mono font-semibold text-emerald-300 break-all">
-                              {previewNumberMask(dcsNumberingMaskDraft, { DocType: "SOP", Department: "HED", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1).padStart(2, "0"), Day: String(new Date().getDate()).padStart(2, "0") })}
-                            </p>
-                          </div>
-                        </>
-                      ) : (
-                        <>
-                          <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg space-y-2">
-                            <p className="text-[11px] text-slate-300 font-semibold">Cara kerja penomoran (Kontrak)</p>
-                            <ol className="text-[11px] text-slate-400 space-y-1 list-decimal list-inside leading-relaxed">
-                              <li>Tiap <b>Jenis Dokumen</b> boleh punya "Format Nomor" sendiri (diatur di panel Jenis Kontrak / Dokumen di atas).</li>
-                              <li>Jenis dokumen yang <b>tidak</b> punya format sendiri memakai <b>Format Nomor Dokumen Kontrak</b> di bawah ini.</li>
-                              <li>Nomor urut dihitung <b>terpisah per Jenis Dokumen dan per tahun</b> — jadi PKS dan Sewa punya urutan masing-masing, dan tiap ganti tahun keduanya mulai lagi dari 1.</li>
-                              <li>Nomor dibuat otomatis &amp; terkunci saat dokumen <b>disusun di sistem</b>. Untuk dokumen <b>hasil unggahan PDF</b>, nomor diisi bebas sesuai dokumen aslinya dan tidak memakai urutan ini.</li>
-                            </ol>
-                          </div>
-                          <div className="space-y-1.5">
-                            <p className="text-[10px] text-slate-500">Klik untuk menyisipkan ke format di bawah:</p>
-                            <div className="flex flex-wrap gap-1.5">
-                              {[
-                                { t: "{Sequence:3}", l: "Nomor urut", d: "001, 002, 003 — dihitung per jenis dokumen per tahun. Angka 3 = jumlah digit." },
-                                { t: "{DocTypeCode}", l: "Kode jenis", d: "Kode singkat jenis dokumen, mis. PKS" },
-                                { t: "{Codes}", l: "Kode tambahan", d: "Kode ekstra jenis dokumen bila diisi, mis. TBK" },
-                                { t: "{MonthRoman}", l: "Bulan Romawi", d: "I, II, III … XII" },
-                                { t: "{Year}", l: "Tahun", d: "2026" },
-                                { t: "{Prefix}", l: "Prefix", d: "Prefix kategori, atau Prefix Default bila kategori tak punya" },
-                                { t: "{Category}", l: "Kategori", d: "Nama kategori, mis. Vendor" },
-                                { t: "{DocType}", l: "Nama jenis", d: "Nama lengkap jenis dokumen" },
-                                { t: "{Month}", l: "Bulan angka", d: "1 … 12" },
-                                { t: "{Day}", l: "Tanggal", d: "1 … 31 — sama seperti token yang tersedia di format nomor Dokumen Internal (DCS)" },
-                              ].map((tok) => (
-                                <button
-                                  key={tok.t}
-                                  type="button"
-                                  title={`${tok.t} — ${tok.d}`}
-                                  onClick={() => {
-                                    // Sisipkan dengan pemisah "/" otomatis, kalau
-                                    // tidak hasilnya menempel jadi {Year}{Year}.
-                                    const cur = masterData.defaultNumberMask || "";
-                                    const needsSep = cur.length > 0 && !/[/.\-_]$/.test(cur);
-                                    setAppSettings({ ...appSettings, masterData: { ...appSettings.masterData, defaultNumberMask: cur + (needsSep ? "/" : "") + tok.t } });
-                                  }}
-                                  className="px-2 py-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 hover:border-indigo-500/50 rounded-lg text-[10px] text-slate-300 cursor-pointer transition"
-                                >
-                                  + {tok.l}
-                                </button>
-                              ))}
-                            </div>
-                            {/* Penjelasan tiap token ditampilkan langsung di sini (tidak
-                                hanya lewat hover/title) supaya terlihat tanpa perlu
-                                mengarahkan kursor satu-satu ke tiap chip. */}
-                            <ul className="text-[10px] text-slate-500 space-y-0.5 list-disc list-inside leading-relaxed">
-                              <li><code className="text-slate-400">{"{Sequence:3}"}</code> — Nomor urut, 001/002/003 — dihitung per jenis dokumen per tahun. Angka menentukan jumlah digit.</li>
-                              <li><code className="text-slate-400">{"{DocTypeCode}"}</code> — Kode singkat jenis dokumen, mis. PKS</li>
-                              <li><code className="text-slate-400">{"{Codes}"}</code> — Kode tambahan jenis dokumen bila diisi, mis. TBK</li>
-                              <li><code className="text-slate-400">{"{MonthRoman}"}</code> — Bulan dalam angka Romawi, I … XII</li>
-                              <li><code className="text-slate-400">{"{Year}"}</code> — Tahun, mis. 2026</li>
-                              <li><code className="text-slate-400">{"{Prefix}"}</code> — Prefix kategori, atau Prefix Default di bawah bila kategori tak punya prefix sendiri</li>
-                              <li><code className="text-slate-400">{"{Category}"}</code> — Nama kategori, mis. Vendor</li>
-                              <li><code className="text-slate-400">{"{DocType}"}</code> — Nama lengkap jenis dokumen</li>
-                              <li><code className="text-slate-400">{"{Month}"}</code> — Bulan angka, 1 … 12</li>
-                              <li><code className="text-slate-400">{"{Day}"}</code> — Tanggal, 1 … 31 (token sama juga tersedia di format nomor Dokumen Internal/DCS)</li>
-                            </ul>
-                          </div>
-                          <div>
-                            <label className="block text-[10px] text-slate-500 mb-1">Prefix Default (dipakai token {"{Prefix}"} kalau kategori tak punya prefix sendiri)</label>
+                      <div className="p-5 space-y-6">
+                        {/* Panduan & Cara Kerja Penomoran (accordion) dan "Data token
+                            ini diisi di tempat lain" DIHAPUS atas permintaan user —
+                            keduanya sudah redundan dengan pop-up penjelasan token
+                            (buka lewat klik tag di bawah: deskripsi + tombol "ke
+                            tempat lain" sudah ada di sana). Berlaku sama persis
+                            untuk mode DCS maupun Kontrak krn satu kartu yang sama. */}
+
+                        {/* Prefix Default — khusus Kontrak */}
+                        {!isDcs && (
+                          <div id="cfg-prefix-default" className="space-y-1.5 rounded-[18px] p-1 -m-1 transition">
+                            <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">Prefix Default</label>
                             <input
                               type="text"
                               value={masterData.defaultNumberPrefix}
                               onChange={(e) => setAppSettings({ ...appSettings, masterData: { ...appSettings.masterData, defaultNumberPrefix: e.target.value.trim().toUpperCase() } })}
-                              className="w-full px-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
+                              placeholder="Misal: GA-AGR"
+                              className="w-full max-w-sm px-3.5 py-2 text-sm font-semibold font-mono bg-slate-900 border border-slate-700 rounded-lg text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition"
                             />
-                          </div>
-                          <input
-                            type="text"
-                            value={masterData.defaultNumberMask}
-                            onChange={(e) => setAppSettings({ ...appSettings, masterData: { ...appSettings.masterData, defaultNumberMask: e.target.value } })}
-                            className="w-full px-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
-                          />
-                          {/* Preview diperbesar (sebelumnya text-[10px] abu-abu gelap,
-                              nyaris tak terlihat) supaya jelas terbaca. */}
-                          <div className="px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg">
-                            <p className="text-[10px] text-slate-500 mb-0.5">Preview</p>
-                            <p className="text-sm font-mono font-semibold text-emerald-300 break-all">
-                              {previewNumberMask(masterData.defaultNumberMask, { Prefix: masterData.defaultNumberPrefix, Category: "Vendor", DocType: "", Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1), Day: String(new Date().getDate()) })}
+                            <p className="text-[11px] text-slate-500">
+                              Digunakan pada token <code className="bg-slate-950 px-1 py-0.5 rounded text-indigo-400 font-mono">{"{Prefix}"}</code> jika kategori tidak memiliki prefix tersendiri.
                             </p>
                           </div>
-                          <button
-                            onClick={handleSaveSettings}
-                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg cursor-pointer"
-                          >
-                            Simpan
-                          </button>
-                        </>
-                      )}
+                        )}
+
+                        {/* Token dikelompokkan per kategori */}
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">Klik Tag Untuk Menyisipkan Variabel:</label>
+                            <span className="text-[11px] text-slate-500 hidden sm:inline">Klik tag untuk lihat penjelasan &amp; menambahkan</span>
+                          </div>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 bg-slate-950/70 p-3.5 rounded-xl border border-slate-800">
+                            {groups.map((g) => (
+                              <div key={g.title} className="space-y-2">
+                                <span className="text-[11px] font-bold text-slate-500 block border-b border-slate-800 pb-1">{g.title}</span>
+                                <div className="flex flex-wrap gap-1.5">
+                                  {g.tokens.map((tok) => (
+                                    // Klik tag = buka pop-up penjelasan (bukan langsung
+                                    // menyisipkan) — token baru benar2 ditambahkan ke
+                                    // pola lewat tombol "+ Tambahkan ke Pola" di pop-up,
+                                    // yang tetap memanggil insertToken yang sama persis.
+                                    <button
+                                      key={tok.t}
+                                      type="button"
+                                      onClick={() => setTokenInfoModal(tok)}
+                                      className="px-2.5 py-1 text-xs font-medium bg-slate-900 hover:bg-indigo-500/10 hover:text-indigo-400 hover:border-indigo-500/40 hover:-translate-y-px text-slate-300 rounded-md border border-slate-800 shadow-sm transition flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Plus className="w-3 h-3 text-slate-500" /> {tok.l}
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+
+                        {/* "Data token ini diisi di tempat lain" DIHAPUS — tautan ke
+                            tempat pengisian token sudah ada di pop-up penjelasan
+                            tiap tag (lihat tokenInfoModal.go di bawah), jadi tidak
+                            perlu diulang di sini lagi. */}
+
+                        {/* Pola format */}
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-bold uppercase tracking-wider text-slate-500">Pola Format Nomor</label>
+                          <input
+                            type="text"
+                            value={mask}
+                            onChange={(e) => setMask(e.target.value)}
+                            placeholder={isDcs ? "{DocType}/{Department}/{Year}/{Sequence:4}" : undefined}
+                            className="w-full px-4 py-2.5 font-mono text-sm bg-slate-950/40 border border-slate-700 rounded-xl text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition"
+                          />
+                        </div>
+
+                        {/* Live preview — sengaja selalu gelap (warna tetap, tidak
+                            ikut dibalik tema terang/gelap) seperti desain. */}
+                        <div className="p-4 bg-[#0f172a] rounded-xl border border-[#1e293b] shadow-inner flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                          <div className="space-y-1 min-w-0">
+                            <span className="text-[10px] font-bold uppercase tracking-widest text-[#94a3b8] flex items-center gap-1.5">
+                              <span className="w-2 h-2 rounded-full bg-[#34d399] animate-pulse" /> Live Preview Output
+                            </span>
+                            <p className="font-mono text-lg font-bold text-[#34d399] tracking-wide break-all">{preview || "(Masukkan pola)"}</p>
+                          </div>
+                          <span className="text-[11px] text-[#94a3b8] bg-[#1e293b] px-3 py-1 rounded-full border border-[#334155] self-start sm:self-center shrink-0">Contoh Hasil Dokumen</span>
+                        </div>
+                      </div>
+
+                      {/* Footer aksi */}
+                      <div className="p-4 bg-slate-950/60 border-t border-slate-800 flex items-center justify-between gap-3">
+                        <span className="text-xs text-slate-500 hidden sm:inline">Perubahan akan langsung berlaku untuk dokumen baru.</span>
+                        <button
+                          type="button"
+                          onClick={isDcs ? handleSaveDcsNumberingRule : handleSaveSettings}
+                          disabled={saveDisabled}
+                          className="w-full sm:w-auto px-6 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm rounded-xl transition-all shadow-md shadow-indigo-500/20 flex items-center justify-center gap-2 cursor-pointer"
+                        >
+                          <Save className="w-4 h-4" /> Simpan Format
+                        </button>
+                      </div>
                     </div>
+
+                    {/* Pop-up penjelasan token — dibuka saat tag diklik. Hanya
+                        tampilan baru; penyisipan ke pola tetap lewat
+                        insertToken yang sama seperti sebelumnya, dan link
+                        "ke tempat lain" tetap lewat goTo/canGo yang sama. */}
+                    {tokenInfoModal && (
+                      <div
+                        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fadeIn"
+                        onClick={() => setTokenInfoModal(null)}
+                        role="dialog"
+                        aria-modal="true"
+                      >
+                        <div
+                          className="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl shadow-xl overflow-hidden"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="p-4 border-b border-slate-800 flex items-start gap-3">
+                            <div className="p-2 bg-indigo-500/10 text-indigo-400 rounded-lg shrink-0">
+                              <Hash className="w-4 h-4" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <h5 className="text-sm font-bold text-slate-100">{tokenInfoModal.l}</h5>
+                              <code className="text-[11px] font-mono text-indigo-400">{tokenInfoModal.t}</code>
+                            </div>
+                            <button type="button" onClick={() => setTokenInfoModal(null)} className="text-slate-500 hover:text-slate-300 cursor-pointer" aria-label="Tutup">
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+                          <div className="p-4 space-y-3">
+                            <p className="text-xs text-slate-400 leading-relaxed">{tokenInfoModal.d}</p>
+                            {tokenInfoModal.go && (
+                              canGo(tokenInfoModal.go) ? (
+                                <button
+                                  type="button"
+                                  onClick={() => { goTo(tokenInfoModal.go!); setTokenInfoModal(null); }}
+                                  className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-soft-blue/10 text-[#3a7fa8] text-xs font-semibold hover:bg-soft-blue/20 transition cursor-pointer"
+                                >
+                                  {tokenInfoModal.go.label} <ArrowRight className="w-3.5 h-3.5" />
+                                </button>
+                              ) : (
+                                <p className="text-[11px] italic text-slate-500">(diatur oleh Super Admin di Kelola Perusahaan)</p>
+                              )
+                            )}
+                          </div>
+                          <div className="p-4 border-t border-slate-800 flex justify-end gap-2">
+                            <button type="button" onClick={() => setTokenInfoModal(null)} className="px-3 py-2 text-xs font-semibold text-slate-400 hover:text-slate-200 rounded-lg cursor-pointer">Batal</button>
+                            <button
+                              type="button"
+                              onClick={() => { insertToken(tokenInfoModal.t); setTokenInfoModal(null); }}
+                              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg transition cursor-pointer flex items-center gap-1.5"
+                            >
+                              <Plus className="w-3.5 h-3.5" /> Tambahkan ke Pola
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                    </>
+                      );
+                    })()}
 
                     {/* ==== Margin Halaman Dokumen — SATU kartu, dua mode ====
                         Beda dari kartu Format Nomor di atas: margin DCS &
@@ -13832,7 +15405,7 @@ export default function App() {
                         lewat tombol "Simpan Margin" di kartu ini — tidak ada
                         perbedaan mekanisme simpan seperti pada kartu Format
                         Nomor di atas. */}
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
+                    <div className="p-4 bg-slate-900 card-soft rounded-[22px] space-y-3 lg:col-span-2">
                       <div className="flex items-center justify-between flex-wrap gap-2">
                         <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
                           <FileText className="w-4 h-4 text-violet-400" /> Margin Halaman Dokumen (mm)
@@ -13893,7 +15466,7 @@ export default function App() {
                       { key: "copyStatuses", label: "Status Rangkap Fisik", icon: <Layers className="w-4 h-4 text-amber-400" /> },
                       { key: "departments", label: "Departemen", icon: <Building2 className="w-4 h-4 text-rose-400" /> },
                     ] as const).map((cfg) => (
-                      <div key={cfg.key} className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3">
+                      <div key={cfg.key} id={cfg.key === "departments" ? "cfg-departments" : undefined} className="p-4 bg-slate-900 card-soft rounded-[22px] space-y-3 transition">
                         <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
                           {cfg.icon} {cfg.label}
                         </h4>
@@ -13975,7 +15548,7 @@ export default function App() {
                     </div>
 
                     {/* Opsi hari reminder */}
-                    <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-3 lg:col-span-2">
+                    <div className="p-4 bg-slate-900 card-soft rounded-[22px] space-y-3 lg:col-span-2">
                       <h4 className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
                         <Bell className="w-4 h-4 text-amber-400" /> Opsi "Ingatkan Sebelum Berakhir" (hari)
                       </h4>
@@ -14149,7 +15722,7 @@ export default function App() {
                             const preview = previewNumberMask(dt.numberMask || masterData.defaultNumberMask, {
                               Prefix: effCode || masterData.defaultNumberPrefix,
                               Category: cat0, DocType: dt.name || "", DocTypeCode: effCode,
-                              Codes: codes, Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1),
+                              Platform: platformCode(tenantPlatforms[0]), Codes: codes, Year: String(new Date().getFullYear()), Month: String(new Date().getMonth() + 1),
                               Day: String(new Date().getDate()),
                             });
                             return (
@@ -14481,7 +16054,7 @@ export default function App() {
                   {!dcsClauseForm ? (
                     <>
                       <div className="flex flex-wrap items-center gap-2">
-                        <button onClick={() => setDcsClauseForm(emptyDcsClauseForm())} className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"><Plus className="w-4 h-4" /> Klausul Baru</button>
+                        <button onClick={() => setDcsClauseForm(emptyDcsClauseForm())} className="px-4 py-2.5 btn-grad-primary text-white rounded-full text-xs font-bold flex items-center gap-1.5 cursor-pointer"><Plus className="w-4 h-4" /> Klausul Baru</button>
                         <button
                           onClick={() => openClauseCopy("dariKontrak")}
                           title="Ambil klausul yang sudah ditulis di Library Klausul kontrak tanpa mengetik ulang."
@@ -14575,13 +16148,14 @@ export default function App() {
                 <div className="space-y-4">
                   <button
                     onClick={() => setVendorForm({ name: "", picName: "", email: "", npwp: "", address: "" })}
-                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold flex items-center gap-1 cursor-pointer"
+                    className="px-4 py-2.5 btn-grad-primary text-white rounded-full text-sm font-semibold flex items-center gap-1 cursor-pointer"
                   >
                     <Plus className="w-4 h-4" /> Tambah Vendor
                   </button>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     {vendors.map((v) => (
-                      <div key={v.id} className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-1">
+                      <div key={v.id} className="p-4 card-grad bg-slate-900 card-soft rounded-[22px] space-y-1 relative overflow-hidden">
+                        <Building2 aria-hidden className="pointer-events-none absolute -right-2 -bottom-3 w-16 h-16 text-peach-strong opacity-25 -rotate-12" strokeWidth={1.2} />
                         <div className="flex items-start justify-between">
                           <p className="font-bold text-slate-200 text-sm">{v.name}</p>
                           <div className="flex gap-1">
@@ -14603,13 +16177,14 @@ export default function App() {
                 <div className="space-y-4">
                   <button
                     onClick={() => setEmployeeForm({ name: "", position: "", department: "", salary: 0, startDate: "" })}
-                    className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold flex items-center gap-1 cursor-pointer"
+                    className="px-4 py-2.5 btn-grad-primary text-white rounded-full text-sm font-semibold flex items-center gap-1 cursor-pointer"
                   >
                     <Plus className="w-4 h-4" /> Tambah Karyawan
                   </button>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     {employees.map((emp) => (
-                      <div key={emp.id} className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-1">
+                      <div key={emp.id} className="p-4 card-grad bg-slate-900 card-soft rounded-[22px] space-y-1 relative overflow-hidden">
+                        <Users aria-hidden className="pointer-events-none absolute -right-2 -bottom-3 w-16 h-16 text-peach-strong opacity-25 -rotate-12" strokeWidth={1.2} />
                         <div className="flex items-start justify-between">
                           <p className="font-bold text-slate-200 text-sm">{emp.name}</p>
                           <div className="flex gap-1">
@@ -14627,7 +16202,7 @@ export default function App() {
 
               {/* APP / COMPANY / E-METERAI CONFIG */}
               {configTab === "app" && (
-                <div className="max-w-2xl space-y-5">
+                <div className="max-w-4xl space-y-5">
                   {/* Watermark PDF kontrak — OPSIONAL (default mati). DCS tetap
                       wajib watermark by sistem, tidak dipengaruhi setelan ini. */}
                   <div className="p-5 bg-slate-950/60 border border-slate-800 rounded-2xl space-y-3">
@@ -14896,8 +16471,8 @@ export default function App() {
                       <h3 className="text-base font-semibold text-slate-100">Hak Akses Menu per Role</h3>
                       <p className="text-[13px] text-slate-500">Centang = role itu BOLEH buka menu tersebut. <b>super_admin</b> selalu penuh, tidak ada di tabel ini. Kosongkan semua centang di satu kolom role = role itu diperlakukan "belum diatur" (akses penuh juga).</p>
                     </div>
-                    <div className="overflow-x-auto">
-                      <table className="text-[12px] border-collapse">
+                    <div className="overflow-x-auto table-card">
+                      <table className="plain-table text-[12px] border-collapse w-full">
                         <thead>
                           <tr>
                             <th className="text-left px-3 py-2 text-slate-400 font-semibold sticky left-0 bg-slate-950">Menu</th>
@@ -14982,7 +16557,7 @@ export default function App() {
                     ) : (
                       <>
                         <div className="overflow-x-auto">
-                          <table className="text-[12px] border-collapse">
+                          <table className="plain-table text-[12px] border-collapse">
                             <thead>
                               <tr>
                                 <th className="text-left px-3 py-2 text-slate-400 font-semibold sticky left-0 bg-slate-950">Folder</th>
@@ -15041,7 +16616,7 @@ export default function App() {
                       <p className="text-[13px] text-slate-500">{allTenants.length} organisasi. Menambah perusahaan sekaligus membuat akun admin pertamanya.</p>
                     </div>
                     <button
-                      onClick={() => setTenantForm({ name: "", branch: "", adminName: "", adminEmail: "", adminPassword: "" })}
+                      onClick={() => { setTenantPlatformInput(""); setTenantForm({ name: "", branch: "", adminName: "", adminEmail: "", adminPassword: "", platforms: [] }); }}
                       className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[13px] font-semibold flex items-center gap-1.5 cursor-pointer shrink-0 transition"
                     >
                       <Plus className="w-4 h-4" /> Tambah perusahaan
@@ -15059,8 +16634,16 @@ export default function App() {
                             <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${t.active ? "bg-emerald-400" : "bg-slate-600"}`} title={t.active ? "Aktif" : "Nonaktif"} />
                           </div>
                           <p className="text-[12px] text-slate-500 truncate">{t.branch || "Tanpa cabang"} · <span className="font-mono text-slate-600">{t.id}</span></p>
+                          {Array.isArray(t.platforms) && t.platforms.length > 0 && (
+                            <div className="flex flex-wrap items-center gap-1 mt-1">
+                              <span className="text-[11px] text-slate-500">Platform:</span>
+                              {t.platforms.map((p: string) => (
+                                <span key={p} className="text-[10px] px-1.5 py-0.5 rounded-md bg-violet-500/10 border border-violet-500/30 text-violet-300">{p}</span>
+                              ))}
+                            </div>
+                          )}
                         </div>
-                        <button onClick={() => setTenantForm({ id: t.id, name: t.name, branch: t.branch, active: t.active })} title="Edit" className="p-1.5 text-slate-400 hover:text-indigo-300 hover:bg-slate-800 rounded-md cursor-pointer shrink-0 opacity-60 group-hover:opacity-100 transition"><Pencil className="w-3.5 h-3.5" /></button>
+                        <button onClick={() => { setTenantPlatformInput(""); setTenantForm({ id: t.id, name: t.name, branch: t.branch, active: t.active, platforms: Array.isArray(t.platforms) ? t.platforms : [] }); }} title="Edit" className="p-1.5 text-slate-400 hover:text-indigo-300 hover:bg-slate-800 rounded-md cursor-pointer shrink-0 opacity-60 group-hover:opacity-100 transition"><Pencil className="w-3.5 h-3.5" /></button>
                       </div>
                     ))}
                     {allTenants.length === 0 && <p className="text-slate-500 text-[13px] py-10 text-center">Belum ada perusahaan.</p>}
@@ -15138,6 +16721,8 @@ export default function App() {
                   </div>
                 </div>
               )}
+              </div>
+              </div>
             </div>
           )}
 
@@ -15145,17 +16730,20 @@ export default function App() {
           {(activeTab === "monitoring" || activeTab === "kontrak-karyawan") && !selectedContract && (
             <div className="space-y-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-xl font-bold flex items-center gap-2">
-                    {activeTab === "kontrak-karyawan"
-                      ? <><Users className="w-5 h-5 text-emerald-400" /> Kontrak Karyawan</>
-                      : <><Bell className="w-5 h-5 text-amber-400" /> Monitoring &amp; Reminder Kontrak</>}
-                  </h2>
-                  <p className="text-sm text-slate-400 mt-1">
-                    {activeTab === "kontrak-karyawan"
-                      ? "Kontrak kerja karyawan (pihak kedua = Karyawan) dipantau terpisah dari kontrak vendor/mitra."
-                      : "Semua kontrak (dibuat di sistem maupun dokumen upload) dipantau masa berlakunya di sini."}
-                  </p>
+                <div className="flex items-center gap-3.5">
+                  <span className="w-11 h-11 rounded-full bg-mist flex items-center justify-center shrink-0">
+                    {activeTab === "kontrak-karyawan" ? <Users className="w-5 h-5 text-indigo-400" /> : <Bell className="w-5 h-5 text-indigo-400" />}
+                  </span>
+                  <div>
+                    <h2 className="text-xl font-bold text-slate-100">
+                      {activeTab === "kontrak-karyawan" ? "Kontrak Karyawan" : "Monitoring & Reminder Kontrak"}
+                    </h2>
+                    <p className="text-sm text-slate-400 mt-0.5">
+                      {activeTab === "kontrak-karyawan"
+                        ? "Kontrak kerja karyawan (pihak kedua = Karyawan) dipantau terpisah dari kontrak vendor/mitra."
+                        : "Semua kontrak (dibuat di sistem maupun dokumen upload) dipantau masa berlakunya di sini."}
+                    </p>
+                  </div>
                 </div>
                 <button
                   onClick={() => {
@@ -15169,7 +16757,7 @@ export default function App() {
                     setCreationStep(1);
                     setIsCreating(true);
                   }}
-                  className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-sm font-semibold transition shadow-lg cursor-pointer shrink-0"
+                  className="flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full text-sm font-semibold transition cursor-pointer shrink-0"
                 >
                   <Plus className="w-4 h-4" />
                   {activeTab === "kontrak-karyawan" ? "Buat Kontrak Karyawan" : "Buat Kontrak Eksternal"}
@@ -15214,6 +16802,24 @@ export default function App() {
                   if (monitorHealth === "warning") return d > 30 && d <= 90;
                   return d > 90; // healthy
                 };
+                const ex = monitorExtra;
+                const has = (v: string | undefined, q: string) => !q.trim() || (v || "").toLowerCase().includes(q.trim().toLowerCase());
+                const extraMatch = (c: Contract) => {
+                  if (!has(c.title, ex.title) || !has(c.contractNumber, ex.number) || !has(c.party2Name, ex.party) || !has(c.party1Name, ex.party1)) return false;
+                  if (ex.docType && (c.docType || "") !== ex.docType) return false;
+                  if (ex.party2Type && c.party2Type !== ex.party2Type) return false;
+                  const sd = (c.startDate || "").slice(0, 10), ed = (c.endDate || "").slice(0, 10);
+                  if (ex.startFrom && (!sd || sd < ex.startFrom)) return false;
+                  if (ex.startTo && (!sd || sd > ex.startTo)) return false;
+                  if (ex.endFrom && (!ed || ed < ex.endFrom)) return false;
+                  if (ex.endTo && (!ed || ed > ex.endTo)) return false;
+                  if (ex.statuses.length && !ex.statuses.includes(c.unifiedStatus || c.status)) return false;
+                  if (ex.docKinds.length && !ex.docKinds.includes(contractDocKind(c))) return false;
+                  const v = Number(c.contractValue) || 0;
+                  if (ex.minVal !== "" && v < Number(ex.minVal)) return false;
+                  if (ex.maxVal !== "" && v > Number(ex.maxVal)) return false;
+                  return true;
+                };
                 const searched = scoped
                   .filter((c) => (monitorScope === "all" ? true : monitorScope === "aktif" ? !isInactive(c) : isInactive(c)))
                   .filter(healthMatch)
@@ -15228,7 +16834,8 @@ export default function App() {
                   .filter((c) => (monitorStatus === "Semua" ? true : (c.unifiedStatus || c.status) === monitorStatus))
                   // Pencarian kini menembus ISI dokumen (pasal + teks OCR), bukan
                   // cuma judul/nomor/pihak — lihat contractSearchIndex.
-                  .filter((c) => matchContract(c, monitorSearch) !== null);
+                  .filter((c) => matchContract(c, monitorSearch) !== null)
+                  .filter(extraMatch);
                 const isiOnlyCount = monitorSearch.trim()
                   ? searched.filter((c) => matchContract(c, monitorSearch) === "isi").length
                   : 0;
@@ -15242,6 +16849,7 @@ export default function App() {
                   sisa: (c) => { const d = daysLeftOf(c); return isInactive(c) || !Number.isFinite(d) ? null : d; },
                   aktif: (c) => (isInactive(c) ? "Tidak Aktif" : "Aktif"),
                   status: (c) => c.status,
+                  dibuat: (c) => c.createdAt || c.startDate || "",
                 });
                 const MONITOR_PAGE_SIZE = 10;
                 const monitorTotalPages = Math.max(1, Math.ceil(filtered.length / MONITOR_PAGE_SIZE));
@@ -15283,147 +16891,182 @@ export default function App() {
                   showToast(`${baris.length} baris diekspor ke CSV (siap dibuka di Excel).`, "success");
                 };
 
+                const appliedDraft: MonitorDraft = {
+                  ...monitorExtra, keyword: monitorSearch, category: monitorCategory, health: monitorHealth, scope: monitorScope,
+                  statuses: Array.from(new Set([...monitorExtra.statuses, ...(monitorStatus !== "Semua" ? [monitorStatus] : [])])),
+                };
+                const activeFilterCount = countMonitorFilters(appliedDraft);
+                const openFilter = () => {
+                  setMonitorDraft(appliedDraft);
+                  setMonitorFilterOpen(true);
+                };
+                const applyFilter = () => {
+                  const d = monitorDraft;
+                  setMonitorSearch(d.keyword); setMonitorCategory(d.category); setMonitorHealth(d.health); setMonitorScope(d.scope);
+                  setMonitorStatus("Semua");
+                  const { keyword: _k, category: _c, health: _h, scope: _s, ...extra } = d;
+                  setMonitorExtra(extra);
+                  setMonitorPage(1);
+                  setMonitorFilterOpen(false);
+                };
+                const resetFilter = () => {
+                  setMonitorDraft({ ...EMPTY_MONITOR_EXTRA, keyword: "", category: "Semua", health: "", scope: "all" });
+                  setMonitorSearch(""); setMonitorCategory("Semua"); setMonitorHealth(""); setMonitorScope("all");
+                  setMonitorStatus("Semua"); setMonitorExtra(EMPTY_MONITOR_EXTRA); setMonitorPage(1);
+                };
+                const statusOptions = Array.from(new Set<string>(contracts.map((c) => c.unifiedStatus || c.status)))
+                  .sort()
+                  .map((st) => ({ value: st, label: CONTRACT_STATUS_LABEL_ID[st] || contractStatusLabel(st as ContractStatus) }));
+                const docTypeOptions = Array.from(new Set<string>(scoped.map((c) => c.docType || "").filter(Boolean))).sort();
+                const party2TypeOptions = Array.from(new Set<string>(scoped.map((c) => c.party2Type || "").filter(Boolean))).sort();
+                const SORT_OPTIONS: { dir: "desc" | "asc"; label: string }[] = [
+                  { dir: "desc", label: "Terbaru" }, { dir: "asc", label: "Terlama" },
+                ];
+                const sortLabel = SORT_OPTIONS.find((o) => o.dir === contractSort.dir)?.label;
+                const pageNumbers: (number | "…")[] = (() => {
+                  if (monitorTotalPages <= 7) return Array.from({ length: monitorTotalPages }, (_, i) => i + 1);
+                  const set = new Set([1, monitorTotalPages, monitorSafePage - 1, monitorSafePage, monitorSafePage + 1]);
+                  const arr = Array.from(set).filter((n) => n >= 1 && n <= monitorTotalPages).sort((a, b) => a - b);
+                  const out: (number | "…")[] = [];
+                  arr.forEach((n, i) => { if (i > 0 && n - arr[i - 1] > 1) out.push("…"); out.push(n); });
+                  return out;
+                })();
+                const topBtn = "h-11 px-5 rounded-full bg-slate-900 text-slate-300 hover:text-slate-100 text-sm font-semibold flex items-center gap-2 cursor-pointer transition card-soft";
+
                 return (
                   <>
-                    {/* Kartu ringkasan = filter cepat. Klik untuk saring tabel ke
-                        bucket itu, klik lagi untuk lepas. Kartu aktif diberi ring. */}
+                    {/* Kartu ringkasan = filter cepat (klik untuk saring tabel, klik lagi untuk lepas). */}
                     <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
                       {([
-                        { key: "expired", count: expired.length, color: "rose", label: "Sudah Lewat Masa Berlaku" },
-                        { key: "critical", count: critical.length, color: "amber", label: "Berakhir ≤ 30 Hari" },
-                        { key: "warning", count: warning.length, color: "indigo", label: "Berakhir 31–90 Hari" },
-                        { key: "healthy", count: healthy.length, color: "emerald", label: "Aman (> 90 Hari)" },
-                      ] as { key: "expired" | "critical" | "warning" | "healthy"; count: number; color: string; label: string }[]).map((card) => {
-                        const active = monitorHealth === card.key;
-                        const colorMap: Record<string, string> = {
-                          rose: "bg-rose-500/10 border-rose-500/30 text-rose-400",
-                          amber: "bg-amber-500/10 border-amber-500/30 text-amber-400",
-                          indigo: "bg-indigo-500/10 border-indigo-500/30 text-indigo-400",
-                          emerald: "bg-emerald-500/10 border-emerald-500/30 text-emerald-400",
-                        };
-                        const ringMap: Record<string, string> = { rose: "ring-rose-400", amber: "ring-amber-400", indigo: "ring-indigo-400", emerald: "ring-emerald-400" };
+                        { key: "expired", count: expired.length, tone: "peach-strong", label: "Sudah Lewat Masa Berlaku", sub: "perlu tindakan segera", orange: true },
+                        { key: "critical", count: critical.length, tone: "peach", label: "Berakhir ≤ 30 Hari", sub: "perpanjang / tinjau", orange: true },
+                        { key: "warning", count: warning.length, tone: "mist-strong", label: "Berakhir 31–90 Hari", sub: "mulai dipantau", orange: false },
+                        { key: "healthy", count: healthy.length, tone: "mist", label: "Aman (> 90 Hari)", sub: "masa berlaku panjang", orange: false },
+                      ] as { key: "expired" | "critical" | "warning" | "healthy"; count: number; tone: string; label: string; sub: string; orange: boolean }[]).map((card) => {
+                        const on = monitorHealth === card.key;
+                        const share = active.length ? Math.round((card.count / active.length) * 100) : 0;
                         return (
                           <button
                             key={card.key}
-                            onClick={() => { setMonitorHealth(active ? "" : card.key); setMonitorPage(1); }}
-                            title={active ? "Klik lagi untuk lepas filter" : "Klik untuk saring tabel ke kontrak ini"}
-                            className={`text-left p-4 rounded-2xl border transition cursor-pointer ${colorMap[card.color]} ${active ? `ring-2 ${ringMap[card.color]}` : "hover:brightness-125"}`}
+                            onClick={() => { setMonitorHealth(on ? "" : card.key); setMonitorPage(1); }}
+                            title={on ? "Klik lagi untuk lepas filter" : "Klik untuk saring tabel ke kontrak ini"}
+                            className={`card-soft text-left p-5 rounded-[28px] bg-slate-900 transition cursor-pointer hover:-translate-y-0.5 ${on ? (card.orange ? "ring-2 ring-peach-strong" : "ring-2 ring-soft-blue") : ""}`}
                           >
-                            <p className="text-2xl font-bold">{card.count}</p>
-                            <p className="text-xs text-slate-400 mt-1 flex items-center gap-1">
-                              {card.label}
-                              {active && <span className="text-[9px] font-bold uppercase opacity-80">· difilter</span>}
-                            </p>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className={`w-10 h-10 rounded-full flex items-center justify-center bg-${card.tone}`}>
+                                {card.key === "expired" ? <XCircle className={`w-5 h-5 ${card.orange ? "text-brand-orange" : "text-indigo-400"}`} />
+                                  : card.key === "critical" ? <Clock className="w-5 h-5 text-brand-orange" />
+                                  : card.key === "warning" ? <Calendar className="w-5 h-5 text-indigo-400" />
+                                  : <CheckCircle2 className="w-5 h-5 text-indigo-400" />}
+                              </span>
+                              {on && <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-slate-950 text-slate-400">difilter</span>}
+                            </div>
+                            <p className="text-3xl font-bold text-slate-100 mt-4 tabular-nums">{card.count}</p>
+                            <p className="text-xs font-semibold text-slate-300 mt-1">{card.label}</p>
+                            <p className="text-[11px] text-slate-500">{card.sub}</p>
+                            <div className="mt-3 h-1.5 rounded-full bg-slate-950 overflow-hidden" title={`${share}% dari kontrak aktif`}>
+                              <div className={`h-full rounded-full ${card.orange ? "bg-brand-orange" : "bg-soft-blue"}`} style={{ width: `${share}%` }} />
+                            </div>
                           </button>
                         );
                       })}
                     </div>
-                    {monitorHealth && (
-                      <button onClick={() => setMonitorHealth("")} className="text-[11px] text-indigo-400 hover:text-indigo-300 font-semibold cursor-pointer flex items-center gap-1">
-                        <XCircle className="w-3.5 h-3.5" /> Lepas filter kartu — tampilkan semua lagi
-                      </button>
-                    )}
-                    {isiOnlyCount > 0 && (
-                      <p className="text-[11px] text-indigo-300/90 flex items-center gap-1.5">
-                        <Search className="w-3.5 h-3.5 shrink-0" />
-                        {isiOnlyCount} dokumen cocok dari <b>isi pasal / teks OCR</b>, bukan dari judul atau nomornya — kata kuncinya dicuplik di bawah judul.
-                      </p>
-                    )}
 
-                    {/* Search & filter — dipindah ke sini (di bawah kartu ringkasan,
-                        di atas tabel) atas permintaan user, terpisah dari baris
-                        judul supaya judul + tombol "Buat Kontrak" tetap ringkas
-                        sejajar di atas. State (monitorSearch/Category/Status/
-                        Scope) & perilakunya SAMA PERSIS, cuma lokasi JSX-nya
-                        pindah — tidak ada logic yang berubah. */}
-                    <div className="flex flex-wrap gap-3">
-                      <div className="relative w-full sm:w-72">
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                    {/* Baris aksi: hanya tiga tombol — Search, Filter, Urutkan. */}
+                    <div className="flex flex-wrap items-center gap-3">
+                      <div className="relative min-w-[240px] flex-1 max-w-sm">
+                        <Search className="w-4 h-4 text-indigo-400 pointer-events-none" style={{ position: "absolute", left: 18, top: "50%", transform: "translateY(-50%)", zIndex: 1 }} />
                         <input
+                          style={{ paddingLeft: 46, paddingRight: 40 }}
                           type="text"
-                          placeholder="Cari judul, nomor, pihak, atau ISI pasal…"
-                          title="Pencarian juga menembus isi pasal dan teks hasil OCR dokumen unggahan."
                           value={monitorSearch}
                           onChange={(e) => { setMonitorSearch(e.target.value); setMonitorPage(1); }}
-                          className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
+                          placeholder="Cari judul, nomor, pihak, atau isi pasal…"
+                          title="Pencarian juga menembus isi pasal dan teks hasil OCR dokumen unggahan."
+                          className="w-full h-11 rounded-full bg-slate-900 card-soft text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-soft-blue/40"
                         />
+                        {monitorSearch && (
+                          <button onClick={() => { setMonitorSearch(""); setMonitorPage(1); }} aria-label="Hapus pencarian" className="absolute right-3 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full text-slate-500 hover:text-slate-200 cursor-pointer">×</button>
+                        )}
                       </div>
-                      <select
-                        value={monitorCategory}
-                        onChange={(e) => { setMonitorCategory(e.target.value); setMonitorPage(1); }}
-                        className="px-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
-                      >
-                        <option value="Semua">Semua Kategori</option>
-                        {clauseCategories.map((cat) => (
-                          <option key={cat} value={cat}>{cat}</option>
-                        ))}
-                      </select>
-                      <select
-                        value={monitorStatus}
-                        onChange={(e) => { setMonitorStatus(e.target.value); setMonitorPage(1); }}
-                        className="px-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
-                      >
-                        <option value="Semua">Semua Status</option>
-                        {/* Opsi filter dibangun dari unifiedStatus (fallback ke
-                            c.status kalau unifiedStatus belum terisi) — value
-                            & labelnya (CONTRACT_STATUS_LABEL_ID) SAMA PERSIS
-                            dengan yang dipakai badge kolom "Status" di tabel &
-                            di Pekerjaan Legal, supaya memilih sebuah opsi di
-                            sini dijamin cocok dengan badge yang muncul. */}
-                        {Array.from(new Set<string>(contracts.map((c) => c.unifiedStatus || c.status)))
-                          .sort()
-                          .map((st) => (
-                            <option key={st} value={st}>{CONTRACT_STATUS_LABEL_ID[st] || contractStatusLabel(st as ContractStatus)}</option>
-                          ))}
-                      </select>
-                      <select
-                        value={monitorScope}
-                        onChange={(e) => { setMonitorScope(e.target.value as "all" | "aktif" | "nonaktif"); setMonitorPage(1); }}
-                        title="Tampilkan kontrak Aktif, Tidak Aktif (diakhiri/diarsipkan), atau keduanya."
-                        className="px-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-300 focus:outline-none focus:border-indigo-500"
-                      >
-                        <option value="all">Aktif &amp; Tidak Aktif</option>
-                        <option value="aktif">Hanya Aktif</option>
-                        <option value="nonaktif">Hanya Tidak Aktif</option>
-                      </select>
-                    </div>
-
-                    <div className="flex items-center justify-between gap-3 flex-wrap">
-                      <p className="text-[11px] text-slate-500">
-                        Menampilkan <b className="text-slate-300 tabular-nums">{filtered.length}</b> dari {scoped.length} dokumen.
-                      </p>
+                      <button onClick={() => openFilter()} className={topBtn}>
+                        <SlidersHorizontal className="w-4 h-4 text-indigo-400" /> Filter
+                        {activeFilterCount > 0 && <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-peach text-brand-orange text-[10px] font-bold flex items-center justify-center tabular-nums">{activeFilterCount}</span>}
+                      </button>
+                      <div className="relative">
+                        <button onClick={() => setMonitorSortOpen((o) => !o)} className={topBtn}>
+                          <ArrowUpDown className="w-4 h-4 text-indigo-400" /> Urutkan
+                          {sortLabel && <span className="text-[11px] text-slate-500 font-medium hidden sm:inline">· {sortLabel}</span>}
+                        </button>
+                        {monitorSortOpen && (
+                          <>
+                            <div className="fixed inset-0 z-30" onClick={() => setMonitorSortOpen(false)} />
+                            <div className="absolute left-0 top-full mt-2 z-40 w-44 bg-slate-900 rounded-[20px] p-2" style={{ boxShadow: "var(--shadow-soft)" }}>
+                              {SORT_OPTIONS.map((o) => {
+                                const on = contractSort.dir === o.dir;
+                                return (
+                                  <button
+                                    key={o.dir}
+                                    onClick={() => { setContractSort({ key: "dibuat", dir: o.dir }); setMonitorPage(1); setMonitorSortOpen(false); }}
+                                    className={`w-full flex items-center justify-between px-3 py-2 rounded-full text-xs font-semibold cursor-pointer transition ${on ? "bg-mist text-indigo-400" : "text-slate-300 hover:bg-slate-950"}`}
+                                  >
+                                    {o.label}
+                                    {on && <span className="text-[10px]">✓</span>}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                      {activeFilterCount > 0 && (
+                        <button onClick={resetFilter} className="text-xs font-semibold text-brand-orange hover:underline cursor-pointer flex items-center gap-1">
+                          <XCircle className="w-3.5 h-3.5" /> Reset filter
+                        </button>
+                      )}
                       <button
                         onClick={exportRegister}
                         disabled={filtered.length === 0}
                         title="Mengunduh persis daftar yang sedang tampil (sudah tersaring & terurut) sebagai CSV — langsung bisa dibuka di Excel."
-                        className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 border border-slate-800 hover:border-emerald-500/50 text-slate-300 hover:text-emerald-300 rounded-lg text-[11px] font-semibold transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                        className="ml-auto h-11 px-5 rounded-full bg-slate-900 card-soft text-slate-300 hover:text-slate-100 text-xs font-semibold flex items-center gap-2 cursor-pointer transition disabled:opacity-40 disabled:cursor-not-allowed"
                       >
-                        <Download className="w-3.5 h-3.5" /> Ekspor {filtered.length} baris ke Excel (CSV)
+                        <Download className="w-4 h-4 text-indigo-400" /> Ekspor CSV
                       </button>
                     </div>
+                    {isiOnlyCount > 0 && (
+                      <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                        <Search className="w-3.5 h-3.5 shrink-0 text-indigo-400" />
+                        {isiOnlyCount} dokumen cocok dari <b>isi pasal / teks OCR</b>, bukan dari judul atau nomornya — kata kuncinya dicuplik di bawah judul.
+                      </p>
+                    )}
 
-                    <div className="bg-slate-950/60 rounded-2xl border border-slate-800 overflow-hidden">
+                    <div className="table-card">
+                      <div className="flex items-center justify-between gap-3 flex-wrap px-2 pt-2 pb-3">
+                        <p className="text-sm font-bold text-slate-100">
+                          Daftar Kontrak <span className="text-xs font-medium text-slate-500 ml-1">{filtered.length} dari {scoped.length} dokumen</span>
+                        </p>
+                      </div>
                       <div className="overflow-x-auto">
                         <table className="w-full text-left text-xs">
-                          <thead className="bg-slate-900/80 text-slate-400 uppercase text-[10px] tracking-wider">
+                          <thead>
                             <tr>
-                              {(() => { const onSort = (k: string) => setContractSort((s) => nextSort(s, k)); return (
+                              {(() => { const onSort = (k: string) => setContractSort((s2) => nextSort(s2, k)); return (
                                 <>
-                                  <SortableTh label="Kontrak" colKey="kontrak" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Kategori" colKey="kategori" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Pihak Kedua" colKey="pihak" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Mulai" colKey="mulai" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Berakhir" colKey="akhir" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Sisa Waktu" colKey="sisa" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Aktif?" colKey="aktif" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <SortableTh label="Status" colKey="status" sort={contractSort} onSort={onSort} className="px-4 py-3" />
-                                  <th className="px-4 py-3">Dokumen</th>
-                                  <th className="px-4 py-3 text-right">Aksi</th>
+                                  <SortableTh label="Kontrak" colKey="kontrak" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Kategori" colKey="kategori" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Pihak Kedua" colKey="pihak" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Mulai" colKey="mulai" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Berakhir" colKey="akhir" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Sisa Waktu" colKey="sisa" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Aktif?" colKey="aktif" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <SortableTh label="Status" colKey="status" sort={contractSort} onSort={onSort} className="px-2 py-3" />
+                                  <th className="px-2 py-3">Dokumen</th>
+                                  <th className="px-2 py-3 text-right">Aksi</th>
                                 </>
                               ); })()}
                             </tr>
                           </thead>
-                          <tbody className="divide-y divide-slate-850">
+                          <tbody>
                             {pageRows.length === 0 && (
                               <tr>
                                 <td colSpan={10} className="px-4 py-10 text-center text-slate-500 italic">
@@ -15437,69 +17080,78 @@ export default function App() {
                               // Guard tanggal berakhir kosong/tidak valid (mis. kontrak
                               // open-ended tanpa tanggal) — dulu tampil "NaN hari lagi".
                               const badge = inactive
-                                ? { text: "—", cls: "bg-slate-700/30 text-slate-500" }
+                                ? { text: "—", cls: "bg-slate-950 text-slate-500" }
                                 : !Number.isFinite(d)
-                                  ? { text: "Tanpa tanggal", cls: "bg-slate-700/30 text-slate-500" }
+                                  ? { text: "Tanpa tanggal", cls: "bg-slate-950 text-slate-500" }
                                   : d < 0
-                                    ? { text: `Lewat ${Math.abs(d)} hari`, cls: "bg-rose-500/20 text-rose-400" }
+                                    ? { text: `Lewat ${Math.abs(d)} hari`, cls: "bg-peach-strong/50 text-brand-orange" }
                                     : d <= 30
-                                      ? { text: `${d} hari lagi`, cls: "bg-amber-500/20 text-amber-400" }
+                                      ? { text: `${d} hari lagi`, cls: "bg-peach text-brand-orange" }
                                       : d <= 90
-                                        ? { text: `${d} hari lagi`, cls: "bg-indigo-500/20 text-indigo-400" }
-                                        : { text: `${d} hari lagi`, cls: "bg-emerald-500/20 text-emerald-400" };
+                                        ? { text: `${d} hari lagi`, cls: "bg-mist text-indigo-400" }
+                                        : { text: `${d} hari lagi`, cls: "bg-slate-950 text-indigo-400" };
                               return (
-                                <tr key={c.id} onClick={() => handleOpenWorkspace(c)} title="Klik baris untuk buka & tinjau kontrak" className={`hover:bg-slate-900/40 transition cursor-pointer ${inactive ? "opacity-60" : ""}`}>
-                                  <td className="px-4 py-3">
-                                    <p className="font-bold text-slate-200">{c.title}</p>
+                                <tr key={c.id} onClick={() => handleOpenWorkspace(c)} title="Klik baris untuk buka & tinjau kontrak" className={`cursor-pointer ${inactive ? "opacity-60" : ""}`}>
+                                  <td className="px-2 py-3">
+                                    <p className="font-bold text-slate-200 min-w-[120px]">{c.title}</p>
                                     <p className="font-mono text-[10px] text-slate-500">{c.contractNumber}</p>
                                     {/* Cocok karena ISI dokumen, bukan judul/nomor — tanpa
                                         cuplikan ini barisnya terlihat muncul tanpa sebab. */}
                                     {matchContract(c, monitorSearch) === "isi" && (
-                                      <p className="mt-1 text-[10px] text-indigo-300/90 leading-snug max-w-[420px]">
+                                      <p className="mt-1 text-[10px] text-indigo-400 leading-snug max-w-[300px]">
                                         <span className="font-semibold">cocok di isi dokumen:</span>{" "}
                                         <span className="text-slate-400">{contentSnippet(c, monitorSearch)}</span>
                                       </p>
                                     )}
                                   </td>
-                                  <td className="px-4 py-3 text-slate-300">{c.category}</td>
-                                  <td className="px-4 py-3 text-slate-300">{c.party2Name}</td>
-                                  <td className="px-4 py-3 text-slate-400 whitespace-nowrap">{c.startDate}</td>
-                                  <td className="px-4 py-3 text-slate-400 whitespace-nowrap">{c.endDate}</td>
-                                  <td className="px-4 py-3">
-                                    <span className={`px-2 py-1 rounded-full font-bold text-[10px] ${badge.cls}`}>
+                                  <td className="px-2 py-3 text-slate-300">{c.category}</td>
+                                  <td className="px-2 py-3 text-slate-300 min-w-[110px]">{c.party2Name}</td>
+                                  <td className="px-2 py-3 text-slate-400 whitespace-nowrap">{c.startDate}</td>
+                                  <td className="px-2 py-3 text-slate-400 whitespace-nowrap">{c.endDate}</td>
+                                  <td className="px-2 py-3">
+                                    <span className={`px-2 py-1 rounded-full font-semibold text-[10.5px] whitespace-nowrap ${badge.cls}`}>
                                       {badge.text}
                                     </span>
                                   </td>
-                                  <td className="px-4 py-3">
-                                    <span className={`px-2 py-1 rounded-full font-bold text-[10px] ${inactive ? "bg-slate-600/20 text-slate-400" : "bg-emerald-500/20 text-emerald-400"}`}>
+                                  <td className="px-2 py-3">
+                                    <span className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full font-semibold text-[10.5px] ${inactive ? "bg-slate-950 text-slate-500" : "bg-mist text-indigo-400"}`}>
+                                      <span className="w-1.5 h-1.5 rounded-full bg-current" />
                                       {inactive ? "Tidak Aktif" : "Aktif"}
                                     </span>
                                   </td>
-                                  <td className="px-4 py-3">
-                                    <span className={`text-[10px] px-2 py-0.5 rounded-full border font-bold uppercase whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[c.unifiedStatus || c.status] || ""}`}>
+                                  <td className="px-2 py-3">
+                                    <span className={`inline-flex items-center gap-1.5 text-[10.5px] px-2 py-1 rounded-full border font-semibold whitespace-nowrap ${CONTRACT_STATUS_BADGE_CLASS[c.unifiedStatus || c.status] || "bg-slate-950 text-slate-400 border-transparent"}`}>
+                                      <span className="w-1.5 h-1.5 rounded-full bg-current" />
                                       {CONTRACT_STATUS_LABEL_ID[c.unifiedStatus || c.status] || c.unifiedStatus || contractStatusLabel(c.status)}
                                     </span>
                                   </td>
-                                  <td className="px-4 py-3">
-                                    {c.masterPdfUrl ? (
-                                      <a
-                                        href={`/api/contracts/${c.id}/view-pdf`}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        onClick={(e) => e.stopPropagation()}
-                                        className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
-                                      >
-                                        <FileText className="w-3.5 h-3.5" /> PDF
-                                      </a>
-                                    ) : (
-                                      <span className="text-slate-600">Digital</span>
-                                    )}
+                                  <td className="px-2 py-3">
+                                    {(() => {
+                                      const kind = contractDocKind(c);
+                                      if (kind === "PDF" && c.masterPdfUrl) return (
+                                        <a
+                                          href={`/api/contracts/${c.id}/view-pdf`}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          onClick={(e) => e.stopPropagation()}
+                                          className="text-indigo-400 hover:text-indigo-300 flex items-center gap-1 font-semibold"
+                                        >
+                                          <FileText className="w-3.5 h-3.5" /> PDF
+                                        </a>
+                                      );
+                                      if (kind === "Digital") return <span className="text-slate-500">Digital</span>;
+                                      return (
+                                        <span className={`inline-flex items-center gap-1 font-semibold ${kind === "Word" ? "text-brand-orange" : "text-indigo-400"}`}>
+                                          <FileText className="w-3.5 h-3.5" /> {kind}
+                                        </span>
+                                      );
+                                    })()}
                                   </td>
-                                  <td className="px-4 py-3">
-                                    <div className="flex items-center justify-end gap-2">
+                                  <td className="px-2 py-3">
+                                    <div className="flex items-center justify-end gap-1.5">
                                       <button
                                         onClick={(e) => { e.stopPropagation(); handleOpenWorkspace(c); }}
-                                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-200 font-semibold transition"
+                                        className="px-2.5 py-1.5 bg-slate-950 hover:bg-mist hover:text-indigo-400 rounded-full text-slate-200 font-semibold transition cursor-pointer"
                                       >
                                         Tinjau
                                       </button>
@@ -15507,14 +17159,14 @@ export default function App() {
                                         <button
                                           onClick={(e) => { e.stopPropagation(); handleOpenRenewModal(c); }}
                                           title="Muncul setelah matriks approval selesai penuh"
-                                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-white font-bold transition flex items-center gap-1"
+                                          className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-full text-white font-bold transition flex items-center gap-1 cursor-pointer"
                                         >
                                           <RefreshCw className="w-3 h-3" /> Perpanjang
                                         </button>
                                       )}
                                       <button
                                         onClick={(e) => { e.stopPropagation(); handleDeleteContract(c.id); }}
-                                        className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 rounded-lg transition"
+                                        className="w-8 h-8 flex items-center justify-center text-slate-500 hover:text-brand-orange hover:bg-peach rounded-full transition cursor-pointer"
                                         title="Hapus Kontrak"
                                       >
                                         <Trash2 className="w-3.5 h-3.5" />
@@ -15528,7 +17180,7 @@ export default function App() {
                         </table>
                       </div>
                       {filtered.length > MONITOR_PAGE_SIZE && (
-                        <div className="flex items-center justify-between gap-3 flex-wrap px-4 py-3 border-t border-slate-800 text-[11px] text-slate-400">
+                        <div className="flex items-center justify-between gap-3 flex-wrap px-2 pt-4 pb-2 text-[11px] text-slate-400">
                           <span>
                             Menampilkan {(monitorSafePage - 1) * MONITOR_PAGE_SIZE + 1}–{Math.min(monitorSafePage * MONITOR_PAGE_SIZE, filtered.length)} dari {filtered.length} kontrak
                           </span>
@@ -15536,24 +17188,48 @@ export default function App() {
                             <button
                               onClick={() => setMonitorPage((p) => Math.max(1, p - 1))}
                               disabled={monitorSafePage <= 1}
-                              className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                              aria-label="Halaman sebelumnya"
+                              className="w-8 h-8 rounded-full bg-slate-950 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                             >
-                              Sebelumnya
+                              ‹
                             </button>
-                            <span className="px-2 font-semibold text-slate-300">
-                              {monitorSafePage} / {monitorTotalPages}
-                            </span>
+                            {pageNumbers.map((n, i) => n === "…" ? (
+                              <span key={`e${i}`} className="w-6 text-center text-slate-500">…</span>
+                            ) : (
+                              <button
+                                key={n}
+                                onClick={() => setMonitorPage(n)}
+                                className={`w-8 h-8 rounded-full text-[11px] font-semibold cursor-pointer tabular-nums ${n === monitorSafePage ? "bg-indigo-600 text-white" : "bg-slate-950 text-slate-300 hover:text-slate-100"}`}
+                              >
+                                {n}
+                              </button>
+                            ))}
                             <button
                               onClick={() => setMonitorPage((p) => Math.min(monitorTotalPages, p + 1))}
                               disabled={monitorSafePage >= monitorTotalPages}
-                              className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                              aria-label="Halaman berikutnya"
+                              className="w-8 h-8 rounded-full bg-slate-950 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                             >
-                              Berikutnya
+                              ›
                             </button>
                           </div>
                         </div>
                       )}
                     </div>
+
+                    {monitorFilterOpen && (
+                      <MonitorFilterDrawer
+                        draft={monitorDraft}
+                        setDraft={setMonitorDraft}
+                        onApply={applyFilter}
+                        onReset={resetFilter}
+                        onClose={() => setMonitorFilterOpen(false)}
+                        categories={clauseCategories}
+                        statusOptions={statusOptions}
+                        docTypes={docTypeOptions}
+                        party2Types={party2TypeOptions}
+                      />
+                    )}
                   </>
                 );
               })()}
@@ -16404,8 +18080,8 @@ export default function App() {
             <div className="space-y-6">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-xl font-bold flex items-center gap-2">
-                    <CheckSquare className="w-5 h-5 text-indigo-400" />
+                  <h2 className="text-xl font-bold text-slate-100 flex items-center gap-3">
+                    <span className="w-11 h-11 rounded-full bg-mist flex items-center justify-center shrink-0"><CheckSquare className="w-5 h-5 text-indigo-400" /></span>
                     Daftar Semua Dokumen
                   </h2>
                   <p className="text-sm text-slate-400 mt-1">
@@ -16415,7 +18091,7 @@ export default function App() {
                 <button
                   onClick={() => handleOpenActivateModal()}
                   title="Unggah bukti TTD untuk kontrak yang sudah FullyApproved — statusnya otomatis jadi Aktif"
-                  className="px-3 py-2 bg-emerald-600/20 hover:bg-emerald-600/40 border border-emerald-600/30 text-emerald-400 rounded-xl text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition shrink-0"
+                  className="btn-grad-primary px-5 h-11 text-white rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition shrink-0"
                 >
                   <Upload className="w-3.5 h-3.5" /> Unggah &amp; Aktifkan
                 </button>
@@ -16435,25 +18111,25 @@ export default function App() {
                   bg-{warna}-600/20 yg pucat di tema terang ini. */}
               <div className="flex flex-wrap items-center gap-2">
                 <div className="relative w-full sm:w-72">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                  <Search className="w-4 h-4 text-indigo-400 pointer-events-none" style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", zIndex: 1 }} />
                   <input
                     type="text" value={allDocsSearch} onChange={(e) => { setAllDocsSearch(e.target.value); setAllDocsPage(1); }}
                     placeholder="Cari nomor, judul, atau ISI pasal…"
                     title="Untuk kontrak, pencarian juga menembus isi pasal dan teks hasil OCR. Dokumen DCS masih dicari per judul/nomor."
-                    className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
+                    style={{ paddingLeft: 44 }} className="w-full h-11 pr-4 rounded-full bg-slate-950 text-sm text-slate-100 placeholder:text-slate-500 border border-transparent focus:outline-none focus:border-soft-blue transition"
                   />
                 </div>
                 <button
                   onClick={() => { setBulkImportOpen(true); setBulkImportPhase("pilih"); setBulkImportRows([]); setBulkImportInfo(""); }}
                   title="Migrasi kontrak lama: unggah banyak PDF/scan sekaligus (dibaca OCR), atau impor register dari CSV."
-                  className="px-3 py-2 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/30 text-violet-400 rounded-xl text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition"
+                  className="btn-grad-soft px-5 h-11 text-slate-100 rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition"
                 >
                   <Upload className="w-3.5 h-3.5" /> Impor Massal
                 </button>
                 <select
                   value={allDocsStatusFilter}
                   onChange={(e) => { setAllDocsStatusFilter(e.target.value as "all" | "aktif" | "nonaktif"); setSelectedContractIds([]); setAllDocsPage(1); }}
-                  className="px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  className="h-11 px-4 bg-slate-900 card-soft rounded-full text-xs text-slate-200 focus:outline-none cursor-pointer"
                 >
                   <option value="all">Semua Status ({totalCount})</option>
                   <option value="aktif">Aktif ({aktifCount})</option>
@@ -16463,39 +18139,39 @@ export default function App() {
                   onClick={exportAllDocs}
                   disabled={visibleContracts.length + visibleDcsDocs.length === 0}
                   title="Mengunduh daftar gabungan yang sedang tampil (kontrak + DCS) sebagai CSV — langsung bisa dibuka di Excel."
-                  className="px-3 py-2 bg-slate-900 border border-slate-800 hover:border-emerald-500/50 text-slate-300 hover:text-emerald-400 rounded-xl text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed"
+                  className="h-11 px-5 bg-slate-900 card-soft text-slate-300 hover:text-slate-100 rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download className="w-3.5 h-3.5" /> Ekspor CSV
                 </button>
                 {selectedContractIds.length > 0 && (
-                  <div className="flex flex-wrap items-center gap-2 bg-indigo-500/10 p-2 rounded-xl border border-indigo-500/20">
+                  <div className="flex flex-wrap items-center gap-2 bg-mist p-1.5 rounded-full">
                     <span className="text-xs font-bold text-indigo-400 px-2">{selectedContractIds.length} Terpilih</span>
-                    <button onClick={() => setIsBulkMoveModalOpen(true)} className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition shadow-lg">
+                    <button onClick={() => setIsBulkMoveModalOpen(true)} className="btn-grad-primary px-4 py-2 text-white rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
                       <FolderOpen className="w-3.5 h-3.5" /> Pindahkan ke Arsip
                     </button>
-                    <button onClick={handleBulkDownload} disabled={isBulkDownloading} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-100 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition border border-slate-700">
+                    <button onClick={handleBulkDownload} disabled={isBulkDownloading} className="px-4 py-2 bg-slate-900 hover:bg-slate-950 disabled:opacity-50 text-slate-100 rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition border border-slate-700">
                       {isBulkDownloading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} Download PDF (Zip)
                     </button>
-                    <button onClick={() => { setBulkReminderMsg(""); setBulkReminderOpen(true); }} className="px-3 py-1.5 bg-amber-600/20 hover:bg-amber-600/30 border border-amber-500/30 text-amber-400 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
+                    <button onClick={() => { setBulkReminderMsg(""); setBulkReminderOpen(true); }} className="px-4 py-2 bg-peach hover:brightness-95 text-brand-orange rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
                       <Bell className="w-3.5 h-3.5" /> Kirim Pengingat
                     </button>
-                    <button onClick={handleBulkDelete} className="px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600/40 border border-rose-600/30 text-rose-400 rounded-lg text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
+                    <button onClick={handleBulkDelete} className="px-4 py-2 bg-peach hover:brightness-95 text-brand-orange rounded-full text-xs font-semibold cursor-pointer flex items-center gap-1.5 transition">
                       <Trash2 className="w-3.5 h-3.5" /> Hapus
                     </button>
                   </div>
                 )}
               </div>
 
-              <div className="bg-slate-950/60 border border-slate-800 rounded-2xl overflow-hidden">
+              <div className="table-card">
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse">
                     <thead>
-                      <tr className="border-b border-slate-800 bg-slate-900/50">
+                      <tr>
                         <th className="p-4 w-12 text-center">
                           <input
                             type="checkbox"
                             title="Pilih semua kontrak (dokumen DCS tidak ikut aksi massal ini)"
-                            className="w-4 h-4 rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-indigo-500/50 cursor-pointer"
+                            ref={(el) => { if (el) el.indeterminate = selectedContractIds.length > 0 && selectedContractIds.length < visibleContracts.length; }}
                             checked={visibleContracts.length > 0 && selectedContractIds.length === visibleContracts.length}
                             onChange={(e) => {
                               if (e.target.checked) {
@@ -16517,11 +18193,10 @@ export default function App() {
                       {pageContracts.map(c => {
                         const pendingStep = c.status === "OnReview" ? c.approvalSteps?.find((s) => s.decision === "pending") : undefined;
                         return (
-                        <tr key={c.id} className={`hover:bg-slate-800/20 transition ${selectedContractIds.includes(c.id) ? "bg-indigo-500/5" : ""}`}>
+                        <tr key={c.id} className={`hover:bg-slate-800/20 transition ${selectedContractIds.includes(c.id) ? "bg-mist/40" : ""}`}>
                           <td className="p-4 text-center">
                             <input
                               type="checkbox"
-                              className="w-4 h-4 rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-indigo-500/50 cursor-pointer"
                               checked={selectedContractIds.includes(c.id)}
                               onChange={(e) => {
                                 if (e.target.checked) setSelectedContractIds([...selectedContractIds, c.id]);
@@ -16530,7 +18205,7 @@ export default function App() {
                             />
                           </td>
                           <td className="p-4">
-                            <span className="text-[9px] bg-indigo-500/15 text-indigo-300 px-2 py-0.5 rounded-full font-bold uppercase">Kontrak</span>
+                            <span className="text-[10px] bg-mist text-indigo-400 px-2.5 py-1 rounded-full font-bold uppercase">Kontrak</span>
                           </td>
                           <td className="p-4">
                             <p className="font-bold text-slate-200 text-sm">{c.title}</p>
@@ -16556,27 +18231,27 @@ export default function App() {
                           </td>
                           <td className="p-4">
                             <div className="flex items-center gap-1.5 flex-wrap">
-                              <button onClick={() => handleOpenWorkspace(c)} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300 text-[11px] font-semibold transition cursor-pointer">
+                              <button onClick={() => handleOpenWorkspace(c)} className="px-4 py-1.5 bg-slate-950 hover:bg-mist hover:text-indigo-400 rounded-full text-slate-300 text-[11px] font-semibold transition cursor-pointer">
                                 Buka
                               </button>
                               <button
                                 onClick={() => { setSelectedContractIds([c.id]); setIsBulkMoveModalOpen(true); }}
                                 title="Pindahkan dokumen ini ke folder/sub folder arsip lain"
-                                className="p-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-indigo-300 transition cursor-pointer"
+                                className="w-8 h-8 flex items-center justify-center bg-slate-950 hover:bg-mist rounded-full text-indigo-400 transition cursor-pointer"
                               >
                                 <FolderOpen className="w-3.5 h-3.5" />
                               </button>
                               <button
                                 onClick={() => handleDownloadSingleContract(c)}
                                 title="Unduh PDF dokumen ini"
-                                className="p-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-emerald-300 transition cursor-pointer"
+                                className="w-8 h-8 flex items-center justify-center bg-slate-950 hover:bg-mist rounded-full text-indigo-400 transition cursor-pointer"
                               >
                                 <Download className="w-3.5 h-3.5" />
                               </button>
                               <button
                                 onClick={() => handleDeleteContract(c.id)}
                                 title="Hapus dokumen ini"
-                                className="p-1.5 bg-slate-800 hover:bg-rose-600/20 rounded-lg text-rose-400 transition cursor-pointer"
+                                className="w-8 h-8 flex items-center justify-center bg-slate-950 hover:bg-peach rounded-full text-brand-orange transition cursor-pointer"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
@@ -16592,14 +18267,14 @@ export default function App() {
                         <tr key={d.id} className="hover:bg-slate-800/20 transition">
                           <td className="p-4 text-center text-slate-700">—</td>
                           <td className="p-4">
-                            <span className="text-[9px] bg-violet-500/15 text-violet-300 px-2 py-0.5 rounded-full font-bold uppercase">DCS · {d.docTypeCode}</span>
+                            <span className="text-[10px] bg-peach text-brand-orange px-2.5 py-1 rounded-full font-bold uppercase">DCS · {d.docTypeCode}</span>
                           </td>
                           <td className="p-4">
                             <p className="font-bold text-slate-200 text-sm">{d.title}</p>
                             <p className="font-mono text-xs text-slate-500 mt-1">{d.documentNumber}</p>
                           </td>
                           <td className="p-4">
-                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${controlled ? "bg-emerald-500/15 text-emerald-400" : "bg-rose-500/15 text-rose-400"}`}>
+                            <span className={`text-[10px] px-2.5 py-1 rounded-full font-bold uppercase ${controlled ? "bg-mist text-indigo-400" : "bg-peach text-brand-orange"}`}>
                               {latest?.status || "—"}
                             </span>
                             {latest?.status === "effective" && !controlled && (
@@ -16612,7 +18287,7 @@ export default function App() {
                           <td className="p-4">
                             <button
                               onClick={() => { setActiveTab("internal-docs"); setDcsSelectedId(d.id); setDcsSelectedVersionId(latest?.id || null); }}
-                              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-300 text-[11px] font-semibold transition cursor-pointer"
+                              className="px-4 py-1.5 bg-slate-950 hover:bg-mist hover:text-indigo-400 rounded-full text-slate-300 text-[11px] font-semibold transition cursor-pointer"
                             >
                               Buka
                             </button>
@@ -16637,7 +18312,7 @@ export default function App() {
                       <button
                         onClick={() => setAllDocsPage((p) => Math.max(1, p - 1))}
                         disabled={allDocsSafePage <= 1}
-                        className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                        className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                       >
                         Sebelumnya
                       </button>
@@ -16647,7 +18322,7 @@ export default function App() {
                       <button
                         onClick={() => setAllDocsPage((p) => Math.min(allDocsTotalPages, p + 1))}
                         disabled={allDocsSafePage >= allDocsTotalPages}
-                        className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                        className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                       >
                         Berikutnya
                       </button>
@@ -17001,17 +18676,18 @@ export default function App() {
           {selectedContract && (
             <div className="space-y-6">
               {/* Workspace Header */}
-              <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
-                <div className="space-y-1">
+              <div className="card-grad card-soft bg-slate-900 p-6 rounded-[28px] flex flex-col gap-4 relative overflow-hidden">
+                <FileText aria-hidden className="pointer-events-none absolute -right-3 -top-7 w-36 h-36 text-soft-blue opacity-[0.12] rotate-12" strokeWidth={1.2} />
+                <Scale aria-hidden className="pointer-events-none absolute right-52 -top-5 w-20 h-20 text-peach-strong opacity-25 -rotate-12" strokeWidth={1.2} />
+                <div className="space-y-1.5 relative">
                   <button
                     onClick={() => setSelectedContract(null)}
-                    className="flex items-center gap-1 text-xs text-indigo-400 hover:underline mb-2 cursor-pointer"
+                    className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-slate-500 hover:text-slate-200 bg-slate-900 card-soft rounded-full pl-2.5 pr-3.5 py-1.5 mb-2 cursor-pointer transition"
                   >
-                    <ArrowLeftRight className="w-3 h-3 rotate-185" /> Kembali ke
-                    Daftar
+                    <ChevronLeft className="w-3.5 h-3.5" /> Kembali ke Daftar
                   </button>
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-sm font-bold bg-indigo-950 text-indigo-400 px-2.5 py-0.5 rounded border border-indigo-900">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <span className="font-mono text-[12px] font-bold bg-soft-blue/20 text-[#3a7fa8] px-3 py-1 rounded-full">
                       {selectedContract.contractNumber}
                     </span>
                     {/* Dipakai unifiedContractStatusOf (bukan selectedContract.status
@@ -17031,10 +18707,10 @@ export default function App() {
                         contractStatusLabel(selectedContract.status)}
                     </span>
                   </div>
-                  <h2 className="text-xl font-bold text-slate-100">
+                  <h2 className="text-[24px] leading-tight font-medium text-slate-100">
                     {selectedContract.title}
                   </h2>
-                  <p className="text-xs text-slate-400">
+                  <p className="text-xs text-slate-500">
                     {(() => {
                       // BUG: selectedContract.parties itu snapshot yang direkam
                       // sekali (biasanya saat kontrak dibuat) dan TIDAK PERNAH
@@ -17062,7 +18738,7 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="flex flex-wrap items-center justify-end gap-2">
+                <div className="ct-toolbar flex flex-wrap items-center gap-2 pt-4 border-t border-slate-800/70 relative">
                   {isContractEditable(selectedContract) && (
                     <button
                       onClick={() => handleOpenEditPartyModal(selectedContract)}
@@ -17215,7 +18891,7 @@ export default function App() {
                       {isOcrRunning ? "Membaca..." : "OCR → Teks"}
                     </button>
                   )}
-                  {isContractEditable(selectedContract) && !isUploadedDocument(selectedContract) && (
+                  {isContractEditable(selectedContract) && (
                     <button
                       onClick={() =>
                         handleUpdateContractDraft("Memperbarui isi draf")
@@ -17249,6 +18925,16 @@ export default function App() {
                     >
                       <FileDigit className="w-3.5 h-3.5" />
                       Buat Addendum
+                    </button>
+                  )}
+                  {selectedContract.status === "Aktif" && (currentUser?.role === "admin" || currentUser?.role === "legal" || currentUser?.role === "super_admin") && (
+                    <button
+                      onClick={() => setReleaseModalOpen(true)}
+                      title="Umumkan ke orang-orang tertentu (dipilih per nama) bahwa kontrak ini sudah rilis/aktif, lengkap dengan keterangan."
+                      className="ct-primary px-4 py-2 text-white text-xs font-bold rounded-xl transition flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Bell className="w-3.5 h-3.5" />
+                      Umumkan Rilis
                     </button>
                   )}
                   {/* "Mode Tinjau (Word)" adalah SATU-SATUNYA pintu tinjau/komentar
@@ -17285,6 +18971,7 @@ export default function App() {
                     Ini dipindah jadi kolom kanan (di bawah) atas permintaan
                     user, supaya preview & editor sebelahan. */}
                 {isUploadedDocument(selectedContract) ? (
+                  <React.Fragment key={docReloadKey}>
                   <UploadedDocumentWorkspace
                     contract={selectedContract}
                     canEdit={isContractEditable(selectedContract)}
@@ -17297,6 +18984,7 @@ export default function App() {
                     showToast={showToast}
                     askConfirm={askConfirm}
                   />
+                  </React.Fragment>
                 ) : (
                 <div className="xl:col-span-12 bg-slate-950 rounded-2xl border border-slate-800 p-6 space-y-6 shadow-2xl flex flex-col justify-between">
                   <div>
@@ -17436,16 +19124,20 @@ export default function App() {
                         <DocToolbar />
                       </div>
                     )}
-                    {/* Standard Indonesian Style Document Formatting */}
+                    {/* Standard Indonesian Style Document Formatting.
+                        Di layar, kertas ini mengikuti tema (gelap di dark mode).
+                        Saat export PDF kelas "paper-light" mengunci palet terang
+                        (lihat index.css) supaya hasil cetak SELALU kertas putih
+                        bertinta gelap, apa pun tema yang sedang aktif. */}
                     <div
                       ref={previewRef}
-                      style={{ ...docTypographyStyle(), backgroundColor: "#ffffff" }}
+                      style={{ ...docTypographyStyle(), backgroundColor: isExportingPdf ? "#ffffff" : "var(--color-slate-900)" }}
                       // p-6 di sini CUMA padding nyaman buat EDIT di layar (panel
                       // ini bukan seukuran kertas A4 asli). Margin cetak yang
                       // sesungguhnya (mm, dari Konfigurasi > Master Data > "Margin
                       // Halaman Kontrak") dipaksakan terpisah, HANYA saat export,
                       // di dalam generateContractPdf — lihat komentar di sana.
-                      className={`${isExportingPdf ? "space-y-3" : "space-y-6"} max-h-[600px] overflow-y-auto p-6 border border-slate-850 text-slate-300`}
+                      className={`${isExportingPdf ? "paper-light space-y-3" : "space-y-6"} max-h-[600px] overflow-y-auto p-6 border border-slate-850 text-slate-300`}
                     >
                       {/* Kop Surat (Letterhead) — logo + identitas perusahaan, sumber
                           data sama dengan yang dipakai kop surat dokumen DCS
@@ -18233,7 +19925,7 @@ export default function App() {
                       selectedContractAddendumInfo && selectedContract.amendmentAttachments && selectedContract.amendmentAttachments.length > 0 && (
                         <div className="font-sans text-xs space-y-2">
                           <h5 className="font-bold text-slate-100">Lampiran Rincian</h5>
-                          <table className="w-full border-collapse text-[11px]">
+                          <table className="plain-table w-full border-collapse text-[11px]">
                             <thead>
                               <tr className="border-b border-slate-700 text-slate-400">
                                 <th className="text-left py-1 pr-2 font-semibold">Keterangan</th>
@@ -18326,7 +20018,7 @@ export default function App() {
                                       </div>
                                     )}
                                     {section.tableColumns && section.tableColumns.length > 0 && (
-                                      <table className="w-full border-collapse text-[11px] border border-slate-600">
+                                      <table className="plain-table w-full border-collapse text-[11px] border border-slate-600">
                                         <thead>
                                           <tr>
                                             {section.tableColumns.map((col, ci) => (
@@ -18494,12 +20186,29 @@ export default function App() {
                 )}
               </div>
 
+              {(selectedContract.status === "Aktif" || (selectedContract.releaseAnnouncements || []).length > 0) && (
+                <ReleaseAnnouncementsCard
+                  contract={selectedContract}
+                  canEdit={selectedContract.status === "Aktif" && (currentUser?.role === "admin" || currentUser?.role === "legal" || currentUser?.role === "super_admin")}
+                  onOpen={() => setReleaseModalOpen(true)}
+                />
+              )}
+              {releaseModalOpen && (
+                <ReleaseAnnounceModal
+                  contract={selectedContract}
+                  users={mentionableUsers}
+                  saving={releaseSaving}
+                  onClose={() => setReleaseModalOpen(false)}
+                  onSend={handleAnnounceRelease}
+                />
+              )}
+
               {/* Status & Siklus Kontrak + Riwayat Addendum — dipindah ke
                   bawah (lebar penuh), atas permintaan user. Dulu jadi kolom
                   kanan sebelahan preview; sekarang di bawah grid preview+
                   editor. Isi/logic blok ini TIDAK diubah sama sekali, cuma
                   dipindah posisi & jadi lebar penuh (bukan 5/12 kolom lagi). */}
-              <div className="bg-slate-950 rounded-2xl border border-slate-800 p-5 shadow-2xl">
+              <div className="card-soft bg-slate-900 rounded-[28px] p-6">
                 <div className="space-y-6">
                     {/* SECTION 3: STATUS & SIKLUS KONTRAK (Draft → OnReview →
                         FullyApproved → Aktif → Archived/Terminated) */}
@@ -18583,7 +20292,7 @@ export default function App() {
                                   <button
                                     onClick={() => handleApprovalDecision("rejected")}
                                     disabled={isDecidingApproval}
-                                    className="py-1.5 bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 text-[10px] font-bold rounded-lg border border-rose-600/30 transition cursor-pointer disabled:opacity-50"
+                                    className="py-2 bg-slate-900 card-soft text-rose-400 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer disabled:opacity-50"
                                   >
                                     Tolak
                                   </button>
@@ -18682,26 +20391,26 @@ export default function App() {
 
                       {selectedContract.status === "Aktif" && (
                         <div className="space-y-2">
-                          <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-[11px] text-emerald-300">
+                          <div className="px-4 py-2.5 bg-emerald-500/10 rounded-full text-[11px] text-emerald-400">
                             Kontrak aktif & terpantau — reminder otomatis berjalan hingga {new Date(selectedContract.endDate).toLocaleDateString("id-ID")}.
                           </div>
                           <div className="grid grid-cols-3 gap-2">
                             <button
                               onClick={() => handleChangeContractStatus("TidakAktif")}
                               title="Nonaktifkan manual sebelum masa berlaku habis (mis. alasan bisnis) — beda dari kedaluwarsa otomatis, hasil akhirnya status yang sama."
-                              className="py-1.5 bg-orange-600/20 hover:bg-orange-600/40 text-orange-300 text-[10px] font-bold rounded-lg border border-orange-600/30 transition cursor-pointer"
+                              className="py-2 bg-peach text-slate-100 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer"
                             >
                               Nonaktifkan
                             </button>
                             <button
                               onClick={() => handleChangeContractStatus("Archived")}
-                              className="py-1.5 bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 text-[10px] font-bold rounded-lg border border-purple-600/30 transition cursor-pointer"
+                              className="py-2 bg-mist text-slate-100 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer"
                             >
                               Arsipkan
                             </button>
                             <button
                               onClick={() => handleChangeContractStatus("Terminated")}
-                              className="py-1.5 bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 text-[10px] font-bold rounded-lg border border-rose-600/30 transition cursor-pointer"
+                              className="py-2 bg-slate-900 card-soft text-rose-400 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer"
                             >
                               Akhiri Kontrak
                             </button>
@@ -18711,19 +20420,19 @@ export default function App() {
 
                       {selectedContract.status === "TidakAktif" && (
                         <div className="space-y-2">
-                          <div className="p-2.5 bg-orange-500/10 border border-orange-500/20 rounded-lg text-[11px] text-orange-300">
+                          <div className="px-4 py-2.5 bg-peach/60 rounded-full text-[11px] text-slate-200">
                             Kontrak sudah melewati masa berlaku ({new Date(selectedContract.endDate).toLocaleDateString("id-ID")}) dan otomatis ditandai Tidak Aktif — tidak lagi dipantau reminder. Gunakan "Perpanjang / Extend" untuk melanjutkan, atau tutup lewat salah satu tombol di bawah.
                           </div>
                           <div className="grid grid-cols-2 gap-2">
                             <button
                               onClick={() => handleChangeContractStatus("Archived")}
-                              className="py-1.5 bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 text-[10px] font-bold rounded-lg border border-purple-600/30 transition cursor-pointer"
+                              className="py-2 bg-mist text-slate-100 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer"
                             >
                               Arsipkan
                             </button>
                             <button
                               onClick={() => handleChangeContractStatus("Terminated")}
-                              className="py-1.5 bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 text-[10px] font-bold rounded-lg border border-rose-600/30 transition cursor-pointer"
+                              className="py-2 bg-slate-900 card-soft text-rose-400 hover:brightness-95 text-[11px] font-bold rounded-full transition cursor-pointer"
                             >
                               Akhiri Kontrak
                             </button>
@@ -18788,8 +20497,12 @@ export default function App() {
           {activeTab === "clauses" && (
             <div className="space-y-6 animate-fadeIn">
               {/* Header */}
-              <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div>
+              <div className="card-grad card-soft bg-slate-900 p-6 rounded-[28px] flex flex-col sm:flex-row sm:items-center justify-between gap-4 relative overflow-hidden">
+                {/* Ornamen ikon hukum samar (dekoratif) */}
+                <Scale aria-hidden className="pointer-events-none absolute -right-2 -top-5 w-36 h-36 text-soft-blue opacity-[0.13]" strokeWidth={1.2} />
+                <Gavel aria-hidden className="pointer-events-none absolute right-44 -bottom-6 w-24 h-24 text-peach-strong opacity-30 -rotate-12" strokeWidth={1.2} />
+                <ScrollText aria-hidden className="pointer-events-none absolute right-[26rem] -top-3 w-16 h-16 text-soft-blue opacity-[0.12] rotate-6" strokeWidth={1.2} />
+                <div className="relative z-10">
                   <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
                     <Sliders className="text-indigo-400 w-5 h-5" />
                     Clause Library (Pustaka Klausul Master)
@@ -18800,12 +20513,12 @@ export default function App() {
                   </p>
                 </div>
 
-                <div className="flex flex-wrap gap-2">
+                <div className="relative z-10 flex flex-nowrap gap-2.5 shrink-0 self-start sm:self-center">
                   <button
                     onClick={() =>
                       setIsManagingCategories(!isManagingCategories)
                     }
-                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-xl text-xs font-semibold flex items-center gap-1 transition shadow-md cursor-pointer shrink-0"
+                    className="btn-grad-soft px-4 py-2 text-slate-100 rounded-full text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0"
                   >
                     <Sliders className="w-4 h-4" />
                     Kelola Rumah/Kategori Klausul
@@ -18813,35 +20526,17 @@ export default function App() {
                   <button
                     onClick={() => openClauseCopy("dariDcs")}
                     title="Ambil klausul yang sudah ditulis di library Dokumen Internal (DCS) tanpa mengetik ulang."
-                    className="px-4 py-2 bg-violet-600/20 hover:bg-violet-600/30 border border-violet-500/30 text-violet-800 rounded-xl text-xs font-semibold flex items-center gap-1 transition cursor-pointer shrink-0"
+                    className="btn-grad-soft px-4 py-2 text-slate-100 rounded-full text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0"
                   >
                     <Workflow className="w-4 h-4" />
                     Salin dari Library DCS
-                  </button>
-                  <button
-                    onClick={() => {
-                      setIsAddingClause(true);
-                      setEditingClauseId(null);
-                      setNewClauseForm({
-                        title: "",
-                        content: "",
-                        category: "General",
-                        tags: "",
-                        isMandatory: false,
-                        isProtected: false,
-                      });
-                    }}
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1 transition shadow-md cursor-pointer shrink-0"
-                  >
-                    <Plus className="w-4.5 h-4.5" />
-                    Tambah Klausul Master
                   </button>
                 </div>
               </div>
 
               {/* Category Management */}
               {isManagingCategories && (
-                <div className="bg-slate-900 border border-slate-800 p-5 rounded-2xl space-y-4">
+                <div className="card-grad card-soft p-6 rounded-[28px] space-y-4">
                   <h3 className="font-bold text-sm text-slate-200">
                     Rumah / Kategori Klausul (Clause Configuration Center)
                   </h3>
@@ -18868,7 +20563,7 @@ export default function App() {
                     />
                     <button
                       type="submit"
-                      className="px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition cursor-pointer"
+                      className="btn-grad-primary px-4 py-1.5 text-white text-xs font-bold rounded-full transition cursor-pointer"
                     >
                       Tambah
                     </button>
@@ -19092,11 +20787,14 @@ export default function App() {
 
               {/* Form Add/Edit Clause */}
               {isAddingClause && (
+                <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setIsAddingClause(false)}>
                 <form
                   onSubmit={handleSaveClause}
-                  className="bg-slate-950/60 p-5 rounded-2xl border border-indigo-500/20 grid grid-cols-1 md:grid-cols-2 gap-4"
+                  onClick={(e) => e.stopPropagation()}
+                  className="modal-panel relative w-full max-w-3xl max-h-[90vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] grid grid-cols-1 md:grid-cols-2 gap-4"
                 >
-                  <div className="md:col-span-2 border-b border-slate-800 pb-2 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                  <button type="button" onClick={() => setIsAddingClause(false)} aria-label="Tutup" className="absolute top-4 right-4 w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 text-lg leading-none cursor-pointer z-10">×</button>
+                  <div className="md:col-span-2 border-b border-slate-800 pb-3 pr-10 flex flex-col md:flex-row md:items-center justify-between gap-4">
                     <h3 className="font-bold text-sm text-indigo-400">
                       {editingClauseId
                         ? "Edit Klausul Master"
@@ -19140,7 +20838,7 @@ export default function App() {
                         })
                       }
                       placeholder="e.g. Pasal 10 - Hak Kekayaan Intelektual"
-                      className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                      className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                     />
                   </div>
 
@@ -19157,7 +20855,7 @@ export default function App() {
                             category: e.target.value,
                           })
                         }
-                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                        className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                       >
                         {clauseCategories.map((cat) => (
                           <option key={cat} value={cat}>
@@ -19180,7 +20878,7 @@ export default function App() {
                           })
                         }
                         placeholder="e.g. HKI, Hukum, Kepatuhan"
-                        className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                        className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                       />
                     </div>
                   </div>
@@ -19236,18 +20934,19 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setIsAddingClause(false)}
-                      className="px-4 py-2 bg-slate-800 text-xs font-semibold rounded-xl text-slate-300"
+                      className="btn-grad-soft px-4 py-2 text-xs font-semibold rounded-full text-slate-300"
                     >
                       Batal
                     </button>
                     <button
                       type="submit"
-                      className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition shadow-lg"
+                      className="btn-grad-primary px-5 py-2 text-white text-xs font-bold rounded-full transition"
                     >
                       Simpan ke Clause Library
                     </button>
                   </div>
                 </form>
+                </div>
               )}
 
               {/* Master Clauses List Grid */}
@@ -19255,7 +20954,7 @@ export default function App() {
                 {clauses.map((c) => (
                   <div
                     key={c.id}
-                    className="bg-slate-950/40 border border-slate-800 p-5 rounded-2xl flex flex-col justify-between space-y-3"
+                    className="card-grad card-soft bg-slate-900 p-5 rounded-[28px] flex flex-col justify-between space-y-3"
                   >
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
@@ -19276,19 +20975,19 @@ export default function App() {
                                 isProtected: c.isProtected,
                               });
                             }}
-                            className="text-[10px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 bg-indigo-500/10 px-1.5 py-0.5 rounded cursor-pointer"
+                            className="text-[10px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 bg-mist px-2 py-0.5 rounded-full cursor-pointer"
                           >
                             Edit
                           </button>
                         </div>
                         <div className="flex gap-1">
                           {c.isMandatory && (
-                            <span className="bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded text-[9px] font-bold border border-emerald-500/25">
+                            <span className="bg-mist text-indigo-400 px-2 py-0.5 rounded-full text-[9px] font-bold">
                               Mandatory
                             </span>
                           )}
                           {c.isProtected && (
-                            <span className="bg-indigo-500/10 text-indigo-400 px-1.5 py-0.5 rounded text-[9px] font-bold border border-indigo-500/25">
+                            <span className="bg-peach text-brand-orange px-2 py-0.5 rounded-full text-[9px] font-bold">
                               Protected
                             </span>
                           )}
@@ -19298,7 +20997,7 @@ export default function App() {
                       <h4 className="font-bold text-sm text-slate-200">
                         {c.title}
                       </h4>
-                      <p className="text-xs text-slate-400 leading-relaxed line-clamp-3 bg-slate-900/40 p-2.5 rounded border border-slate-850/60 font-mono">
+                      <p className="text-xs text-slate-400 leading-relaxed line-clamp-3 bg-slate-950/70 p-3 rounded-2xl font-mono">
                         {c.content}
                       </p>
                     </div>
@@ -19308,7 +21007,7 @@ export default function App() {
                         {c.tags.map((t) => (
                           <span
                             key={t}
-                            className="bg-slate-900 px-1.5 py-0.5 rounded text-[9px] text-slate-400"
+                            className="bg-slate-950 px-2 py-0.5 rounded-full text-[9px] text-slate-400"
                           >
                             #{t}
                           </span>
@@ -19342,7 +21041,7 @@ export default function App() {
                         addendumRecitalParagraph: "",
                       });
                     }}
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1 transition shadow-md cursor-pointer shrink-0"
+                    className="btn-grad-primary px-4 py-2 text-white rounded-full text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shrink-0"
                   >
                     <Plus className="w-4 h-4" />
                     Tambah Template
@@ -19350,9 +21049,11 @@ export default function App() {
                 </div>
 
                 {isBuildingTemplate && (
+                  <div className="modal-backdrop fixed inset-0 z-[60] flex items-center justify-center p-4" onClick={() => setIsBuildingTemplate(false)}>
                   <form
                     onSubmit={handleSaveTemplate}
-                    className="bg-slate-900 border border-slate-800 p-6 rounded-2xl mb-6 space-y-4"
+                    onClick={(e) => e.stopPropagation()}
+                    className="modal-panel relative w-full max-w-4xl max-h-[90vh] overflow-y-auto bg-slate-900 p-7 rounded-[28px] space-y-4"
                   >
                     <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                       <h3 className="font-bold text-sm text-indigo-400">
@@ -19363,9 +21064,10 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setIsBuildingTemplate(false)}
-                        className="text-slate-500 hover:text-slate-300 text-xs cursor-pointer"
+                        aria-label="Tutup"
+                        className="w-8 h-8 rounded-full bg-slate-950 text-slate-400 hover:text-slate-100 text-lg leading-none cursor-pointer"
                       >
-                        Batal
+                        ×
                       </button>
                     </div>
 
@@ -19385,7 +21087,7 @@ export default function App() {
                             })
                           }
                           placeholder="e.g. Perjanjian Sewa Alat Berat"
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                         />
                       </div>
                       <div className="space-y-1">
@@ -19400,7 +21102,7 @@ export default function App() {
                               category: e.target.value,
                             })
                           }
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                         >
                           {clauseCategories.map((cat) => (
                             <option key={cat} value={cat}>
@@ -19422,7 +21124,7 @@ export default function App() {
                               description: e.target.value,
                             })
                           }
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                           rows={2}
                         />
                       </div>
@@ -19435,7 +21137,7 @@ export default function App() {
                       </label>
                       <div className="flex gap-4">
                         {/* Selected Clauses */}
-                        <div className="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-3 min-h-[200px] flex flex-col gap-2">
+                        <div className="flex-1 bg-slate-950 border border-transparent rounded-2xl p-3 min-h-[200px] flex flex-col gap-2">
                           <h4 className="text-[10px] text-slate-500 uppercase font-bold text-center mb-1">
                             Pasal dalam Template
                           </h4>
@@ -19484,7 +21186,7 @@ export default function App() {
                         </div>
 
                         {/* Available Clauses: searchable, grouped per category */}
-                        <div className="w-2/5 bg-slate-950 border border-slate-800 rounded-xl p-3 min-h-[200px] flex flex-col gap-2 overflow-y-auto max-h-[420px]">
+                        <div className="w-2/5 bg-slate-950 border border-transparent rounded-2xl p-3 min-h-[200px] flex flex-col gap-2 overflow-y-auto max-h-[420px]">
                           <h4 className="text-[10px] text-slate-500 uppercase font-bold text-center">
                             Pilih Klausul (klik untuk tambah/hapus)
                           </h4>
@@ -19650,7 +21352,7 @@ export default function App() {
                           value={templateForm.openingParagraph}
                           onChange={(e) => setTemplateForm({ ...templateForm, openingParagraph: e.target.value })}
                           placeholder='Kosongkan untuk pakai kalimat default. Bisa pakai {{Variabel}}, mis. "Pada hari ini, tanggal {{StartDate}}, kami yang bertandatangan..."'
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                         />
                       </div>
                       <div className="space-y-1">
@@ -19662,7 +21364,7 @@ export default function App() {
                           value={templateForm.closingParagraph}
                           onChange={(e) => setTemplateForm({ ...templateForm, closingParagraph: e.target.value })}
                           placeholder='Kosongkan untuk pakai kalimat default (khusus dokumen Addendum). Bisa pakai {{Variabel}}.'
-                          className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                         />
                       </div>
                     </div>
@@ -19676,26 +21378,27 @@ export default function App() {
                         value={templateForm.addendumRecitalParagraph}
                         onChange={(e) => setTemplateForm({ ...templateForm, addendumRecitalParagraph: e.target.value })}
                         placeholder='Kosongkan untuk pakai kalimat default (khusus dokumen Addendum, menggantikan "Bahwa PARA PIHAK telah membuat dan menandatangani..."). Token tersedia: {{ParentDocType}} {{ParentNumber}} {{ParentDate}} {{ParentEndDate}} {{PreviousOrdinal}} {{PreviousNumber}} {{PreviousDate}}, plus {{Variabel}} kontrak biasa.'
-                        className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                        className="w-full px-3 py-2 bg-slate-950 border border-transparent rounded-2xl text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                       />
                     </div>
 
                     <div className="flex justify-end pt-4 border-t border-slate-800">
                       <button
                         type="submit"
-                        className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-xl transition shadow-lg cursor-pointer"
+                        className="btn-grad-primary px-5 py-2 text-white text-xs font-bold rounded-full transition cursor-pointer"
                       >
                         Simpan Template
                       </button>
                     </div>
                   </form>
+                  </div>
                 )}
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   {templates.map((tpl) => (
                     <div
                       key={tpl.id}
-                      className="bg-slate-950/60 border border-slate-850 p-4 rounded-xl space-y-3 relative group"
+                      className="card-grad card-soft bg-slate-900 p-5 rounded-[28px] space-y-3 relative group"
                     >
                       <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity flex gap-1.5">
                         <button
@@ -19714,7 +21417,7 @@ export default function App() {
                               addendumRecitalParagraph: tpl.addendumRecitalParagraph || "",
                             });
                           }}
-                          className="bg-indigo-600 hover:bg-indigo-500 text-white p-1.5 rounded cursor-pointer"
+                          className="btn-grad-primary text-white w-8 h-8 flex items-center justify-center rounded-full cursor-pointer"
                           title="Edit template"
                         >
                           <Sliders className="w-3.5 h-3.5" />
@@ -19726,14 +21429,14 @@ export default function App() {
                             showToast("Template dihapus", "success");
                             fetchInitialData();
                           }}
-                          className="bg-rose-600 hover:bg-rose-500 text-white p-1.5 rounded cursor-pointer"
+                          className="btn-grad-soft text-brand-orange w-8 h-8 flex items-center justify-center rounded-full cursor-pointer"
                           title="Hapus template"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
                       <div>
-                        <span className="text-[9px] bg-indigo-500/10 text-indigo-400 px-2 py-0.5 rounded-full font-bold uppercase border border-indigo-500/20">
+                        <span className="text-[9px] bg-mist text-indigo-400 px-2.5 py-0.5 rounded-full font-bold uppercase">
                           {tpl.category}
                         </span>
                         <h4 className="font-bold text-sm text-slate-200 mt-2">
@@ -19744,7 +21447,7 @@ export default function App() {
                         </p>
                       </div>
 
-                      <div className="space-y-1 pt-2 border-t border-slate-850">
+                      <div className="space-y-1 pt-3 border-t border-slate-800/60">
                         <p className="text-[10px] text-slate-500 uppercase font-bold">
                           Pasal Terkait ({tpl.clauseIds.length}):
                         </p>
@@ -19754,7 +21457,7 @@ export default function App() {
                             return cl ? (
                               <span
                                 key={cid}
-                                className="bg-slate-900 text-slate-400 text-[10px] px-1.5 py-0.5 rounded"
+                                className="bg-slate-950 text-slate-400 text-[10px] px-2 py-0.5 rounded-full"
                               >
                                 {cl.title.split(" - ")[0]}
                               </span>
@@ -19771,7 +21474,7 @@ export default function App() {
                           {tpl.requiredVariables.map((v) => (
                             <span
                               key={v}
-                              className="bg-slate-900 text-indigo-400 text-[10px] px-1.5 py-0.5 rounded font-mono"
+                              className="bg-slate-950 text-indigo-400 text-[10px] px-2 py-0.5 rounded-full font-mono"
                             >
                               {v}
                             </span>
@@ -20374,9 +22077,9 @@ export default function App() {
 
           {activeTab === "audits" && (
             <div className="space-y-6 animate-fadeIn text-xs">
-              <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800">
-                <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                  <History className="text-indigo-400 w-5 h-5" />
+              <div className="card-grad card-soft bg-slate-900 p-6 rounded-[28px]">
+                <h2 className="text-xl font-bold text-slate-100 flex items-center gap-3 mb-1">
+                  <span className="w-10 h-10 rounded-full bg-mist flex items-center justify-center shrink-0"><History className="text-indigo-400 w-5 h-5" /></span>
                   Audit Trail & Integrasi HRIS/ERP
                 </h2>
                 <p className="text-xs text-slate-400">
@@ -20388,17 +22091,17 @@ export default function App() {
 
               <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
                 {/* Audit Logs Table (8 cols) */}
-                <div className="xl:col-span-8 bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-4">
+                <div className="xl:col-span-8 card-soft bg-slate-900 rounded-[28px] p-6 space-y-4">
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <h3 className="font-bold text-sm">
                       Log Forensik Aktivitas Sistem
                     </h3>
                     <div className="relative w-full sm:w-72">
-                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                      <Search className="w-4 h-4 text-indigo-400 pointer-events-none" style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", zIndex: 1 }} />
                       <input
                         type="text" value={auditSearch} onChange={(e) => { setAuditSearch(e.target.value); setAuditPage(1); }}
                         placeholder="Cari pengguna / aktivitas / detail / no. kontrak..."
-                        className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
+                        style={{ paddingLeft: 44 }} className="w-full h-11 pr-4 rounded-full bg-slate-950 text-sm text-slate-100 placeholder:text-slate-500 border border-transparent focus:outline-none focus:border-soft-blue transition"
                       />
                     </div>
                   </div>
@@ -20454,7 +22157,7 @@ export default function App() {
                               </span>
                             </td>
                             <td className="py-3 px-3">
-                              <span className="px-1.5 py-0.5 rounded bg-slate-900 text-slate-300 font-semibold">
+                              <span className={`inline-block px-2.5 py-1 rounded-full font-semibold text-[10.5px] ${/delete|hapus|reject|tolak|terminate|revoke/i.test(String(a.action)) ? "bg-peach text-brand-orange" : "bg-mist text-indigo-400"}`}>
                                 {a.action}
                               </span>
                             </td>
@@ -20484,7 +22187,7 @@ export default function App() {
                         <button
                           onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
                           disabled={safePage <= 1}
-                          className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                          className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                         >
                           Sebelumnya
                         </button>
@@ -20494,7 +22197,7 @@ export default function App() {
                         <button
                           onClick={() => setAuditPage((p) => Math.min(totalPages, p + 1))}
                           disabled={safePage >= totalPages}
-                          className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                          className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                         >
                           Berikutnya
                         </button>
@@ -20506,7 +22209,7 @@ export default function App() {
                 </div>
 
                 {/* Database Integration Simulation (4 cols) */}
-                <div className="xl:col-span-4 bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-5">
+                <div className="xl:col-span-4 card-soft bg-slate-900 rounded-[28px] p-6 space-y-5">
                   <div className="border-b border-slate-800 pb-2">
                     <h3 className="font-bold text-sm">
                       Sinkronisasi Database Eksternal
@@ -20525,7 +22228,7 @@ export default function App() {
                       {employees.map((emp) => (
                         <div
                           key={emp.id}
-                          className="p-2 bg-slate-900 rounded border border-slate-855 flex items-center justify-between text-[11px]"
+                          className="p-3 bg-slate-950 rounded-2xl flex items-center justify-between text-[11px]"
                         >
                           <div>
                             <p className="font-bold text-slate-200">
@@ -20535,7 +22238,7 @@ export default function App() {
                               {emp.id} • {emp.position}
                             </p>
                           </div>
-                          <span className="text-emerald-400 font-semibold">
+                          <span className="text-indigo-400 font-semibold">
                             Rp {emp.salary.toLocaleString("id-ID")}
                           </span>
                         </div>
@@ -20552,7 +22255,7 @@ export default function App() {
                       {vendors.map((v) => (
                         <div
                           key={v.id}
-                          className="p-2 bg-slate-900 rounded border border-slate-855 text-[11px] space-y-0.5"
+                          className="p-3 bg-slate-950 rounded-2xl text-[11px] space-y-0.5"
                         >
                           <p className="font-bold text-slate-200">{v.name}</p>
                           <p className="text-[10px] text-slate-400">
@@ -20631,15 +22334,15 @@ export default function App() {
             const safePage = Math.min(auditKdPage, totalPages);
             const pageRows = rows.slice((safePage - 1) * KD_PAGE_SIZE, safePage * KD_PAGE_SIZE);
             const moduleBadge = (m: "dcs" | "karyawan" | "eksternal") => {
-              if (m === "dcs") return <span className="px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-300 font-semibold text-[10px]">DCS</span>;
-              if (m === "karyawan") return <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 font-semibold text-[10px]">Karyawan</span>;
-              return <span className="px-1.5 py-0.5 rounded bg-indigo-500/10 text-indigo-300 font-semibold text-[10px]">Eksternal</span>;
+              if (m === "dcs") return <span className="px-2.5 py-1 rounded-full bg-slate-950 text-slate-300 font-semibold text-[10.5px]">DCS</span>;
+              if (m === "karyawan") return <span className="px-2.5 py-1 rounded-full bg-peach text-brand-orange font-semibold text-[10.5px]">Karyawan</span>;
+              return <span className="px-2.5 py-1 rounded-full bg-mist text-indigo-400 font-semibold text-[10.5px]">Eksternal</span>;
             };
             return (
             <div className="space-y-6 animate-fadeIn text-xs">
-              <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800">
-                <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
-                  <Layers className="text-indigo-400 w-5 h-5" />
+              <div className="card-grad card-soft bg-slate-900 p-6 rounded-[28px]">
+                <h2 className="text-xl font-bold text-slate-100 flex items-center gap-3 mb-1">
+                  <span className="w-10 h-10 rounded-full bg-mist flex items-center justify-center shrink-0"><Layers className="text-indigo-400 w-5 h-5" /></span>
                   Audit Trail Kontrak &amp; DCS
                 </h2>
                 <p className="text-xs text-slate-400">
@@ -20652,17 +22355,17 @@ export default function App() {
 
               <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
                 {/* Log Kontrak & DCS (8 cols) */}
-                <div className="xl:col-span-8 bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-4">
+                <div className="xl:col-span-8 card-soft bg-slate-900 rounded-[28px] p-6 space-y-4">
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <h3 className="font-bold text-sm">
                       Log Aktivitas Kontrak &amp; DCS
                     </h3>
                     <div className="relative w-full sm:w-72">
-                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                      <Search className="w-4 h-4 text-indigo-400 pointer-events-none" style={{ position: "absolute", left: 16, top: "50%", transform: "translateY(-50%)", zIndex: 1 }} />
                       <input
                         type="text" value={auditKdSearch} onChange={(e) => { setAuditKdSearch(e.target.value); setAuditKdPage(1); }}
                         placeholder="Cari pengguna / aktivitas / detail / no. kontrak..."
-                        className="w-full pl-9 pr-3 py-2.5 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/15 transition"
+                        style={{ paddingLeft: 44 }} className="w-full h-11 pr-4 rounded-full bg-slate-950 text-sm text-slate-100 placeholder:text-slate-500 border border-transparent focus:outline-none focus:border-soft-blue transition"
                       />
                     </div>
                   </div>
@@ -20678,10 +22381,10 @@ export default function App() {
                         key={key}
                         type="button"
                         onClick={() => { setAuditKdModule(key); setAuditKdPage(1); }}
-                        className={`px-2.5 py-1 rounded-lg text-[10.5px] font-semibold cursor-pointer transition border ${
+                        className={`px-3.5 py-1.5 rounded-full text-[11px] font-semibold cursor-pointer transition ${
                           auditKdModule === key
-                            ? "bg-indigo-600/20 text-indigo-300 border-indigo-500/40"
-                            : "bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200"
+                            ? "bg-mist text-indigo-400"
+                            : "bg-slate-950 text-slate-400 hover:text-slate-200"
                         }`}
                       >
                         {label}
@@ -20720,7 +22423,7 @@ export default function App() {
                             </td>
                             <td className="py-3 px-3">{moduleBadge(a.__modul)}</td>
                             <td className="py-3 px-3">
-                              <span className="px-1.5 py-0.5 rounded bg-slate-900 text-slate-300 font-semibold">
+                              <span className={`inline-block px-2.5 py-1 rounded-full font-semibold text-[10.5px] ${/delete|hapus|reject|tolak|terminate|revoke/i.test(String(a.action)) ? "bg-peach text-brand-orange" : "bg-mist text-indigo-400"}`}>
                                 {a.action}
                               </span>
                             </td>
@@ -20750,7 +22453,7 @@ export default function App() {
                         <button
                           onClick={() => setAuditKdPage((p) => Math.max(1, p - 1))}
                           disabled={safePage <= 1}
-                          className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                          className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                         >
                           Sebelumnya
                         </button>
@@ -20760,7 +22463,7 @@ export default function App() {
                         <button
                           onClick={() => setAuditKdPage((p) => Math.min(totalPages, p + 1))}
                           disabled={safePage >= totalPages}
-                          className="px-2.5 py-1 rounded-lg border border-slate-800 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-900"
+                          className="px-3.5 py-1.5 rounded-full bg-slate-950 text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed hover:text-slate-100 cursor-pointer"
                         >
                           Berikutnya
                         </button>
@@ -20770,7 +22473,7 @@ export default function App() {
                 </div>
 
                 {/* Ringkasan per Modul (4 cols) */}
-                <div className="xl:col-span-4 bg-slate-950/40 border border-slate-800 rounded-2xl p-5 space-y-4">
+                <div className="xl:col-span-4 card-soft bg-slate-900 rounded-[28px] p-6 space-y-4">
                   <div className="border-b border-slate-800 pb-2">
                     <h3 className="font-bold text-sm">
                       Ringkasan per Modul
@@ -20780,26 +22483,26 @@ export default function App() {
                     </p>
                   </div>
                   <div className="space-y-2.5">
-                    <div className="p-3 bg-slate-900 rounded-xl border border-slate-855 flex items-center justify-between">
+                    <div className="p-3.5 bg-slate-950 rounded-2xl flex items-center justify-between">
                       <div>
                         <p className="font-bold text-slate-200">Kontrak Eksternal</p>
                         <p className="text-[10px] text-slate-500">Vendor / Customer / Mitra</p>
                       </div>
                       <span className="text-lg font-bold text-indigo-400">{countEksternal}</span>
                     </div>
-                    <div className="p-3 bg-slate-900 rounded-xl border border-slate-855 flex items-center justify-between">
+                    <div className="p-3.5 bg-slate-950 rounded-2xl flex items-center justify-between">
                       <div>
                         <p className="font-bold text-slate-200">Kontrak Karyawan</p>
                         <p className="text-[10px] text-slate-500">Internal (PKWT/PKWTT)</p>
                       </div>
-                      <span className="text-lg font-bold text-emerald-400">{countKaryawan}</span>
+                      <span className="text-lg font-bold text-brand-orange">{countKaryawan}</span>
                     </div>
-                    <div className="p-3 bg-slate-900 rounded-xl border border-slate-855 flex items-center justify-between">
+                    <div className="p-3.5 bg-slate-950 rounded-2xl flex items-center justify-between">
                       <div>
                         <p className="font-bold text-slate-200">Dokumen DCS</p>
                         <p className="text-[10px] text-slate-500">SOP / IK / Memo / Kebijakan</p>
                       </div>
-                      <span className="text-lg font-bold text-violet-400">{countDcs}</span>
+                      <span className="text-lg font-bold text-soft-blue">{countDcs}</span>
                     </div>
                   </div>
                   <p className="text-[10px] text-slate-600 pt-2 border-t border-slate-850">
@@ -20813,6 +22516,7 @@ export default function App() {
             );
           })()}
         </main>
+        </div>
       </div>
 
       {/* CREATE CONTRACT WIZARD MODAL */}
@@ -21014,10 +22718,41 @@ export default function App() {
                     </div>
                     )}
 
+                    {/* Platform kerja sama (opsional) — berlaku untuk semua
+                        kategori, jenis dokumen & kedua metode pembuatan. Nilai
+                        terpilih mengisi segmen {Platform} di nomor, mis.
+                        144/PKS/TIKETUX/IX/2026. Kosong = segmen dihilangkan. */}
+                    {/* Disembunyikan bila perusahaan tidak punya platform. */}
+                    {(tenantPlatforms.length > 0 || !!newContractForm.platform) && (
+                    <div className="space-y-1.5">
+                      <label className="block text-sm font-semibold text-slate-300">
+                        Kerjasama Platform <span className="text-slate-500 font-normal">(opsional)</span>
+                      </label>
+                      <select
+                        value={newContractForm.platform}
+                        onChange={(e) => setNewContractForm({ ...newContractForm, platform: e.target.value })}
+                        className="w-full px-4 py-3 bg-slate-900 border border-slate-800 rounded-xl text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                      >
+                        <option value="">— Tidak dipilih —</option>
+                        {!tenantPlatforms.includes(newContractForm.platform) && newContractForm.platform && (
+                          <option value={newContractForm.platform}>{newContractForm.platform}</option>
+                        )}
+                        {tenantPlatforms.map((p) => (
+                          <option key={p} value={p}>{p}</option>
+                        ))}
+                      </select>
+                      <p className="text-[11px] text-slate-500">
+                        Platform yang menjadi pihak kerja sama — tampil di nomor dokumen
+                        {newContractForm.platform ? <> sebagai <span className="font-mono text-slate-400">{platformCode(newContractForm.platform)}</span></> : ""}.
+                        Daftar platform perusahaan diatur di Konfigurasi &gt; Kelola Perusahaan.
+                      </p>
+                    </div>
+                    )}
+
                     <div className="space-y-1.5">
                       <label className="block text-sm font-semibold text-slate-300 flex items-center gap-1.5">
                         Nomor Dokumen{newContractForm.creationMode === "upload" ? " (dari vendor/penerbit)" : ""}
-                        <HelpCircle className="w-3.5 h-3.5 text-slate-500 font-normal" title={newContractForm.creationMode === "upload" ? "Dokumen ini hasil unggah PDF — nomor DIISI BEBAS sesuai dokumen aslinya/vendor. Kosongkan bila ingin nomor otomatis sistem." : "Nomor final, sudah dialokasikan begitu Kategori & Jenis Dokumen dipilih — terkunci, supaya urut & tak pernah dobel."} />
+                        <HelpCircle className="w-3.5 h-3.5 text-slate-500 font-normal" title={newContractForm.creationMode === "upload" ? `Dokumen ini hasil unggah ${fileKindFromName(newContractForm.masterPdfFile?.name) || "berkas (PDF/Word)"} — nomor DIISI BEBAS sesuai dokumen aslinya/vendor. Kosongkan bila ingin nomor otomatis sistem.` : "Nomor final, sudah dialokasikan begitu Kategori & Jenis Dokumen dipilih — terkunci, supaya urut & tak pernah dobel."} />
                       </label>
                       {newContractForm.creationMode === "upload" ? (
                         // Unggah PDF murni → nomor free text (nomor vendor/dokumen asli).
@@ -21133,7 +22868,19 @@ export default function App() {
                           <p className="text-[11px] text-emerald-400 flex items-center gap-1">
                             <CheckCircle className="w-3 h-3" />
                             {newContractForm.masterPdfFile.name} siap diunggah
+                            <span className={`ml-1 px-2 py-0.5 rounded-full text-[10px] font-bold ${fileKindFromName(newContractForm.masterPdfFile.name) === "Word" ? "bg-peach text-brand-orange" : "bg-mist text-indigo-400"}`}>
+                              {fileKindFromName(newContractForm.masterPdfFile.name)}
+                            </span>
                           </p>
+                        )}
+                        {newContractForm.masterPdfFile && fileKindFromName(newContractForm.masterPdfFile.name) === "Word" && (
+                          <p className="text-[11px] text-slate-400">Format Word: dipratinjau &amp; bisa diedit langsung di Document Workspace; PDF dibuat saat diunduh/ditandatangani.</p>
+                        )}
+                        {newContractForm.masterPdfFile && fileKindFromName(newContractForm.masterPdfFile.name) === "PDF" && (
+                          <p className="text-[11px] text-slate-400">Format PDF: dipratinjau dengan layout asli; untuk mengedit isinya, ubah ke Word dulu di Document Workspace.</p>
+                        )}
+                        {newContractForm.masterPdfFile && fileKindFromName(newContractForm.masterPdfFile.name) === "Gambar" && (
+                          <p className="text-[11px] text-slate-400">Format gambar/scan: disimpan sebagai berkas asli (teks dibaca lewat OCR bila diaktifkan).</p>
                         )}
                         <p className="text-[11px] text-slate-500">
                           Berkas ini menjadi dokumen kontrak utama dan disimpan apa adanya (original tidak pernah ditimpa). Setelah kontrak dibuat, buka di Document Workspace: pratinjau dengan layout asli (kop, logo, tabel, footer, TTD), edit, lalu Save sebagai versi baru. PDF, Word (.docx/.doc), JPG, PNG — maks. 10 MB.
@@ -22434,7 +24181,7 @@ export default function App() {
       {/* Modal bagikan link review eksternal (menggantikan window.prompt) —
           dipakai bersama Kontrak & DCS lewat state shareLinkModal. */}
       {shareLinkModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-fadeIn">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-fadeIn">
           <div className="bg-slate-950 border border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden">
             <div className="p-5 border-b border-slate-800 bg-slate-900/50 flex justify-between items-start">
               <div>
@@ -22490,6 +24237,19 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+
+      {docDownloadPicker && (
+        <DocumentDownloadModal
+          open
+          onClose={() => setDocDownloadPicker(null)}
+          sourceFormat={docDownloadPicker.sourceFormat}
+          officeToPdfAvailable={docDownloadPicker.officeToPdfAvailable}
+          onPick={(format) => {
+            window.location.href = buildDocumentDownloadUrl(docDownloadPicker.contractId, "current", format);
+            setDocDownloadPicker(null);
+          }}
+        />
       )}
 
       {pdfShare && (
@@ -23865,35 +25625,55 @@ export default function App() {
         }))];
         const visible = clauseComments.filter((c) => !c.parentId && (marginShowResolved || !c.resolved));
         const marginItems: MarginItem[] = visible.map((c) => ({
-          id: c.id, clauseId: c.clauseId, kind: c.kind, resolved: c.resolved, anchor: c.anchor,
+          id: c.id, clauseId: c.clauseId, kind: c.kind, resolved: c.resolved, anchor: c.anchor, replacement: c.replacement, status: c.status,
         }));
         if (marginDraft) {
           marginItems.push({ id: "__draft__", clauseId: marginDraft.clauseId, kind: marginDraft.kind, resolved: false, anchor: { quote: marginDraft.quote } });
         }
         const openCount = clauseComments.filter((c) => !c.parentId && !c.resolved).length;
-        const closeReview = () => { setReviewModeOpen(false); setMarginDraft(null); setMarginDraftText(""); setMarginReplyText(""); setActiveMarginId(null); setReAnchoringCommentId(null); };
+        // Kontrak "Upload Dokumen": Mode Tinjau menampilkan BERKAS asli versi aktif
+        // (bukan narasi/pasal template — clauses-nya memang kosong).
+        const isUploadReview = isUploadedDocument(selectedContract);
+        // Menerima usulan = membuat versi dokumen baru: hanya Draft & peran yg boleh ubah dokumen.
+        const canApplyMarkup = selectedContract.status === "Draft" && ["admin", "staff", "legal", "manager", "super_admin"].includes(currentUser?.role);
+        const docMarkupItems: MarkupItem[] = visible
+          .filter((c) => c.docAnchor && c.anchor)
+          .map((c) => ({
+            id: c.id, kind: (c.kind || "comment") as MarkupItem["kind"], resolved: c.resolved, status: c.status,
+            paraIndex: c.docAnchor!.paraIndex, start: c.anchor!.start, end: c.anchor!.end, quote: c.anchor!.quote, replacement: c.replacement,
+          }));
+        const closeReview = () => { setDocMarkupDraft(null); setDocMarkupText(""); setDocMarkupReplacement(""); setReviewModeOpen(false); setMarginDraft(null); setMarginDraftText(""); setMarginDraftReplacement(""); setMarginReplyText(""); setActiveMarginId(null); setReAnchoringCommentId(null); };
 
         const renderInternalCard = (item: MarginItem, isActive: boolean) => {
           if (item.id === "__draft__") {
             if (!marginDraft) return null;
             return (
-              <div className={`rounded-xl bg-slate-900 border border-dashed shadow-2xl p-3 space-y-2 border-l-4 ${marginDraft.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-amber-400 border-amber-600/60"}`}>
+              <div className={`rounded-xl bg-slate-900 border border-dashed shadow-2xl p-3 space-y-2 border-l-4 ${marginDraft.kind === "comment" ? "border-l-amber-400 border-amber-600/60" : marginDraft.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-emerald-500 border-emerald-700/60"}`}>
                 <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
-                  {marginDraft.kind === "strike" ? "✂ Usulan Coret" : "✎ Komentar Baru"}
+                  {marginDraft.kind === "comment" ? "✎ Komentar Baru" : marginDraft.kind === "strike" ? "✂ Usulan Coret" : "⇄ Usulan Ganti"}
                 </p>
-                <p className={`text-[11px] italic ${marginDraft.kind === "strike" ? "text-rose-300 line-through" : "text-amber-200"}`}>"{marginDraft.quote}"</p>
+                <p className={`text-[11px] italic ${marginDraft.kind === "comment" ? "text-amber-200" : "text-rose-300 line-through"}`}>"{marginDraft.quote}"</p>
+                {marginDraft.kind === "replace" && (
+                  <input
+                    autoFocus
+                    value={marginDraftReplacement}
+                    onChange={(e) => setMarginDraftReplacement(e.target.value)}
+                    placeholder="Teks pengganti…"
+                    className="w-full px-2 py-1.5 bg-slate-950 border border-emerald-700/50 rounded-lg text-xs text-emerald-200 focus:outline-none focus:border-emerald-500"
+                  />
+                )}
                 <textarea
-                  autoFocus
+                  autoFocus={marginDraft.kind !== "replace"}
                   value={marginDraftText}
                   onChange={(e) => setMarginDraftText(e.target.value)}
                   onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submitMarginComment(); }}
                   rows={3}
-                  placeholder="Tulis komentar / alasan revisi… (Ctrl+Enter kirim)"
+                  placeholder={marginDraft.kind === "comment" ? "Tulis komentar… (Ctrl+Enter kirim)" : "Alasan (opsional)… (Ctrl+Enter kirim)"}
                   className="w-full px-2 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                 />
                 <div className="flex gap-2">
-                  <button onClick={submitMarginComment} disabled={marginBusy || !marginDraftText.trim()} className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-bold rounded-lg cursor-pointer">Kirim</button>
-                  <button onClick={() => { setMarginDraft(null); setMarginDraftText(""); setActiveMarginId(null); }} className="px-2 py-1 text-slate-400 hover:text-slate-200 text-[11px] rounded-lg cursor-pointer">Batal</button>
+                  <button onClick={submitMarginComment} disabled={marginBusy || (marginDraft.kind === "comment" && !marginDraftText.trim())} className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-bold rounded-lg cursor-pointer">Kirim</button>
+                  <button onClick={() => { setMarginDraft(null); setMarginDraftText(""); setMarginDraftReplacement(""); setActiveMarginId(null); }} className="px-2 py-1 text-slate-400 hover:text-slate-200 text-[11px] rounded-lg cursor-pointer">Batal</button>
                 </div>
               </div>
             );
@@ -23901,9 +25681,12 @@ export default function App() {
           const cmt = clauseComments.find((c) => c.id === item.id);
           if (!cmt) return null;
           const replies = clauseComments.filter((c) => c.parentId === cmt.id);
-          const canManage = currentUser?.id === cmt.userId || ["admin", "legal"].includes(currentUser?.role);
+          const canManage = currentUser?.id === cmt.userId || ["admin", "legal", "super_admin"].includes(currentUser?.role);
+          const isMarkupProposal = cmt.kind === "strike" || cmt.kind === "replace";
+          const isPendingMarkup = isMarkupProposal && cmt.status === "pending";
+          const canDecideMarkup = ["admin", "staff", "legal", "manager", "super_admin"].includes(currentUser?.role);
           return (
-            <div className={`rounded-xl bg-slate-900 border p-3 space-y-1.5 cursor-pointer transition border-l-4 ${cmt.kind === "strike" ? "border-l-rose-500" : "border-l-amber-400"} ${isActive ? "border-indigo-500 ring-1 ring-indigo-500/40 shadow-2xl" : "border-slate-800 shadow-md hover:border-slate-700"} ${cmt.resolved ? "opacity-60" : ""}`}>
+            <div className={`rounded-xl bg-slate-900 border p-3 space-y-1.5 cursor-pointer transition border-l-4 ${isMarkupProposal ? "border-l-rose-500" : "border-l-amber-400"} ${isActive ? "border-indigo-500 ring-1 ring-indigo-500/40 shadow-2xl" : "border-slate-800 shadow-md hover:border-slate-700"} ${cmt.resolved ? "opacity-60" : ""}`}>
               <div className="flex items-center gap-1.5">
                 <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold shrink-0 ${cmt.external ? "bg-amber-500/20 text-amber-300" : "bg-indigo-500/20 text-indigo-300"}`}>
                   {String(cmt.userName || "?").charAt(0).toUpperCase()}
@@ -23917,7 +25700,15 @@ export default function App() {
               </div>
               <p className="text-[9px] text-slate-500">{new Date(cmt.createdAt).toLocaleString("id-ID", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}</p>
               {cmt.anchor?.quote && (
-                <p className={`text-[10px] italic border-l-2 pl-2 ${cmt.kind === "strike" ? "border-rose-500 text-rose-300 line-through" : "border-amber-400 text-amber-200"}`}>"{cmt.anchor.quote}"</p>
+                <p className={`text-[10px] italic border-l-2 pl-2 ${isMarkupProposal ? "border-rose-500 text-rose-300 line-through" : "border-amber-400 text-amber-200"}`}>"{cmt.anchor.quote}"</p>
+              )}
+              {cmt.kind === "replace" && cmt.replacement && (
+                <p className="text-[10px] text-emerald-300 border-l-2 border-emerald-500 pl-2 underline decoration-emerald-500/60">→ "{cmt.replacement}"</p>
+              )}
+              {cmt.status && cmt.status !== "pending" && (
+                <span className={`inline-block text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${cmt.status === "accepted" ? "bg-emerald-500/20 text-emerald-300" : "bg-slate-700 text-slate-300"}`}>
+                  {cmt.status === "accepted" ? "✓ Diterima — sudah diterapkan" : "✕ Ditolak"}
+                </span>
               )}
               <p className={`text-[11px] leading-relaxed whitespace-pre-wrap ${cmt.resolved ? "text-slate-500 line-through" : "text-slate-300"}`}>{cmt.text}</p>
               {replies.map((rp) => (
@@ -23927,14 +25718,30 @@ export default function App() {
                 </div>
               ))}
               <div className="flex items-center gap-3 pt-1 flex-wrap">
+                {isPendingMarkup && (
+                  <>
+                    <button
+                      disabled={!canApplyMarkup || marginBusy}
+                      onClick={(e) => { e.stopPropagation(); if (cmt.docAnchor) handleAcceptMarkup(cmt); else handleAcceptClauseMarkup(cmt); }}
+                      title={canApplyMarkup ? (cmt.docAnchor ? "Terapkan usulan ini ke dokumen sebagai versi baru (original tetap utuh)." : "Terapkan usulan ini ke teks pasal; tersimpan sebagai versi baru draf (riwayat versi tetap utuh).") : "Menerima usulan mengubah dokumen — hanya bisa saat kontrak berstatus Draft, oleh staf yang berwenang."}
+                      className="text-[10px] font-bold text-emerald-300 hover:text-emerald-200 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition"
+                    >✓ Terima</button>
+                    <button
+                      disabled={!canDecideMarkup || marginBusy}
+                      onClick={(e) => { e.stopPropagation(); handleRejectMarkup(cmt); }}
+                      title="Tolak usulan — dokumen tidak berubah."
+                      className="text-[10px] font-bold text-rose-300 hover:text-rose-200 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition"
+                    >✕ Tolak</button>
+                  </>
+                )}
                 <button
                   onClick={(e) => { e.stopPropagation(); handleResolveComment(cmt); }}
-                  className={`text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition ${cmt.resolved ? "text-slate-500 hover:text-slate-300" : "text-emerald-400 hover:text-emerald-300"}`}
+                  className={`${isPendingMarkup ? "hidden " : ""}text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition ${cmt.resolved ? "text-slate-500 hover:text-slate-300" : "text-emerald-400 hover:text-emerald-300"}`}
                 >
                   <CheckCircle className="w-3 h-3" />
                   {cmt.resolved ? "Buka lagi" : "Selesai"}
                 </button>
-                {canManage && cmt.anchor?.quote && !cmt.resolved && (
+                {canManage && cmt.anchor?.quote && !cmt.resolved && !cmt.docAnchor && (
                   <button
                     onClick={(e) => { e.stopPropagation(); setReAnchoringCommentId(cmt.id); showToast("Sorot kalimat baru pada dokumen untuk memindahkan komentar ini.", "info"); }}
                     title="Sorot kalimat lain pada dokumen untuk memindahkan highlight komentar ini ke sana."
@@ -23993,22 +25800,27 @@ export default function App() {
               <button onClick={closeReview} className="text-slate-400 hover:text-slate-100 font-bold cursor-pointer px-2">✕</button>
             </div>
 
-            {reAnchoringCommentId ? (
+            {isUploadReview ? (
+              <div className="shrink-0 px-5 py-2 border-b border-slate-800/60 bg-slate-900/30 text-[10px] text-slate-500">
+                Dokumen ditampilkan <b className="text-slate-300">apa adanya</b>. Pada dokumen Word, <b className="text-slate-300">sorot teks</b> → ✎ Komentar / ✂ Coret / ⇄ Ganti; usulan baru mengubah dokumen setelah <b className="text-slate-300">Diterima</b>. Komentar umum ada di kolom kanan.
+              </div>
+            ) : reAnchoringCommentId ? (
               <div className="shrink-0 px-5 py-2 border-b border-indigo-500/30 bg-indigo-500/10 text-[11px] text-indigo-300 flex items-center gap-3 flex-wrap">
                 <span>✎ <b>Mode ubah sorotan aktif</b> — sorot kalimat baru pada dokumen untuk memindahkan highlight komentar ini.</span>
                 <button onClick={() => setReAnchoringCommentId(null)} className="text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg cursor-pointer">Batal</button>
               </div>
             ) : (
               <div className="shrink-0 px-5 py-2 border-b border-slate-800/60 bg-slate-900/30 text-[10px] text-slate-500 flex items-center gap-4 flex-wrap">
-                <span><b className="text-slate-300">Sorot kalimat</b> → pilih ✎ Komentar Baru / ✂ Usulkan Coret</span>
+                <span><b className="text-slate-300">Sorot kalimat</b> → pilih ✎ Komentar / ✂ Coret / ⇄ Ganti</span>
                 <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-amber-300/60" /> komentar</span>
                 <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-rose-500/30 border-b-2 border-rose-500" /> usulan coret</span>
+                <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm bg-emerald-500/30 border-b-2 border-emerald-500" /> usulan ganti</span>
                 <span>Klik sorotan ⇄ klik kartu untuk saling memfokuskan</span>
               </div>
             )}
 
             <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-8">
-              <div className="max-w-6xl mx-auto bg-slate-900/40 border border-slate-800 rounded-2xl p-5 sm:p-10">
+              <div className={`${isUploadReview ? "max-w-7xl" : "max-w-6xl"} mx-auto bg-slate-900/40 border border-slate-800 rounded-2xl p-5 sm:p-10`}>
                 <div className="text-center pb-5 mb-6 border-b border-slate-800">
                   <h4 className="font-bold text-slate-100 uppercase tracking-wide text-sm">
                     {selectedContractAddendumInfo
@@ -24018,6 +25830,70 @@ export default function App() {
                   <p className="text-xs text-slate-400 mt-1">{selectedContract.title}</p>
                   <p className="text-[11px] font-mono text-slate-500 mt-0.5">NOMOR: {selectedContract.contractNumber}</p>
                 </div>
+                {isUploadReview ? (
+                  <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-5 items-start">
+                    <ContractDocumentMarkup
+                      contractId={selectedContract.id}
+                      reloadKey={docReloadKey}
+                      items={docMarkupItems}
+                      activeId={activeMarginId}
+                      onActiveChange={setActiveMarginId}
+                      onStartDraft={(seed) => { setDocMarkupDraft(seed); setDocMarkupText(""); setDocMarkupReplacement(""); }}
+                      onNotify={(m) => showToast(m, "info")}
+                    />
+                    <div className="space-y-3 lg:sticky lg:top-0">
+                      <h5 className="text-xs font-bold text-slate-200 uppercase tracking-wide">Komentar ({visible.length})</h5>
+                      {docMarkupDraft && (
+                        <div className={`rounded-xl bg-slate-900 border border-dashed shadow-2xl p-3 space-y-2 border-l-4 ${docMarkupDraft.kind === "comment" ? "border-l-amber-400 border-amber-600/60" : docMarkupDraft.kind === "strike" ? "border-l-rose-500 border-rose-700/60" : "border-l-emerald-500 border-emerald-700/60"}`}>
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400">
+                            {docMarkupDraft.kind === "comment" ? "✎ Komentar Baru" : docMarkupDraft.kind === "strike" ? "✂ Usulan Coret" : "⇄ Usulan Ganti"}
+                          </p>
+                          <p className={`text-[11px] italic ${docMarkupDraft.kind === "comment" ? "text-amber-200" : "text-rose-300 line-through"}`}>"{docMarkupDraft.quote}"</p>
+                          {docMarkupDraft.kind === "replace" && (
+                            <input
+                              autoFocus
+                              value={docMarkupReplacement}
+                              onChange={(e) => setDocMarkupReplacement(e.target.value)}
+                              placeholder="Teks pengganti…"
+                              className="w-full px-2 py-1.5 bg-slate-950 border border-emerald-700/50 rounded-lg text-xs text-emerald-200 focus:outline-none focus:border-emerald-500"
+                            />
+                          )}
+                          <textarea
+                            autoFocus={docMarkupDraft.kind !== "replace"}
+                            value={docMarkupText}
+                            onChange={(e) => setDocMarkupText(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submitDocMarkup(); }}
+                            rows={3}
+                            placeholder={docMarkupDraft.kind === "comment" ? "Tulis komentar… (Ctrl+Enter kirim)" : "Alasan (opsional)… (Ctrl+Enter kirim)"}
+                            className="w-full px-2 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                          />
+                          <div className="flex gap-2">
+                            <button onClick={submitDocMarkup} disabled={marginBusy} className="px-3 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-bold rounded-lg cursor-pointer">Kirim</button>
+                            <button onClick={() => { setDocMarkupDraft(null); setDocMarkupText(""); setDocMarkupReplacement(""); }} className="px-2 py-1 text-slate-400 hover:text-slate-200 text-[11px] rounded-lg cursor-pointer">Batal</button>
+                          </div>
+                        </div>
+                      )}
+                      {visible.length === 0 && (
+                        <div className="rounded-xl border border-dashed border-slate-800 p-3 text-[11px] text-slate-500 leading-relaxed">
+                          Belum ada komentar pada dokumen ini.
+                        </div>
+                      )}
+                      {marginItems.map((item) => (
+                        <div key={item.id} onClick={() => setActiveMarginId(item.id)}>{renderInternalCard(item, activeMarginId === item.id)}</div>
+                      ))}
+                      <textarea
+                        value={docCommentText}
+                        onChange={(e) => setDocCommentText(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) submitDocumentComment(); }}
+                        rows={3}
+                        placeholder="Tulis komentar untuk dokumen ini… (Ctrl+Enter kirim)"
+                        className="w-full px-2.5 py-2 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                      />
+                      <button onClick={submitDocumentComment} disabled={marginBusy || !docCommentText.trim()}
+                        className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-bold rounded-lg cursor-pointer">Kirim Komentar</button>
+                    </div>
+                  </div>
+                ) : (
                 <WordMarginReview
                   clauses={reviewClauses}
                   items={marginItems}
@@ -24031,6 +25907,7 @@ export default function App() {
                     </div>
                   }
                 />
+                )}
               </div>
             </div>
           </div>
@@ -24158,10 +26035,10 @@ export default function App() {
                         <CheckCircle className="w-3 h-3" />
                         {cmt.resolved ? "Buka kembali" : "Tandai selesai"}
                       </button>
-                      {(currentUser?.id === cmt.userId || ["admin", "legal"].includes(currentUser?.role)) && !cmt.resolved && (
+                      {(currentUser?.id === cmt.userId || ["admin", "legal", "super_admin"].includes(currentUser?.role)) && !cmt.resolved && (
                         <button onClick={() => { setEditingCommentId(cmt.id); setEditingCommentText(cmt.text); }} className="text-[10px] text-slate-500 hover:text-slate-300 cursor-pointer transition">Edit</button>
                       )}
-                      {(currentUser?.id === cmt.userId || ["admin", "legal"].includes(currentUser?.role)) && (
+                      {(currentUser?.id === cmt.userId || ["admin", "legal", "super_admin"].includes(currentUser?.role)) && (
                         <button onClick={() => handleDeleteComment(cmt)} className="text-[10px] text-rose-600 hover:text-rose-400 cursor-pointer transition">Hapus</button>
                       )}
                       <button
@@ -24347,6 +26224,53 @@ export default function App() {
                 <label className="block text-xs font-semibold text-slate-300">Cabang / Lokasi</label>
                 <input type="text" value={tenantForm.branch || ""} onChange={(e) => setTenantForm({ ...tenantForm, branch: e.target.value })} className="w-full px-3 py-2 bg-slate-900 border border-slate-800 rounded-lg text-sm text-slate-100 focus:outline-none focus:border-indigo-500" />
               </div>
+              {/* Platform kerja sama milik perusahaan ini → pilihan dropdown
+                  "Kerjasama Platform" di wizard kontrak & segmen {Platform}
+                  di nomor dokumen (mis. 144/PKS/ASMAT/IX/2026). */}
+              {(() => {
+                const list: string[] = Array.isArray(tenantForm.platforms) ? tenantForm.platforms : [];
+                const addPlatform = () => {
+                  const v = tenantPlatformInput.trim();
+                  if (!v) return;
+                  if (!list.some((x) => x.toLowerCase() === v.toLowerCase())) {
+                    setTenantForm({ ...tenantForm, platforms: [...list, v] });
+                  }
+                  setTenantPlatformInput("");
+                };
+                return (
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-semibold text-slate-300">Platform Kerjasama <span className="font-normal text-slate-500">(opsional)</span></label>
+                    <div className="flex flex-wrap gap-1.5">
+                      {list.map((p, i) => (
+                        <span key={p} className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 bg-slate-900 border border-slate-800 rounded-full text-slate-200">
+                          {p} <span className="font-mono text-[10px] text-slate-500">{platformCode(p)}</span>
+                          <button
+                            type="button"
+                            onClick={() => setTenantForm({ ...tenantForm, platforms: list.filter((_, xi) => xi !== i) })}
+                            title="Hapus"
+                            className="text-slate-500 hover:text-rose-400 cursor-pointer"
+                          >
+                            ✕
+                          </button>
+                        </span>
+                      ))}
+                      {list.length === 0 && <span className="text-[11px] text-slate-500 italic">Belum ada platform.</span>}
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={tenantPlatformInput}
+                        onChange={(e) => setTenantPlatformInput(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); addPlatform(); } }}
+                        placeholder="mis. Asmat, Tiketux — tekan Enter"
+                        className="flex-1 px-3 py-2 bg-slate-900 border border-dashed border-slate-700 rounded-lg text-sm text-slate-100 focus:outline-none focus:border-indigo-500"
+                      />
+                      <button type="button" onClick={addPlatform} className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-lg cursor-pointer">Tambah</button>
+                    </div>
+                    <p className="text-[10px] text-slate-500">Muncul sebagai pilihan "Kerjasama Platform" saat membuat kontrak, dan tertulis di nomor dokumen, mis. 144/PKS/{platformCode(list[0] || "Asmat")}/IX/2026.</p>
+                  </div>
+                );
+              })()}
               {!tenantForm.id ? (
                 <>
                   <div className="space-y-1.5">
